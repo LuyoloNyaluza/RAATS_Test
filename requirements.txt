@@ -1,0 +1,26 @@
+# RAATS Requirements (Week 1)
+# Core
+python>=3.10
+# LLM & RAG
+ollama
+langchain
+langgraph
+chromadb
+faiss-cpu
+# Data & Finance
+yfinance
+pandas-ta
+pandas
+numpy
+# NLP & Sentiment
+spacy
+textblob
+vaderSentiment
+# Utils
+python-dotenv
+# Testing
+pytest
+# Optional: Jupyter for notebooks
+jupyterlab
+# Optional: Docker SDK (if managing containers from python)
+docker
