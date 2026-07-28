@@ -3,7 +3,7 @@
 
 ## Monday 24 Aug – spaCy fundamentals
 - Review spaCy 101: https://spacy.io/usage/spacy-101
-- Load the English model: `python -m spacy download en_core_web_sm` (already done in week1)
+- Load the English model (should already be installed from week1): `python -m spacy download en_core_web_sm`
 - Write a script to test basic tokenization, POS tagging, and named entity recognition on a few sample headlines.
 - Output: Notebook 05_spacy_intro.ipynb demonstrating spaCy pipeline.
 
@@ -18,28 +18,33 @@
 - Write a function that returns sentiment score and label (positive/negative/neutral) using both libraries.
 - Output: Notebook 07_sentiment_comparison.ipynb.
 
-## Thursday 27 Aug – Building a financial text preprocessing pipeline
-- Combine the steps: load raw news, clean HTML/tags, extract entities, compute sentiment.
-- Store the enriched data in a structured format (e.g., CSV with columns: date, headline, source, tickers, companies, sentiment_vader, sentiment_textblob).
-- Output: Script `src/data/enrich_news.py` that processes all raw news files and writes to `data/processed/enriched_news.csv`.
+## Thursday 27 Aug – Building a financial NLP pipeline
+- Combine the previous steps into a reusable function that takes a headline and returns:
+  - List of entities (with types)
+  - Sentiment scores from VADER and TextBlob
+  - Cleaned text (lowercased, no punctuation)
+- Apply this pipeline to the news data collected in week1 (data/raw/news/).
+- Store the enriched data as CSV: data/processed/news_enriched_week4.csv.
+- Output: Notebook 08_nlp_pipeline.ipynb.
 
-## Friday 28 Aug – Morning: Apply pipeline to week's news
-- Run the enrichment script on the news collected during week 1 (or newly fetched).
-- Examine the output: check which entities were extracted, sentiment distribution.
-- Afternoon: Rest (no work).
+## Friday 28 Aug – Morning: Visualization and insights
+- Generate some simple visualizations: distribution of sentiment, top entities mentioned, etc.
+- Use matplotlib or seaborn (install if needed: `pip install matplotlib seaborn`).
+- Afternoon: Rest (no work) – enjoy the break.
 
 ## Saturday 29 Aug – Rest day
 - No planned work.
 
 ## Sunday 30 Aug – Preparation for Week 5
-- Review yfinance and pandas-ta documentation for technical indicators.
-- Think about how to merge enriched news with price data for feature creation.
-- Write a brief note in `journal/week4_prep_week5.md` about ideas for week 5.
-- Commit any notes or scripts.
+- Review the plan for week5: technical indicators and market data collection.
+- Check that yfinance and pandas-ta are installed (they are in requirements).
+- Optionally, run a quick test to download one month of data for AAPL and compute a few indicators.
+- Write a quick note in journal/week4_prep_week5.md about what you'll do Monday.
+- Commit any notes or small scripts.
 
 ---
 **End of Week 4 Deliverables:**
-- Notebooks: 05_spacy_intro.ipynb, 06_financial_entities.ipynb, 07_sentiment_comparison.ipynb
-- Script: src/data/enrich_news.py
-- Data: data/processed/enriched_news.csv
+- Notebooks: 05_spacy_intro.ipynb, 06_financial_entities.ipynb, 07_sentiment_comparison.ipynb, 08_nlp_pipeline.ipynb
+- Data: data/processed/news_enriched_week4.csv
+- Visualizations: optional plots in notebooks or a separate folder.
 - Logs: journal/week4_log.md, journal/week4_prep_week5.md
