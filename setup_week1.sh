@@ -3,6 +3,8 @@
 # RAATS Week‑1 Setup Script
 # - Checks Docker, installs Ollama (if needed), creates Python venv,
 #   installs requirements, downloads spaCy model.
+# - Prepares the environment for Week 1: environment setup, Ollama testing,
+#   and initial exploration.
 # =============================================================================
 
 set -euo pipefail
@@ -66,3 +68,4 @@ echo "  1. Activate the venv: source venv/Scripts/activate"
 echo "  2. Test Ollama: ollama run llama3 \"What is the sentiment of the word 'bullish'?\""
 echo "  3. Open the notebooks folder and start exploring."
 echo "  4. Commit any changes and push to your repo."
+echo "  5. Start a journal.md file to log your weekly progress and reflections."
