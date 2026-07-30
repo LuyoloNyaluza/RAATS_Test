@@ -14,6 +14,36 @@ RAATS is an agentic AI system for adaptive real‑time trading that combines:
 - Risk‑managed execution with latency monitoring
 - Scalable deployment using Docker Compose
 
+## Suggested Learning Resources
+To build and extend RAATS, consider studying the following topics and resources:
+
+### Core Concepts
+- **Agentic AI & LangGraph** – https://langchain-ai.github.io/langgraph/
+- **Retrieval‑Augmented Generation (RAG)** – https://python.langchain.com/docs/modules/data_connection/retrievers/
+- **Large Language Models (LLMs) with Ollama** – https://ollama.com/
+- **Vector Stores (FAISS, Chroma)** – https://faiss.ai/, https://www.trychroma.com/
+- **Financial Data & Technical Indicators** – https://pypi.org/project/yfinance/, https://github.com/twopirllc/pandas-ta
+- **NLP for Finance (spaCy, TextBlob, VADER)** – https://spacy.io/, https://www.nltk.org/, https://github.com/cjhutto/vaderSentiment
+- **Risk Management & Position Sizing** – https://www.investopedia.com/terms/r/riskmanagement.asp
+- **Docker & Docker Compose** – https://docs.docker.com/get-started/
+
+### Tutorials & Courses
+- "Building LLM‑Powered Applications" – Coursera / DeepLearning.AI
+- "Algorithmic Trading with Python" – QuantInsti / Udemy
+- "LangChain for LLM Applications" – free YouTube series (LangChain channel)
+- "Docker for Data Science" – DataCamp
+
+### Books
+- *Advances in Financial Machine Learning* – Marcos López de Prado
+* *Designing Data‑Intensive Applications* – Martin Kleppmann
+* *LangChain in Action* – Manning (forthcoming)
+
+### Community & Forums
+- LangChain Discord: https://discord.gg/langchain
+- Ollama Community: https://discord.gg/ollama
+- QuantConnect Forum: https://www.quantconnect.com/forum
+- r/algotrading (Reddit)
+
 ## Repository Structure
 ```
 RAATS/
@@ -32,7 +62,8 @@ RAATS/
 ├── tests/                # Unit & integration tests
 ├── docker/               # Docker‑compose, Dockerfiles
 ├── requirements.txt      # Python dependencies
-└── setup_week1.sh        # Helper script for Week 1 environment setup
+├── setup_week1.sh        # Helper script for Week 1 environment setup
+└── verify.txt
 ```
 
 ## Getting Started
