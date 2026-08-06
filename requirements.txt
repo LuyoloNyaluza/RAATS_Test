@@ -1,6 +1,6 @@
 # RAATS Requirements (Week 1)
 # Core
-python>=3.10
+# python 3.12
 # LLM & RAG
 ollama
 langchain
@@ -9,7 +9,7 @@ chromadb
 faiss-cpu
 # Data & Finance
 yfinance
-pandas-ta
+# pandas-ta
 pandas
 numpy
 # NLP & Sentiment
