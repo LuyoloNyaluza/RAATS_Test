@@ -1,0 +1,13 @@
+[
+  {
+    "source": {
+      "name": "Placeholder News"
+    },
+    "author": "System",
+    "title": "Sample news about AAPL",
+    "description": "This is placeholder data. Implement real news API.",
+    "url": "https://example.com",
+    "publishedAt": "2026-08-10T21:51:42.268522",
+    "content": "Placeholder content for development"
+  }
+]

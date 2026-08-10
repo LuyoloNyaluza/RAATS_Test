@@ -1,8 +1,10 @@
 import requests
 import pandas as pd
 import os
-from datetime import datetime, timedelta
 import json
+
+from datetime import datetime, timedelta
+from typing import Optional, List
 
 def fetch_financial_news(
         query: str = "stock market",
@@ -65,6 +67,7 @@ def fetch_financial_news(
 
         return articles
 
-if name == "main":
+if __name__ == "__main__":
         # Example usage
-        fetch_financial_news("AAPL", save_to_json=True)
+        news = fetch_financial_news("AAPL", save_to_json=True)
+        print(news)

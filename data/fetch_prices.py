@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import os
 from datetime import datetime, timedelta
+from typing import List
 
 def fetch_price_data(
         symbols: List[str],
@@ -50,7 +51,14 @@ def fetch_price_data(
 
         return data
 
-if name == "main":
+if __name__ == "__main__":
         # Example usage
-        symbols = ["AAPL", "MSFT", "GOOGL"]
-        fetch_price_data(symbols, period="5d", interval="1d")
+        symbols = ["AAPL", "MSFT", "GOOGL", "GC=F", "SI=F", "ZAR=X", "NQ=F"]
+        results = fetch_price_data(
+        symbols,
+        period="5d",
+        interval="1d"
+    )
+
+        print("\nSuccessfully fetched:")
+        print(list(results.keys()))
