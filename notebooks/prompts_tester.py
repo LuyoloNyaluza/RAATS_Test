@@ -14,7 +14,8 @@ import logging
 import time
 
 try:
-    import ollama
+    from ollama import Client
+    ollama = Client()
 except ImportError:
     ollama = None
 
@@ -57,7 +58,7 @@ Respond ONLY in valid JSON:
 TEMPLATE_C = """You are a trading analyst. Combine the technical snapshot with the retrieved
 news context to produce a signal.
 
-Technical snapshot:
+Technical summary:
 {technical_summary}
 
 Retrieved news context:
@@ -97,6 +98,8 @@ SAMPLE_SNAPSHOTS = [
 
 
 def run_template(model_name: str, template: str, data: dict) -> str:
+    if ollama is None:
+        raise RuntimeError("Ollama is not installed. Please install it with: pip install ollama")
     prompt = template.format(**data)
     start = time.time()
     response = ollama.generate(model=model_name, prompt=prompt, options={"temperature": 0.2})
