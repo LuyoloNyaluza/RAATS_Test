@@ -63,7 +63,7 @@ If any of the above is missing, revisit [WEEK1_SETUP.md](./WEEK1_SETUP.md) and [
    ```python
    # Example cell content for 03_rag_basics.ipynb
    # In[1]: Import libraries
-   from langchain_community.embeddings import OllamaEmbeddings
+   from langchain_ollama import OllamaEmbeddings
    from langchain_community.vectorstores import FAISS
    from langchain_community.llms import Ollama
    from langchain.chains import RetrievalQA
