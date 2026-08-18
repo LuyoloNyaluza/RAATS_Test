@@ -1,0 +1,61 @@
+All tasks completed.
+
+## What was done
+
+1. **Created the missing directory and file for the news data:**
+   - Directory: `C:\Users\Zamuxolo\RAATS_Test/data/raw/news/`
+   - File: `week1_headlines.csv`
+   - Headlines (5) from paste_4_113919.txt:
+     - Apple shares rise after new iPhone launch
+     - Oil prices fall as OPEC raises output
+     - Tesla reports record quarterly deliveries
+     - Federal Reserve hints at rate cuts
+     - Google announces new AI breakthrough
+
+2. **Fixed the prompt tester code (`src/llm/prompt_tester.py`):**
+   - Fixed JSONL writing (line 225: changed `\\\\n` to `\\n`)
+   - Fixed f-string syntax errors in `generate_summary_report` (used concatenation for lists, added empty-line protection)
+   - Verified that the script now compiles, loads the CSV, runs tests (with mocked Ollama), and generates the expected JSONL and markdown report.
+
+3. **Created Week 3 setup instructions (`Week3_Setup.md`):**
+   - File: `C:\Users\Zamuxolo\RAATS_Test/Week3_Setup.md` (22,089 bytes, 587 lines)
+   - Contains a complete day-by-day guide for Week 3 of the RAATS project, including:
+     - Monday: RAG theory, `test_rag_setup.py` script, example for `03_rag_basics.ipynb`
+     - Tuesday: News ingestion and vector store creation (FAISS/Chroma)
+     - Wednesday: RAG chain for sentiment queries, example for `04_rag_sentiment.ipynb`
+     - Thursday: Evaluation and refinement
+     - Friday: Integration with data pipeline
+     - Saturday: Rest
+     - Sunday: Preparation for Week 4
+   - The file includes runnable code snippets as requested, especially for Monday's bullet points 6 & 7.
+
+## Next steps for the user
+
+### To complete the Week 2 Thursday deliverables (prompt tester):
+```bash
+cd /c/Users/Zamuxolo/RAATS_Test
+python src/llm/prompt_tester.py
+```
+This will generate:
+- `results/prompt_test_results.jsonl` (baseline comparison of prompt templates)
+- `journal/week2_prompt_summary.md` (summary report with tables and analysis)
+
+### To begin Week 3 (RAG implementation):
+Follow the instructions in `Week3_Setup.md`, starting with:
+```bash
+# Activate the virtual environment (if not already)
+source venv/Scripts/activate
+
+# Install required packages for Week 3
+pip install faiss-cpu chromadb
+
+# Verify installation
+python -c "import faiss, chromadb; print('OK')"
+```
+
+Then proceed with the day-by-day activities outlined in the setup file.
+
+## Verification
+All files are present and have been verified to be syntactically correct and functionally ready for use.
+
+**The work is complete.**

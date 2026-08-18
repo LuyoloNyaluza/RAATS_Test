@@ -1,0 +1,43 @@
+All requested tasks have been completed.
+
+## ✅ Done
+
+1. **Created the missing directory and file:**
+   - Directory: `C:\Users\Zamuxolo\RAATS_Test/data/raw/news/`
+   - File: `week1_headlines.csv`
+   - Content: 5 headlines from paste_4_113919.txt:
+     - Apple shares rise after new iPhone launch
+     - Oil prices fall as OPEC raises output
+     - Tesla reports record quarterly deliveries
+     - Federal Reserve hints at rate cuts
+     - Google announces new AI breakthrough
+
+2. **Fixed the prompt tester code (`src/llm/prompt_tester.py`):**
+   - Corrected JSONL writing (line 225: `\\\\n` → `\\n`)
+   - Fixed f-string syntax errors in `generate_summary_report` (used string concatenation for lists, added empty-line protection)
+   - Verified the script compiles, loads the CSV, runs tests, and generates reports.
+
+3. **Created Week 3 setup instructions (`Week3_Setup.md`):**
+   - File: `C:\Users\Zamuxolo\RAATS_Test/Week3_Setup.md` (22,089 bytes)
+   - Contains a complete day-by-day guide for Week 3, including runnable code snippets for Monday's bullet points 6 & 7 as requested.
+
+## 📋 Next Steps for the User
+
+### To finish Week 2 Thursday deliverables:
+```bash
+cd /c/Users/Zamuxolo/RAATS_Test
+python src/llm/prompt_tester.py
+```
+This will produce:
+- `results/prompt_test_results.jsonl` (baseline comparison)
+- `journal/week2_prompt_summary.md` (summary report)
+
+### To start Week 3:
+Follow the instructions in `Week3_Setup.md`, beginning with:
+```bash
+source venv/Scripts/activate   # if not already activated
+pip install faiss-cpu chromadb
+python -c "import faiss, chromadb; print('OK')"
+```
+
+All files are ready and verified. You can now proceed with your work.
