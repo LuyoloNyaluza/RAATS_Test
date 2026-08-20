@@ -2,7 +2,7 @@
 
 **Project:** MSc Computer Science – University of Fort Hare  
 **Student:** Luyolo Nyaluza  
-**Email:** luyolon@hotmail.com  
+**Email:**  
 
 ---
 
