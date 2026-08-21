@@ -44,7 +44,7 @@ def fetch_financial_news(
         #     articles = []
 
         # PLACEHOLDER: Return mock data for development/testing
-        print("⚠️  Using placeholder news data - replace with real API implementation")
+        print("Using placeholder news data - replace with real API implementation")
         articles = [
             {
                 "source": {"name": "Placeholder News"},
