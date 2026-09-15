@@ -1,5 +1,3 @@
-
-
 import os
 import time
 import pandas as pd
@@ -8,17 +6,7 @@ import yfinance as yf
 
 
 def fetch_price_data(tickers, start, end, pause=2.0):
-    """Download OHLCV data for given tickers and date range.
-
-    Args:
-        tickers: list of ticker symbols.
-        start, end: date range (anything pd.Timestamp-compatible).
-        pause: seconds to wait between requests, to reduce rate-limiting.
-
-    Returns:
-        dict of {ticker: DataFrame}. Tickers with no data returned are
-        omitted rather than included as empty DataFrames.
-    """
+    """Download OHLCV data for given tickers and date range."""
     data_dict = {}
     for ticker in tickers:
         print(f'Fetching {ticker}...')
@@ -30,8 +18,6 @@ def fetch_price_data(tickers, start, end, pause=2.0):
             time.sleep(pause)
             continue
 
-        # yfinance returns MultiIndex columns even for a single ticker —
-        # flatten them so pandas_ta's .str column matching works.
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
@@ -42,7 +28,7 @@ def fetch_price_data(tickers, start, end, pause=2.0):
             continue
 
         data_dict[ticker] = df
-        time.sleep(pause)  # be gentle with Yahoo's endpoint between requests
+        time.sleep(pause)
 
     return data_dict
 
@@ -57,21 +43,12 @@ def add_technical_indicators(df):
     df.ta.ema(length=50, append=True)
     df.ta.rsi(length=14, append=True)
     df.ta.macd(fast=12, slow=26, signal=9, append=True)
+    df.ta.atr(length=14, append=True)
     return df
 
 
 def save_data(data_dict, base_dir, min_rows=50):
-    """Save raw, full-indicator, and clean-indicator CSVs for each ticker.
-
-    Args:
-        data_dict: {ticker: DataFrame} as returned by fetch_price_data.
-        base_dir: root output directory (e.g. 'data').
-        min_rows: tickers with fewer rows than this are skipped, since the
-                  50-period indicators would be entirely NaN anyway.
-
-    Returns:
-        list of (ticker, total_rows, clean_rows) tuples for reporting.
-    """
+    """Save raw, full-indicator, and clean-indicator CSVs for each ticker."""
     raw_dir = os.path.join(base_dir, 'raw', 'prices')
     proc_dir = os.path.join(base_dir, 'processed', 'indicators')
     os.makedirs(raw_dir, exist_ok=True)
@@ -84,14 +61,11 @@ def save_data(data_dict, base_dir, min_rows=50):
             print(f'  Skipping {ticker}: insufficient rows ({len(df)}) for indicators.')
             continue
 
-        # Raw prices
         df.to_csv(os.path.join(raw_dir, f'{ticker}_ohlcv.csv'))
 
-        # Full indicators (keeps warm-up NaNs)
         df_with_ind = add_technical_indicators(df.copy())
         df_with_ind.to_csv(os.path.join(proc_dir, f'{ticker}_indicators.csv'))
 
-        # Clean indicators (all NaNs dropped, ready for direct downstream use)
         df_clean = df_with_ind.dropna()
         df_clean.to_csv(os.path.join(proc_dir, f'{ticker}_indicators_clean.csv'))
 
