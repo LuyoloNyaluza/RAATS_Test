@@ -1,73 +1,71 @@
-import requests
-import pandas as pd
-import os
+
 import json
+import os
+import time
+from datetime import datetime
+from typing import Optional
+from urllib.parse import quote
 
-from datetime import datetime, timedelta
-from typing import Optional, List
+import feedparser
 
-def fetch_financial_news(
-        query: str = "stock market",
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
-        language: str = "en",
-        save_to_json: bool = True
-    ) -> List[dict]:
-        """
-        Fetch financial news articles
-        Args:
-            query: Search query (e.g., "AAPL earnings", "Federal Reserve")
-            from_date: Start date (YYYY-MM-DD)
-            to_date: End date (YYYY-MM-DD)
-            language: Language code (default: 'en')
-            save_to_json: Whether to save results to JSON file
-        Returns:
-            List of news article dictionaries
-        """
-        # TODO: Replace with your actual news API implementation
-        # Example using NewsAPI (you'll need to get an API key):
-        #
-        # API_KEY = "your_newsapi_key_here"
-        # url = f"https://newsapi.org/v2/everything?"
-        # url += f"q={query}&"
-        # url += f"from={from_date or (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')}&"
-        # url += f"to={to_date or datetime.now().strftime('%Y-%m-%d')}&"
-        # url += f"language={language}&"
-        # url += f"sortBy=publishedAt&"
-        # url += f"apiKey={API_KEY}"
-        #
-        # response = requests.get(url)
-        # if response.status_code == 200:
-        #     news_data = response.json()
-        #     articles = news_data.get('articles', [])
-        # else:
-        #     articles = []
 
-        # PLACEHOLDER: Return mock data for development/testing
-        print("Using placeholder news data - replace with real API implementation")
-        articles = [
-            {
-                "source": {"name": "Placeholder News"},
-                "author": "System",
-                "title": f"Sample news about {query}",
-                "description": "This is placeholder data. Implement real news API.",
-                "url": "https://example.com",
-                "publishedAt": datetime.now().isoformat(),
-                "content": "Placeholder content for development"
-            }
-        ]
+def fetch_financial_news(ticker: str, company_name: Optional[str] = None, max_articles: int = 10):
+    """Fetch recent news headlines for a ticker via Google News RSS."""
+    query = f"{company_name} {ticker} stock" if company_name else f"{ticker} stock"
+    url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en"
 
-        if save_to_json and articles:
-            data_dir = "src/data"
-            os.makedirs(data_dir, exist_ok=True)
-            filename = f"{data_dir}/news_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(filename, 'w') as f:
-                json.dump(articles, f, indent=2)
-            print(f"📰 Saved placeholder news to {filename}")
+    feed = feedparser.parse(url)
 
-        return articles
+    if feed.bozo:
+        print(f"  WARNING: could not parse feed for {ticker}: {feed.bozo_exception}")
+        return []
+
+    articles = []
+    for entry in feed.entries[:max_articles]:
+        articles.append({
+            "source": {"name": getattr(entry, "source", {}).get("title", "Google News")
+                       if hasattr(entry, "source") else "Google News"},
+            "author": None,
+            "title": entry.get("title", ""),
+            "description": entry.get("summary", ""),
+            "url": entry.get("link", ""),
+            "publishedAt": entry.get("published", datetime.utcnow().isoformat()),
+            "content": entry.get("summary", ""),
+            "ticker": ticker,
+        })
+
+    return articles
+
+
+def fetch_news_for_watchlist(tickers_with_names: dict, max_articles: int = 10, pause: float = 1.0):
+    """Fetch news for multiple tickers."""
+    all_articles = {}
+    for ticker, name in tickers_with_names.items():
+        print(f"Fetching news for {ticker} ({name})...")
+        articles = fetch_financial_news(ticker, company_name=name, max_articles=max_articles)
+        print(f"  Found {len(articles)} articles")
+        all_articles[ticker] = articles
+        time.sleep(pause)
+    return all_articles
+
+
+def save_news(all_articles: dict, output_dir: str = "data/raw/news"):
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    for ticker, articles in all_articles.items():
+        path = os.path.join(output_dir, f"{ticker}_news_{timestamp}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(articles, f, indent=2, ensure_ascii=False)
+        print(f"Saved {len(articles)} articles for {ticker} to {path}")
+
 
 if __name__ == "__main__":
-        # Example usage
-        news = fetch_financial_news("AAPL", save_to_json=True)
-        print(news)
+    watchlist = {
+        "TSLA": "Tesla", "AAPL": "Apple", "MSFT": "Microsoft", "GOOGL": "Google",
+        "AMZN": "Amazon", "NVDA": "Nvidia", "META": "Meta", "NFLX": "Netflix",
+        "AMD": "AMD", "INTC": "Intel",
+    }
+
+    all_articles = fetch_news_for_watchlist(watchlist, max_articles=10, pause=1.0)
+    save_news(all_articles)
