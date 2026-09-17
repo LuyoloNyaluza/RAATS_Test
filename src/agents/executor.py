@@ -2,7 +2,7 @@ import logging
 from typing import Optional
 
 from src.risk.risk_manager import RiskManager
-from src.utills.async_timer import wait_for_entry
+from src.utils.async_timer import wait_for_entry
 
 logger = logging.getLogger("raats.agents.executor")
 

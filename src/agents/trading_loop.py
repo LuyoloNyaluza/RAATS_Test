@@ -1,9 +1,3 @@
-"""
-src/agents/trading_loop.py
-
-Graph: collector -> stability -> [analyst -> executor] -> END
-"""
-
 from typing import TypedDict, Dict, Any, List, Optional
 
 from langgraph.graph import StateGraph, END
@@ -17,6 +11,8 @@ from src.agents.analyst import analyze_market
 from src.agents.executor import execute_trade
 from src.risk.risk_manager import RiskManager
 from src.risk.stability_filter import MarketStabilityFilter
+from src.utils.timer import node_timer
+from src.utils.logger import log_cycle
 
 
 class AgentState(TypedDict, total=False):
@@ -45,7 +41,7 @@ class AgentState(TypedDict, total=False):
 
 _STABILITY_FILTER = MarketStabilityFilter()
 
-
+@node_timer("collector")
 def collector_node(state: AgentState) -> AgentState:
     ticker = state.get("ticker", "AAPL")
     state["market_data"] = collect_market_data(ticker)
@@ -53,7 +49,7 @@ def collector_node(state: AgentState) -> AgentState:
     state["timestamp"] = state["market_data"]["timestamp"]
     return state
 
-
+@node_timer("stability")
 def stability_node(state: AgentState) -> AgentState:
     ticker = state.get("ticker", "AAPL")
     try:
@@ -79,13 +75,13 @@ def stability_node(state: AgentState) -> AgentState:
 def route_on_stability(state: AgentState) -> str:
     return "analyst" if state.get("stability_status") == "Stable" else "observe"
 
-
+@node_timer("analyst")
 def analyst_node(state: AgentState) -> AgentState:
     result = analyze_market(dict(state))
     state.update(result)  # type: ignore[typeddict-item]
     return state
 
-
+@node_timer("executor")
 def executor_node(state: AgentState) -> AgentState:
     result = execute_trade(dict(state))
     state.update(result)  # type: ignore[typeddict-item]
@@ -135,6 +131,13 @@ def run_daily_cycle(
         "stability_status": "",
     }
     final_state = app.invoke(initial_state)
+    signal = str(final_state.get("llm_signal") or final_state.get("signal") or "")
+    log_cycle(
+        signal=signal,
+        executed_price=final_state.get("executed_price"),
+        latencies=final_state.get("latencies", {}),
+        pnl=final_state.get("closed_trade", {}).get("pnl", 0.0),
+    )
 
     print("=== Daily Cycle Result ===")
     print(f"Ticker:      {final_state.get('ticker')}")

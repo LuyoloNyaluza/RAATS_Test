@@ -1,0 +1,7 @@
+{"timestamp": "2026-09-17T21:10:10.448733+00:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {}, "pnl": 0.0}
+{"timestamp": "2026-09-17T23:27:34.305075+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {}, "pnl": 0.0}
+{"timestamp": "2026-09-17T23:40:00.295434+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {}, "pnl": 0.0}
+{"timestamp": "2026-09-17T23:40:00.360570+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {}, "pnl": 0.0}
+{"timestamp": "2026-09-17T23:40:08.080417+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {}, "pnl": 0.0}
+{"timestamp": "2026-09-17T23:40:16.199464+02:00", "signal": "BUY", "executed_price": 344.9800109863281, "latencies_ms": {}, "pnl": 0.0}
+{"timestamp": "2026-09-17T23:40:16.229584+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {}, "pnl": 0.0}
