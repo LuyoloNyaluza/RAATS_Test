@@ -80,6 +80,27 @@ def compute_gradient(closes: Sequence[float], lookback: int = 10) -> float:
     slope, _intercept = np.polyfit(x, window, 1)
     return float(slope)
 
+def calculate_ror(entry_price: float, current_price: float, direction: int = 1) -> float:
+    """Return the rate of return for a trade.
+    direction: +1 for long, -1 for short."""
+    if entry_price == 0:
+        raise ValueError("entry_price cannot be zero")
+    price_return = (current_price - entry_price) / entry_price
+    return price_return * direction
+
+def calculate_rpr(
+    benchmark_return: float,
+    atr_current: float,
+    risk_tolerance: float = 0.02,
+    benchmark_volatility: Optional[float] = None,
+) -> float:
+    
+    """Risk-Adjusted Performance Ratio (RPR) for a trade.
+    Combines the benchmark return with a volatility penalty based on ATR."""
+    volatility_penalty = atr_current * risk_tolerance
+    if benchmark_volatility is not None and atr_current > 0:
+        volatility_penalty *= benchmark_volatility / atr_current
+    return benchmark_return + volatility_penalty
 
 def normalize_gradient(m: float, lookback: int, atr: float) -> float:
     """Convert price-per-bar slope into a dimensionless ATR-relative measure.
