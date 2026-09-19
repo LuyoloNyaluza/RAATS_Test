@@ -145,6 +145,7 @@ def run_daily_cycle(
     final_state = app.invoke(initial_state)
     signal = str(final_state.get("llm_signal") or final_state.get("signal") or "")
     log_cycle(
+        ticker=ticker,
         signal=signal,
         executed_price=final_state.get("executed_price"),
         latencies=final_state.get("latencies", {}),
