@@ -1,37 +1,3 @@
-"""
-src/risk/risk_manager.py
-
-RAATS Section 3.2: Adaptive Decision-Making Logic and Risk Management.
-
-  3.2.1 Stop Loss / Take Profit at 1:2 RRR, ATR-derived risk distance
-  3.2.2 Adaptive bi-directional stepping stop logic
-        - Direction D derived from the trading signal's GRADIENT (spec wording)
-        - risk_unit scaled by a dimensionless gradient factor
-  3.2.3 Tiered position sizing strategy
-
------------------------------------------------------------------------------
-GRADIENT HANDLING - WHY NOT `m * StopLoss`
------------------------------------------------------------------------------
-The raw gradient m has units of price-per-bar; a stop loss has units of price.
-Multiplying them yields price^2/bar, which is not a price. Numerically it also
-explodes: with entry 315.32 / SL 303.88, m=1.5 gives m*SL = 455.82, i.e. a
-"stop" ABOVE entry on a long (instant trigger); m=-0.8 gives -243.10.
-
-Instead the gradient is normalized to a dimensionless quantity:
-
-    m_norm = (m * lookback) / ATR        # total move over the window, in ATRs
-
-and used two ways:
-
-    D           = sign(m_norm)            when |m_norm| exceeds a deadband
-    risk_unit   = ATR * atr_multiplier * gradient_factor(m_norm)
-
-Because every SL/TP/stepping formula is expressed in terms of risk_unit, the
-gradient automatically modulates BOTH the initial stop and every subsequent
-stepped stop - which is the "m(StopLoss + adaptive value)" behaviour, done in
-a dimensionally consistent way. The verified stepping math is unchanged.
------------------------------------------------------------------------------
-"""
 
 import math
 from dataclasses import dataclass
@@ -40,9 +6,6 @@ from typing import Dict, Optional, Tuple, List, Sequence
 import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# ATR
-# ---------------------------------------------------------------------------
 def compute_atr(highs: Sequence[float], lows: Sequence[float],
                 closes: Sequence[float], period: int = 14) -> float:
     """Average True Range over `period` bars."""
@@ -64,14 +27,8 @@ def compute_atr(highs: Sequence[float], lows: Sequence[float],
     return sum(true_ranges[-period:]) / period
 
 
-# ---------------------------------------------------------------------------
-# Gradient
-# ---------------------------------------------------------------------------
 def compute_gradient(closes: Sequence[float], lookback: int = 10) -> float:
-    """Slope m of a least-squares line through the last `lookback` closes.
-
-    Units: price per bar.
-    """
+    """Slope m of a least-squares line through the last `lookback` closes."""
     values = np.asarray(closes, dtype=float)
     if len(values) < lookback:
         raise ValueError(f"Need at least {lookback} closes, got {len(values)}")
@@ -80,46 +37,17 @@ def compute_gradient(closes: Sequence[float], lookback: int = 10) -> float:
     slope, _intercept = np.polyfit(x, window, 1)
     return float(slope)
 
-def calculate_ror(entry_price: float, current_price: float, direction: int = 1) -> float:
-    """Return the rate of return for a trade.
-    direction: +1 for long, -1 for short."""
-    if entry_price == 0:
-        raise ValueError("entry_price cannot be zero")
-    price_return = (current_price - entry_price) / entry_price
-    return price_return * direction
-
-def calculate_rpr(
-    benchmark_return: float,
-    atr_current: float,
-    risk_tolerance: float = 0.02,
-    benchmark_volatility: Optional[float] = None,
-) -> float:
-    
-    """Risk-Adjusted Performance Ratio (RPR) for a trade.
-    Combines the benchmark return with a volatility penalty based on ATR."""
-    volatility_penalty = atr_current * risk_tolerance
-    if benchmark_volatility is not None and atr_current > 0:
-        volatility_penalty *= benchmark_volatility / atr_current
-    return benchmark_return + volatility_penalty
 
 def normalize_gradient(m: float, lookback: int, atr: float) -> float:
-    """Convert price-per-bar slope into a dimensionless ATR-relative measure.
-
-        m_norm = (m * lookback) / ATR
-
-    |m_norm| = 1.0 means the trend covers roughly one ATR over the window.
-    """
+    """m_norm = (m * lookback) / ATR - dimensionless, ATR-relative."""
     if atr <= 0:
         raise ValueError("ATR must be positive to normalize the gradient")
     return (m * lookback) / atr
 
 
 def direction_from_gradient(m_norm: float, deadband: float = 0.3) -> int:
-    """Spec 3.2.2: D determined by the trading signal's gradient.
-
-    Returns +1 (long), -1 (short), or 0 (no clear gradient -> stand aside).
-    The deadband stops a flat/choppy market flip-flopping direction.
-    """
+    """D purely from gradient sign: +1 BUY (m_norm positive), -1 SELL
+    (m_norm negative), 0 = no clear direction (within deadband)."""
     if abs(m_norm) < deadband:
         return 0
     return 1 if m_norm > 0 else -1
@@ -132,17 +60,7 @@ def gradient_factor(
     f_max: float = 2.0,
     widen_with_trend: bool = True,
 ) -> float:
-    """Dimensionless multiplier applied to risk_unit.
-
-    widen_with_trend=True  -> steeper trend gives a WIDER stop, so ordinary
-                              retracement inside a fast move does not shake the
-                              position out. (default)
-    widen_with_trend=False -> steeper trend gives a TIGHTER stop, locking gains
-                              more aggressively in strong moves.
-
-    Clamped to [f_min, f_max] so an extreme gradient can never produce an
-    absurd stop distance.
-    """
+    """Dimensionless multiplier applied to risk_unit, clamped to [f_min, f_max]."""
     magnitude = abs(m_norm)
     if widen_with_trend:
         factor = 1.0 + (k * magnitude)
@@ -151,20 +69,17 @@ def gradient_factor(
     return float(min(max(factor, f_min), f_max))
 
 
-# ---------------------------------------------------------------------------
-# Position
-# ---------------------------------------------------------------------------
 @dataclass
 class Position:
     ticker: str
-    direction: int          # D: +1 long, -1 short
+    direction: int
     entry_price: float
     size: float
-    risk_unit: float        # ATR * atr_multiplier * gradient_factor
+    risk_unit: float
     stop_loss: float
     take_profit: float
-    entry_gradient: float = 0.0        # m (price/bar) at entry
-    entry_gradient_norm: float = 0.0   # m_norm (dimensionless) at entry
+    entry_gradient: float = 0.0
+    entry_gradient_norm: float = 0.0
     gradient_factor: float = 1.0
     locked_rr: Optional[float] = None
     max_rr_seen: float = 0.0
@@ -181,16 +96,13 @@ class Position:
         return self.current_gain(current_price) * self.size
 
 
-# ---------------------------------------------------------------------------
-# Risk Manager
-# ---------------------------------------------------------------------------
 class RiskManager:
-    """RAATS adaptive risk manager with gradient-driven bi-directional stops.
+    """RAATS adaptive risk manager.
 
-    direction_source:
-        "gradient"  - D from price gradient only (spec-literal default)
-        "signal"    - D from the LLM signal only (previous behaviour)
-        "agreement" - trade only when gradient and LLM signal agree
+    Direction logic (finalized): the LLM signal is an INVEST/HOLD filter,
+    not a direction-picker. HOLD -> no trade, regardless of gradient.
+    BUY or SELL (either) -> "invest" is confirmed; the GRADIENT's sign then
+    picks the actual direction (positive -> BUY, negative -> SELL).
     """
 
     def __init__(
@@ -207,7 +119,6 @@ class RiskManager:
         gradient_f_min: float = 0.75,
         gradient_f_max: float = 2.0,
         widen_with_trend: bool = True,
-        direction_source: str = "agreement",
     ):
         self.atr_multiplier = atr_multiplier
         self.rrr = rrr
@@ -223,68 +134,42 @@ class RiskManager:
         self.gradient_f_max = gradient_f_max
         self.widen_with_trend = widen_with_trend
 
-        if direction_source not in ("gradient", "signal", "agreement"):
-            raise ValueError(f"Unknown direction_source: {direction_source}")
-        self.direction_source = direction_source
-
         self.positions: Dict[str, Position] = {}
         self.daily_pnl: float = 0.0
         self.closed_trades: List[dict] = []
-        self.conflicts: List[dict] = []   # gradient vs LLM disagreements
 
-    # -- gradient helpers ---------------------------------------------------
     def resolve_gradient(self, closes: Sequence[float], atr: float) -> Tuple[float, float]:
-        """Return (m, m_norm) for the configured lookback."""
         m = compute_gradient(closes, self.gradient_lookback)
         m_norm = normalize_gradient(m, self.gradient_lookback, atr)
         return m, m_norm
 
     def compute_risk_unit(self, atr: float, m_norm: float) -> Tuple[float, float]:
-        """Return (risk_unit, gradient_factor)."""
         gf = gradient_factor(
-            m_norm,
-            k=self.gradient_k,
-            f_min=self.gradient_f_min,
-            f_max=self.gradient_f_max,
-            widen_with_trend=self.widen_with_trend,
+            m_norm, k=self.gradient_k, f_min=self.gradient_f_min,
+            f_max=self.gradient_f_max, widen_with_trend=self.widen_with_trend,
         )
         return atr * self.atr_multiplier * gf, gf
 
     def resolve_direction(self, m_norm: float, signal: str) -> Tuple[int, str]:
-        """Return (direction, reason). direction 0 means stand aside."""
+        """LLM = invest/hold filter (signal is "INVEST" or "HOLD").
+        Gradient = direction, when investing.
+
+        Returns (direction, reason). direction 0 means stand aside.
+        """
         signal = (signal or "").upper()
+
+        if signal != "INVEST":
+            return 0, f"LLM signal is {signal or 'empty'} - no trade considered"
+
         grad_dir = direction_from_gradient(m_norm, self.gradient_deadband)
-        sig_dir = 1 if signal == "BUY" else -1 if signal == "SELL" else 0
-
-        if self.direction_source == "gradient":
-            if grad_dir == 0:
-                return 0, (f"Gradient within deadband (|m_norm|={abs(m_norm):.3f} "
-                           f"< {self.gradient_deadband}) - no clear direction")
-            if sig_dir != 0 and sig_dir != grad_dir:
-                self.conflicts.append({"m_norm": m_norm, "signal": signal,
-                                       "gradient_dir": grad_dir})
-                return grad_dir, (f"Gradient ({'up' if grad_dir > 0 else 'down'}) "
-                                  f"overrides LLM signal {signal}")
-            return grad_dir, f"Direction from gradient (m_norm={m_norm:+.3f})"
-
-        if self.direction_source == "signal":
-            if sig_dir == 0:
-                return 0, f"Signal {signal} is not directional"
-            return sig_dir, f"Direction from LLM signal ({signal})"
-
-        # agreement
         if grad_dir == 0:
-            return 0, f"Gradient within deadband (|m_norm|={abs(m_norm):.3f})"
-        if sig_dir == 0:
-            return 0, f"Signal {signal} is not directional"
-        if sig_dir != grad_dir:
-            self.conflicts.append({"m_norm": m_norm, "signal": signal,
-                                   "gradient_dir": grad_dir})
-            return 0, (f"Conflict: LLM says {signal} but gradient is "
-                       f"{'up' if grad_dir > 0 else 'down'} (m_norm={m_norm:+.3f})")
-        return sig_dir, f"Gradient and signal agree ({signal}, m_norm={m_norm:+.3f})"
+            return 0, (f"LLM confirmed an opportunity (INVEST), but gradient has no "
+                       f"clear direction (|m_norm|={abs(m_norm):.3f} < {self.gradient_deadband})")
 
-    # -- 3.2.3 Tiered position sizing ---------------------------------------
+        chosen = "BUY" if grad_dir == 1 else "SELL"
+        return grad_dir, (f"LLM confirmed an opportunity (INVEST); gradient "
+                          f"(m_norm={m_norm:+.3f}) sets direction to {chosen}")
+
     def calculate_position_size(self, total_capital: float, is_top_five: bool = False) -> float:
         if total_capital <= 200:
             return total_capital / 10
@@ -295,14 +180,13 @@ class RiskManager:
             return base
         return 0.5 * total_capital
 
-    # -- 3.2.1 SL / TP on entry ---------------------------------------------
     def compute_initial_levels(self, entry_price: float, direction: int,
                                risk_unit: float) -> Tuple[float, float]:
+        """BUY (D=+1): SL below entry, TP above. SELL (D=-1): SL above, TP below."""
         stop_loss = entry_price - (direction * risk_unit)
         take_profit = entry_price + (direction * self.rrr * risk_unit)
         return stop_loss, take_profit
 
-    # -- Daily loss circuit breaker -----------------------------------------
     def can_trade_today(self, portfolio_value: float) -> bool:
         if self.daily_pnl >= 0:
             return True
@@ -314,23 +198,11 @@ class RiskManager:
     def reset_daily(self) -> None:
         self.daily_pnl = 0.0
 
-    # -- Trade validation ---------------------------------------------------
     def validate_trade(
-        self,
-        ticker: str,
-        signal: str,
-        current_price: float,
-        portfolio_value: float,
-        atr: float,
-        closes: Optional[Sequence[float]] = None,
-        m_norm: Optional[float] = None,
-        is_top_five: bool = False,
+        self, ticker: str, signal: str, current_price: float, portfolio_value: float,
+        atr: float, closes: Optional[Sequence[float]] = None,
+        m_norm: Optional[float] = None, is_top_five: bool = False,
     ) -> Tuple[bool, float, int, str]:
-        """Validate a proposed trade.
-
-        Supply either `closes` (gradient computed internally) or a precomputed
-        `m_norm`. Returns (approved, size, direction, reason).
-        """
         if not self.can_trade_today(portfolio_value):
             return False, 0.0, 0, (
                 f"Daily loss limit reached (pnl={self.daily_pnl:.2f}, "
@@ -367,45 +239,26 @@ class RiskManager:
 
         return True, size, direction, reason
 
-    # -- Opening ------------------------------------------------------------
     def open_position(
-        self,
-        ticker: str,
-        direction: int,
-        entry_price: float,
-        size: float,
-        atr: float,
-        m: float = 0.0,
-        m_norm: float = 0.0,
+        self, ticker: str, direction: int, entry_price: float, size: float,
+        atr: float, m: float = 0.0, m_norm: float = 0.0,
     ) -> Position:
         risk_unit, gf = self.compute_risk_unit(atr, m_norm)
         stop_loss, take_profit = self.compute_initial_levels(entry_price, direction, risk_unit)
 
         position = Position(
-            ticker=ticker,
-            direction=direction,
-            entry_price=entry_price,
-            size=size,
-            risk_unit=risk_unit,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            entry_gradient=m,
-            entry_gradient_norm=m_norm,
-            gradient_factor=gf,
+            ticker=ticker, direction=direction, entry_price=entry_price, size=size,
+            risk_unit=risk_unit, stop_loss=stop_loss, take_profit=take_profit,
+            entry_gradient=m, entry_gradient_norm=m_norm, gradient_factor=gf,
         )
         self.positions[ticker] = position
         return position
 
-    # -- 3.2.2 Adaptive bi-directional stepping stop ------------------------
     def update_stepping_stop(self, ticker: str, current_price: float) -> dict:
-        """Verified stepping logic (unchanged).
-
+        """
             steps     = floor((current_rr - 2.0) / 0.5)
             locked_rr = 1.5 + (steps * 0.5)
             new_sl    = P_entry + (D * locked_rr * risk_unit)
-
-        Gradient enters through risk_unit, so stepped stops inherit the
-        gradient scaling automatically.
         """
         position = self.positions.get(ticker)
         if position is None:
@@ -436,7 +289,6 @@ class RiskManager:
         return {"updated": True, "current_rr": current_rr, "steps": steps,
                 "locked_rr": locked_rr, "old_stop_loss": old_sl, "stop_loss": new_sl}
 
-    # -- Exit checks --------------------------------------------------------
     def check_exit(self, ticker: str, current_price: float) -> Optional[str]:
         position = self.positions.get(ticker)
         if position is None:
@@ -480,7 +332,6 @@ class RiskManager:
         self.closed_trades.append(record)
         return record
 
-    # -- Reporting ----------------------------------------------------------
     def portfolio_summary(self, prices: Optional[Dict[str, float]] = None) -> dict:
         prices = prices or {}
         unrealized = sum(p.unrealized_pnl(prices[t])
@@ -494,5 +345,4 @@ class RiskManager:
             "unrealized_pnl": unrealized,
             "daily_pnl": self.daily_pnl,
             "win_rate": (len(wins) / len(self.closed_trades) * 100) if self.closed_trades else 0.0,
-            "gradient_signal_conflicts": len(self.conflicts),
         }

@@ -1,3 +1,17 @@
+"""
+src/agents/analyst.py
+
+LLM signal is now INVEST / HOLD, not BUY / SELL / HOLD.
+
+Rationale: gradient (not the LLM) determines trade direction (see
+src/risk/risk_manager.py's resolve_direction). Asking the LLM to guess a
+side (BUY/SELL) was misleading - that guess was being silently discarded
+whenever it disagreed with the gradient, which is confusing to read in logs
+and doesn't reflect what the LLM's output is actually used for. INVEST/HOLD
+matches its real role: confirm there's a genuine opportunity worth trading
+(informed by market data + sentiment), and let deterministic Python
+(gradient + risk_manager) handle direction, sizing, and execution.
+"""
 
 import json
 import logging
@@ -12,8 +26,6 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("raats.agent.analyst")
 
-# Override via environment variable for quick A/B testing without code
-# changes: set RAATS_ANALYST_MODEL=mistral before running trading_loop.py.
 DEFAULT_ANALYST_MODEL = os.environ.get("RAATS_ANALYST_MODEL", "llama3")
 
 ANALYST_PROMPT = """You are a financial analyst. Given the following market data for {ticker}:
@@ -22,11 +34,16 @@ ANALYST_PROMPT = """You are a financial analyst. Given the following market data
 - RSI: {rsi}
 - Sentiment score: {sentiment}
 
-Respond ONLY in valid JSON, no extra text:
+Decide only whether this is a genuine trading OPPORTUNITY worth acting on
+right now, or whether conditions do not justify a trade. Do NOT pick a
+direction - that is determined separately from price trend data.
+
+Respond ONLY in valid JSON, no extra text. Keep "justification" to ONE
+short sentence, under 20 words:
 {{
-  "signal": "BUY | SELL | HOLD",
+  "signal": "INVEST | HOLD",
   "confidence": <0-1 float>,
-  "justification": "<one or two concise sentences>"
+  "justification": "<one short sentence, max 20 words>"
 }}"""
 
 
@@ -42,8 +59,19 @@ def _safe_parse_json(raw_text: str) -> Dict:
             return json.loads(text[start:end + 1])
         except json.JSONDecodeError:
             pass
-    logger.warning("Could not parse analyst output as JSON: %s", text[:150])
+    logger.warning("Could not parse analyst output as JSON (%d chars): %s", len(text), text)
     return {"signal": "HOLD", "confidence": 0.0, "justification": "Failed to parse LLM output."}
+
+
+def _normalize_signal(raw_signal: str) -> str:
+    """Map legacy/unexpected model output onto INVEST/HOLD, so a model that
+    ignores the prompt and still says BUY/SELL doesn't silently become an
+    unrecognized value downstream.
+    """
+    s = (raw_signal or "").strip().upper()
+    if s in ("INVEST", "BUY", "SELL"):
+        return "INVEST"
+    return "HOLD"
 
 
 def ollama_analyze(prompt: str, model_name: Optional[str] = None) -> str:
@@ -55,7 +83,7 @@ def ollama_analyze(prompt: str, model_name: Optional[str] = None) -> str:
     response = ollama.generate(
         model=model_name,
         prompt=prompt,
-        options={"temperature": 0.2},
+        options={"temperature": 0.2, "num_predict": 200},
     )
     return response.get("response", "")
 
@@ -86,7 +114,7 @@ def analyze_market(state: dict, model_name: Optional[str] = None) -> dict:
         }
 
     state["llm_analysis"] = result.get("justification", "")
-    state["signal"] = result.get("signal", "HOLD")
+    state["signal"] = _normalize_signal(result.get("signal", "HOLD"))
     state["confidence"] = result.get("confidence", 0.0)
-    state["analyst_model"] = model_name   # NEW: record which model produced this, for A/B comparison
+    state["analyst_model"] = model_name
     return state

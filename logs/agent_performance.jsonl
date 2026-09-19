@@ -88,3 +88,43 @@
 {"timestamp": "2026-09-18T23:12:54.502725+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 11.8, "stability": 11.81}, "pnl": 0.0}
 {"timestamp": "2026-09-18T23:12:54.519235+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 6.47, "stability": 5.83}, "pnl": 0.0}
 {"timestamp": "2026-09-18T23:12:54.534068+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 5.56, "stability": 5.97}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:42:59.619804+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 42.18, "stability": 11.44}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:43:22.115881+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 30.15, "stability": 6.31, "analyst": 22443.94, "executor": 8.91}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:43:30.651600+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 31.56, "stability": 6.21, "analyst": 8491.57, "executor": 0.44}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:43:41.170297+02:00", "signal": "BUY", "executed_price": 344.9800109863281, "latencies_ms": {"collector": 34.76, "stability": 4.48, "analyst": 10474.82, "executor": 0.48}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:43:50.231949+02:00", "signal": "BUY", "executed_price": null, "latencies_ms": {"collector": 29.44, "stability": 4.89, "analyst": 9021.48, "executor": 0.42}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:43:50.265812+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 27.31, "stability": 4.23}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:44:00.148101+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 25.2, "stability": 4.77, "analyst": 9845.31, "executor": 0.9}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:44:00.189986+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 31.56, "stability": 5.69}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:44:00.241556+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 44.41, "stability": 4.31}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:44:00.329816+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 81.87, "stability": 4.25}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:54:29.247832+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 22.59, "stability": 9.2}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:54:46.528902+02:00", "signal": "INVEST", "executed_price": null, "latencies_ms": {"collector": 5.17, "stability": 3.29, "analyst": 17260.96, "executor": 7.93}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:54:55.513505+02:00", "signal": "INVEST", "executed_price": null, "latencies_ms": {"collector": 6.38, "stability": 6.94, "analyst": 8968.31, "executor": 0.34}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:55:06.727569+02:00", "signal": "INVEST", "executed_price": null, "latencies_ms": {"collector": 3.73, "stability": 2.92, "analyst": 11202.55, "executor": 0.55}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:55:17.709701+02:00", "signal": "INVEST", "executed_price": null, "latencies_ms": {"collector": 6.0, "stability": 7.33, "analyst": 10961.02, "executor": 0.43}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:55:17.725809+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 5.79, "stability": 6.63}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:55:29.036153+02:00", "signal": "INVEST", "executed_price": null, "latencies_ms": {"collector": 4.91, "stability": 5.0, "analyst": 11294.12, "executor": 0.47}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:55:29.060086+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 10.07, "stability": 9.84}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:55:29.074867+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 5.2, "stability": 5.15}, "pnl": 0.0}
+{"timestamp": "2026-09-19T09:55:29.089506+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 5.29, "stability": 5.64}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:02:45.099736+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 20.11, "stability": 7.44}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:03:03.373763+02:00", "signal": "INVEST", "executed_price": null, "latencies_ms": {"collector": 3.13, "stability": 2.69, "analyst": 18242.01, "executor": 12.1}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:03:15.743724+02:00", "signal": "INVEST", "executed_price": null, "latencies_ms": {"collector": 10.58, "stability": 8.61, "analyst": 12278.01, "executor": 38.17}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:03:27.399129+02:00", "signal": "INVEST", "executed_price": null, "latencies_ms": {"collector": 55.84, "stability": 30.81, "analyst": 11038.6, "executor": 6.17}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:03:39.350871+02:00", "signal": "INVEST", "executed_price": null, "latencies_ms": {"collector": 55.02, "stability": 25.6, "analyst": 11419.23, "executor": 97.11}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:03:39.779629+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 44.78, "stability": 69.28}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:03:51.118797+02:00", "signal": "INVEST", "executed_price": null, "latencies_ms": {"collector": 90.68, "stability": 46.9, "analyst": 11027.66, "executor": 1.14}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:03:51.151835+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 17.48, "stability": 11.73}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:03:51.175433+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 10.08, "stability": 7.92}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:03:51.189782+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 5.76, "stability": 4.06}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:12:35.782108+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 20.52, "stability": 7.88}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:12:53.857324+02:00", "signal": "INVEST", "executed_price": 331.3399963378906, "latencies_ms": {"collector": 4.62, "stability": 2.77, "analyst": 18055.01, "executor": 9.37}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:13:02.664186+02:00", "signal": "INVEST", "executed_price": 491.2300109863281, "latencies_ms": {"collector": 7.38, "stability": 5.92, "analyst": 8790.87, "executor": 0.38}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:13:14.314528+02:00", "signal": "INVEST", "executed_price": 344.9800109863281, "latencies_ms": {"collector": 3.94, "stability": 2.93, "analyst": 11639.95, "executor": 0.57}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:13:25.172140+02:00", "signal": "INVEST", "executed_price": 248.4199981689453, "latencies_ms": {"collector": 5.45, "stability": 6.96, "analyst": 10836.95, "executor": 0.54}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:13:25.188265+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 5.23, "stability": 5.66}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:13:35.978129+02:00", "signal": "INVEST", "executed_price": 670.239990234375, "latencies_ms": {"collector": 4.94, "stability": 5.99, "analyst": 10773.06, "executor": 0.52}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:13:36.004249+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 10.58, "stability": 10.69}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:13:36.021572+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 5.84, "stability": 6.5}, "pnl": 0.0}
+{"timestamp": "2026-09-19T10:13:36.039481+02:00", "signal": "HOLD", "executed_price": null, "latencies_ms": {"collector": 8.88, "stability": 6.13}, "pnl": 0.0}

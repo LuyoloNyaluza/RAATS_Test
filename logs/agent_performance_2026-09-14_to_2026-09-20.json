@@ -1,0 +1,112 @@
+[
+  {
+    "timestamp": "2026-09-19T10:22:54.185267+02:00",
+    "signal": "HOLD",
+    "executed_price": null,
+    "latencies_ms": {
+      "collector": 19.66,
+      "stability": 9.42
+    },
+    "pnl": 0.0
+  },
+  {
+    "timestamp": "2026-09-19T10:23:11.129619+02:00",
+    "signal": "INVEST",
+    "executed_price": 331.3399963378906,
+    "latencies_ms": {
+      "collector": 3.14,
+      "stability": 2.65,
+      "analyst": 16920.13,
+      "executor": 9.17
+    },
+    "pnl": 0.0
+  },
+  {
+    "timestamp": "2026-09-19T10:23:19.471278+02:00",
+    "signal": "INVEST",
+    "executed_price": 491.2300109863281,
+    "latencies_ms": {
+      "collector": 5.44,
+      "stability": 6.2,
+      "analyst": 8316.13,
+      "executor": 0.38
+    },
+    "pnl": 0.0
+  },
+  {
+    "timestamp": "2026-09-19T10:23:28.962363+02:00",
+    "signal": "INVEST",
+    "executed_price": 344.9800109863281,
+    "latencies_ms": {
+      "collector": 3.91,
+      "stability": 3.65,
+      "analyst": 9471.33,
+      "executor": 0.56
+    },
+    "pnl": 0.0
+  },
+  {
+    "timestamp": "2026-09-19T10:23:40.752308+02:00",
+    "signal": "INVEST",
+    "executed_price": 248.4199981689453,
+    "latencies_ms": {
+      "collector": 6.89,
+      "stability": 5.46,
+      "analyst": 11759.85,
+      "executor": 0.55
+    },
+    "pnl": 0.0
+  },
+  {
+    "timestamp": "2026-09-19T10:23:40.777502+02:00",
+    "signal": "HOLD",
+    "executed_price": null,
+    "latencies_ms": {
+      "collector": 5.75,
+      "stability": 5.97
+    },
+    "pnl": 0.0
+  },
+  {
+    "timestamp": "2026-09-19T10:23:52.653114+02:00",
+    "signal": "INVEST",
+    "executed_price": 670.239990234375,
+    "latencies_ms": {
+      "collector": 5.29,
+      "stability": 5.44,
+      "analyst": 11849.6,
+      "executor": 0.51
+    },
+    "pnl": 0.0
+  },
+  {
+    "timestamp": "2026-09-19T10:23:52.691328+02:00",
+    "signal": "HOLD",
+    "executed_price": null,
+    "latencies_ms": {
+      "collector": 11.22,
+      "stability": 9.26
+    },
+    "pnl": 0.0
+  },
+  {
+    "timestamp": "2026-09-19T10:23:52.719145+02:00",
+    "signal": "HOLD",
+    "executed_price": null,
+    "latencies_ms": {
+      "collector": 5.63,
+      "stability": 5.92
+    },
+    "pnl": 0.0
+  },
+  {
+    "timestamp": "2026-09-19T10:23:52.764525+02:00",
+    "signal": "HOLD",
+    "executed_price": null,
+    "latencies_ms": {
+      "collector": 4.71,
+      "stability": 4.65
+    },
+    "pnl": 0.0
+  }
+]
