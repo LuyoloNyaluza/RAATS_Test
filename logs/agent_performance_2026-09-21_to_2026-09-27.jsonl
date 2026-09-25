@@ -1,0 +1,10 @@
+{"timestamp":"2026-09-25T13:40:26.064316+02:00","signal":"HOLD","ticker":"TSLA","executed_price":null,"latencies_ms":{"collector":62.23,"stability":14.52},"pnl":0.0}
+{"timestamp":"2026-09-25T13:40:48.149179+02:00","signal":"INVEST","ticker":"AAPL","executed_price":331.3399963378906,"latencies_ms":{"collector":20.95,"stability":4.21,"analyst":22044.46,"executor":12.21},"pnl":0.0}
+{"timestamp":"2026-09-25T13:40:56.480681+02:00","signal":"INVEST","ticker":"MSFT","executed_price":491.2300109863281,"latencies_ms":{"collector":23.07,"stability":9.17,"analyst":8289.4,"executor":0.54},"pnl":0.0}
+{"timestamp":"2026-09-25T13:41:09.891367+02:00","signal":"INVEST","ticker":"GOOGL","executed_price":344.9800109863281,"latencies_ms":{"collector":33.34,"stability":6.07,"analyst":13364.41,"executor":0.37},"pnl":0.0}
+{"timestamp":"2026-09-25T13:41:20.722687+02:00","signal":"INVEST","ticker":"AMZN","executed_price":248.4199981689453,"latencies_ms":{"collector":33.77,"stability":8.06,"analyst":10783.14,"executor":0.69},"pnl":0.0}
+{"timestamp":"2026-09-25T13:41:20.773766+02:00","signal":"HOLD","ticker":"NVDA","executed_price":null,"latencies_ms":{"collector":38.12,"stability":6.53},"pnl":0.0}
+{"timestamp":"2026-09-25T13:41:31.837907+02:00","signal":"INVEST","ticker":"META","executed_price":670.239990234375,"latencies_ms":{"collector":31.45,"stability":6.69,"analyst":11020.35,"executor":0.58},"pnl":0.0}
+{"timestamp":"2026-09-25T13:41:31.894090+02:00","signal":"HOLD","ticker":"NFLX","executed_price":null,"latencies_ms":{"collector":40.94,"stability":9.98},"pnl":0.0}
+{"timestamp":"2026-09-25T13:41:31.942183+02:00","signal":"HOLD","ticker":"AMD","executed_price":null,"latencies_ms":{"collector":39.09,"stability":5.12},"pnl":0.0}
+{"timestamp":"2026-09-25T13:41:32.156229+02:00","signal":"HOLD","ticker":"INTC","executed_price":null,"latencies_ms":{"collector":217.01,"stability":3.79},"pnl":0.0}

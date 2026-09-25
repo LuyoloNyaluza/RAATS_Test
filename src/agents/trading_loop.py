@@ -1,3 +1,4 @@
+
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TypedDict, Dict, Any, List, Optional
@@ -39,8 +40,9 @@ class AgentState(TypedDict, total=False):
     risk_manager: Any
     stability_status: str
     stability_detail: Dict[str, Any]
-    latencies: Dict[str, float]          # NEW - was missing, caused {} bug
-    analyst_model: Optional[str]          # NEW - records which model was used
+    latencies: Dict[str, float]
+    analyst_model: Optional[str]
+    simulate_date: Optional[str]   # NEW - "YYYY-MM-DD" or None for live mode
 
 
 _STABILITY_FILTER = MarketStabilityFilter()
@@ -49,8 +51,9 @@ _STABILITY_FILTER = MarketStabilityFilter()
 @node_timer("collector")
 def collector_node(state: AgentState) -> AgentState:
     ticker = state.get("ticker", "AAPL")
-    state["market_data"] = collect_market_data(ticker)
-    state["sentiment"] = collect_sentiment(ticker)
+    as_of = state.get("simulate_date")
+    state["market_data"] = collect_market_data(ticker, as_of=as_of)
+    state["sentiment"] = collect_sentiment(ticker, as_of=as_of)
     state["timestamp"] = state["market_data"]["timestamp"]
     return state
 
@@ -58,8 +61,9 @@ def collector_node(state: AgentState) -> AgentState:
 @node_timer("stability")
 def stability_node(state: AgentState) -> AgentState:
     ticker = state.get("ticker", "AAPL")
+    as_of = state.get("simulate_date")
     try:
-        df = collect_ohlcv_frame(ticker)
+        df = collect_ohlcv_frame(ticker, as_of=as_of)
         result = _STABILITY_FILTER.assess(df)
         state["stability_status"] = result.status
         state["stability_detail"] = result.indicators
@@ -84,7 +88,7 @@ def route_on_stability(state: AgentState) -> str:
 
 @node_timer("analyst")
 def analyst_node(state: AgentState) -> AgentState:
-    model_name = state.get("analyst_model")  # allows per-run A/B override
+    model_name = state.get("analyst_model")
     result = analyze_market(dict(state), model_name=model_name)
     state.update(result)  # type: ignore[typeddict-item]
     return state
@@ -123,6 +127,8 @@ def run_daily_cycle(
     portfolio_value: float = 10_000,
     is_top_five: bool = False,
     analyst_model: Optional[str] = None,
+    simulate_date: Optional[str] = None,
+    verbose: bool = True,
 ):
     app = app or build_graph()
     initial_state: AgentState = {
@@ -139,8 +145,9 @@ def run_daily_cycle(
         "is_top_five": is_top_five,
         "risk_manager": risk_manager,
         "stability_status": "",
-        "latencies": {},                 # NEW - seed the field
-        "analyst_model": analyst_model,  # None -> analyst.py's default
+        "latencies": {},
+        "analyst_model": analyst_model,
+        "simulate_date": simulate_date,
     }
     final_state = app.invoke(initial_state)
     signal = str(final_state.get("llm_signal") or final_state.get("signal") or "")
@@ -152,22 +159,24 @@ def run_daily_cycle(
         pnl=final_state.get("closed_trade", {}).get("pnl", 0.0),
     )
 
-    print("=== Daily Cycle Result ===")
-    print(f"Ticker:      {final_state.get('ticker')}")
-    print(f"Stability:   {final_state.get('stability_status')}")
-    if final_state.get("stability_status") != "Stable":
-        print(f"Deferred:    {final_state.get('risk_reason')}")
-        return final_state
+    if verbose:
+        print("=== Daily Cycle Result ===")
+        print(f"Ticker:      {final_state.get('ticker')}"
+              + (f"  (as of {simulate_date})" if simulate_date else ""))
+        print(f"Stability:   {final_state.get('stability_status')}")
+        if final_state.get("stability_status") != "Stable":
+            print(f"Deferred:    {final_state.get('risk_reason')}")
+            return final_state
 
-    print(f"LLM signal:  {final_state.get('llm_signal')} "
-          f"(confidence: {final_state.get('confidence')}, model: {final_state.get('analyst_model')})")
-    print(f"Executed:    {final_state.get('executed')}  "
-          f"@ {final_state.get('executed_price')}")
-    if final_state.get("executed") and final_state.get("stop_loss") is not None:
-        print(f"Direction:   {final_state.get('direction')}  size={final_state.get('position_size'):.4f}")
-        print(f"SL / TP:     {final_state.get('stop_loss'):.2f} / {final_state.get('take_profit'):.2f}")
-    print(f"Risk note:   {final_state.get('risk_reason')}")
-    print(f"Latencies:   {final_state.get('latencies')}")
+        print(f"LLM signal:  {final_state.get('llm_signal')} "
+              f"(confidence: {final_state.get('confidence')}, model: {final_state.get('analyst_model')})")
+        print(f"Executed:    {final_state.get('executed')}  "
+              f"@ {final_state.get('executed_price')}")
+        if final_state.get("executed") and final_state.get("stop_loss") is not None:
+            print(f"Direction:   {final_state.get('direction')}  size={final_state.get('position_size'):.4f}")
+            print(f"SL / TP:     {final_state.get('stop_loss'):.2f} / {final_state.get('take_profit'):.2f}")
+        print(f"Risk note:   {final_state.get('risk_reason')}")
+        print(f"Latencies:   {final_state.get('latencies')}")
     return final_state
 
 
@@ -177,9 +186,6 @@ def run_watchlist(
     top_five: Optional[List[str]] = None,
     analyst_model: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Sequential watchlist run (unchanged behaviour, one shared RiskManager
-    so per-ticker position/capital constraints are enforced correctly).
-    """
     app = build_graph()
     risk_manager = RiskManager()
     top_five = top_five or []
@@ -218,28 +224,11 @@ def run_watchlist_concurrent(
     analyst_model: Optional[str] = None,
     max_workers: int = 5,
 ) -> List[Dict[str, Any]]:
-    """Run each ticker's cycle in a background thread so independent
-    tickers' Ollama calls overlap instead of strictly queuing.
-
-    CAVEATS - read before using this for anything beyond latency measurement:
-      - Each thread gets its OWN RiskManager (the existing one is not
-        thread-safe - concurrent mutation of its `positions` dict could
-        corrupt state). This means "is_top_five" tiered sizing bonuses and
-        cross-ticker capital constraints (only one position per ticker,
-        daily loss limit shared across the whole portfolio) are NOT
-        enforced across threads here - each ticker is evaluated as if it
-        had the full portfolio_value to itself.
-      - Safe and useful for: measuring wall-clock speedup, comparing model
-        latency, independent per-ticker signal generation.
-      - NOT yet safe for: live multi-ticker portfolio execution with shared
-        capital - that needs a proper thread-safe RiskManager (e.g. a lock
-        around position mutations) as a follow-up piece of work, not this.
-    """
     app = build_graph()
     results = []
 
     def _run_one(ticker: str):
-        rm = RiskManager()  # separate instance per thread - see caveat above
+        rm = RiskManager()
         return run_daily_cycle(
             ticker, app=app, risk_manager=rm,
             portfolio_value=portfolio_value, analyst_model=analyst_model,
