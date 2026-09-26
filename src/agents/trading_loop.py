@@ -1,3 +1,23 @@
+"""
+src/agents/trading_loop.py
+
+FIX (this version): an already-open position was NOT being monitored on
+Unstable days. The graph previously routed stability -> END on any
+Unstable verdict, skipping executor_node entirely - which meant
+update_stepping_stop() and check_exit() never ran for a position held
+through a volatile period, exactly when stop-loss enforcement matters
+most. Confirmed on real data: a LONG opened 2026-09-02 went unmonitored
+on both 2026-09-03 and 2026-09-04 (both Unstable), with no code path to
+catch a stop-loss breach on either day.
+
+Root cause was purely a routing gap, not a bug in execute_trade() itself
+- it already checks "is this ticker already in risk_manager.positions"
+BEFORE looking at signal, so monitoring an open position never actually
+needed the analyst to have run. The fix routes Unstable-but-holding
+tickers directly to executor (skipping analyst, saving an LLM call too),
+while Unstable-and-flat tickers still correctly defer to observation
+with no new entry considered.
+"""
 
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,7 +62,7 @@ class AgentState(TypedDict, total=False):
     stability_detail: Dict[str, Any]
     latencies: Dict[str, float]
     analyst_model: Optional[str]
-    simulate_date: Optional[str]   # NEW - "YYYY-MM-DD" or None for live mode
+    simulate_date: Optional[str]
 
 
 _STABILITY_FILTER = MarketStabilityFilter()
@@ -83,7 +103,19 @@ def stability_node(state: AgentState) -> AgentState:
 
 
 def route_on_stability(state: AgentState) -> str:
-    return "analyst" if state.get("stability_status") == "Stable" else "observe"
+    """Stable -> analyst (full cycle, may open a new position).
+    Unstable -> executor DIRECTLY if a position is already open on this
+                ticker (monitor/exit only, no new entry considered, no
+                LLM call spent); otherwise -> observe (defer, do nothing).
+    """
+    if state.get("stability_status") == "Stable":
+        return "analyst"
+
+    risk_manager = state.get("risk_manager")
+    ticker = state.get("ticker")
+    if risk_manager is not None and ticker in getattr(risk_manager, "positions", {}):
+        return "executor"
+    return "observe"
 
 
 @node_timer("analyst")
@@ -113,7 +145,7 @@ def build_graph():
     workflow.add_conditional_edges(
         "stability",
         route_on_stability,
-        {"analyst": "analyst", "observe": END},
+        {"analyst": "analyst", "executor": "executor", "observe": END},
     )
     workflow.add_edge("analyst", "executor")
     workflow.add_edge("executor", END)
@@ -166,10 +198,13 @@ def run_daily_cycle(
         print(f"Stability:   {final_state.get('stability_status')}")
         if final_state.get("stability_status") != "Stable":
             print(f"Deferred:    {final_state.get('risk_reason')}")
-            return final_state
-
-        print(f"LLM signal:  {final_state.get('llm_signal')} "
-              f"(confidence: {final_state.get('confidence')}, model: {final_state.get('analyst_model')})")
+            # NOTE: no longer an early return here - if a position was
+            # actually open and monitored via the executor-direct route,
+            # its result (closed_trade, updated stop, etc.) still needs
+            # to print below rather than being cut off at this point.
+        if final_state.get("analyst_model") is not None:
+            print(f"LLM signal:  {final_state.get('llm_signal')} "
+                  f"(confidence: {final_state.get('confidence')}, model: {final_state.get('analyst_model')})")
         print(f"Executed:    {final_state.get('executed')}  "
               f"@ {final_state.get('executed_price')}")
         if final_state.get("executed") and final_state.get("stop_loss") is not None:
