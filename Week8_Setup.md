@@ -1,5 +1,5 @@
-# Week 8 Setup - Integration: End‑to‑End Paper Trading
-**Goal:** Integrate all components into a single paper‑trading simulation, run historical simulation over a week of data, and generate performance report.
+# Week 8 Setup - Integration: End‑to‑End Paper Trading (Enhanced)
+**Goal:** Integrate all components into a single paper‑trading simulation with dynamic watchlist management, run historical simulation over a week of data, and generate performance report.
 
 ## Prerequisites
 - Completed Week 7 setup (risk management, latency measurement, logging)
