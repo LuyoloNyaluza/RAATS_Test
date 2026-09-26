@@ -15,7 +15,6 @@ from urllib.parse import quote
 
 from src.data.fetch_news import fetch_financial_news, fetch_news_for_watchlist
 from src.data.score_sentiment import score_articles, summarize_ticker_sentiment
-from src.data.process_news import load_and_clean_news
 
 
 def fetch_universe_news(
