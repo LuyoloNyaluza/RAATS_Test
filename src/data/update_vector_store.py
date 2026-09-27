@@ -6,6 +6,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+LOCAL_TZ = ZoneInfo("Africa/Johannesburg")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("raats.update_vector_store")
@@ -93,7 +96,7 @@ def run_sentiment_scoring(news_dir: Optional[Path] = None, model_name: str = "mi
               f"{summary['positive']} positive, {summary['negative']} negative, "
               f"{summary['neutral']} neutral (overall: {summary['overall']})")
 
-    summary_path = news_dir / f"sentiment_summary_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    summary_path = news_dir / f"sentiment_summary_{datetime.now(LOCAL_TZ).strftime('%Y%m%d_%H%M%S')}.json"
     with open(summary_path, "w", encoding="utf-8") as fh:
         json.dump(all_summaries, fh, indent=2)
     print(f"  Saved sentiment summary to {summary_path}")
