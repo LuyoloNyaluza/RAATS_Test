@@ -55,6 +55,8 @@ class DynamicTradingManager:
         # Initialize trading lists
         self.active_list: List[str] = []
         self.waitlist: List[str] = []
+        self._initial_active: List[str] = []
+        self._initial_waitlist: List[str] = []
         self.all_sentiment_scores: Dict[str, float] = {}
         
         # Track positions and performance
@@ -264,7 +266,7 @@ def run_dynamic_trading_session(
     
     # Store initial lists for summary
     manager._initial_active = manager.active_list.copy()
-    manager._initial_waitlist = manager.waitlist.copy()
+    setattr(manager, "_initial_waitlist", manager.waitlist.copy())
     
     # Run the trading session
     results = manager.run_trading_session(simulate_date=simulate_date)
