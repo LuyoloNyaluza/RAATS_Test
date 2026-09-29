@@ -1,46 +1,33 @@
 # File: src/agents/trading_loop_dynamic.py
 """
-Enhanced trading loop with dynamic watchlist management.
-
-FIXES in this version, against the original:
-
-1. CRASH FIXED: `result.get("executed_price", 0.0)` looked safe but
-   wasn't - stability_node explicitly sets executed_price=None (the key
-   EXISTS with value None), so .get()'s default was never used, and
-   f"{None:8.2f}" crashed. Now formatted with an explicit None check.
-
-2. SUMMARY NOW REFLECTS REAL TRADES: the original created
-   self.risk_manager but never used it - run_watchlist_concurrent gives
-   each thread its OWN throwaway RiskManager (by design, for thread
-   safety), so self.risk_manager.portfolio_summary() always reported
-   zero trades even when positions genuinely opened. Switched to
-   run_watchlist (sequential), which already correctly shares ONE
-   RiskManager across all tickers - the tradeoff is losing concurrent
-   Ollama calls in exchange for a summary that's actually true.
-
-3. REAL PERFORMANCE METRICS: reuses
-   src.simulation.orchestrator.compute_performance_metrics (the same
-   Sharpe/drawdown/return calculation run_simulation.py's report uses),
-   rather than only ever printing a raw portfolio_summary() dict.
-
-4. THREE-WAY CATEGORIZATION: results are now split into EXECUTED
-   (a trade opened), HOLD (the LLM said no - a real signal, not a
-   block), and UNSTABLE (the stability filter deferred it) - the
-   original only distinguished EXECUTED vs SKIPPED, conflating "LLM
-   said no" with "market was too volatile to even ask."
-
-5. JSONL LOGGING: pre-market scan results and the end-of-session
-   summary are now written to the weekly JSONL log (via log_scan /
-   log_session_summary), not just printed to a terminal that scrolls
-   away.
+Enhanced trading loop with dynamic watchlist management using a discovery layer.
+Integrates the discovery layer (src/data/discovery.py) to generate a dynamic
+ticker universe each day based on:
+  1. 35 deterministic random S&P 500 candidates
+  2. Google News RSS discovers ticker/company mentions from previous market day
+  3. yfinance identifies previous-session market movers from S&P 500 universe
+  4. Excludes open positions to avoid churning existing holdings
+Then uses the existing watchlist manager to fetch news, score sentiment, and
+generate active/waitlist arrays.
 """
 
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
+import pandas as pd
 
 from src.data.watchlist_manager import (
     get_top_tickers_by_sentiment,
     update_trading_lists
+)
+from src.data.discovery import (
+    get_sp500_universe,
+    get_random_base,
+    discover_tickers_from_news,
+    discover_market_movers,
+    build_candidate_base,
+    build_company_map,
+    fetch_previous_session_data,
+    get_previous_trading_day
 )
 from src.agents.trading_loop import (
     AgentState,
@@ -48,7 +35,7 @@ from src.agents.trading_loop import (
 )
 from src.risk.risk_manager import RiskManager
 from src.simulation.orchestrator import compute_performance_metrics
-from src.utils.logger import log_session_summary
+from src.utils.logger import log_session_summary, log_daily_watchlist
 
 
 def _format_price(price: Optional[float]) -> str:
@@ -61,7 +48,7 @@ def _format_price(price: Optional[float]) -> str:
 class DynamicTradingManager:
     """
     Manages dynamic watchlist based on news sentiment and position tracking.
-    - Read news before market opens
+    - Read news before market opens (via discovery layer + watchlist manager)
     - Hold top-N array (ranked by sentiment)
     - Open trades for the top active_list
     - As trades close, fill from waiting list
@@ -70,7 +57,7 @@ class DynamicTradingManager:
 
     def __init__(
         self,
-        ticker_universe: List[str],
+        ticker_universe: Optional[List[str]] = None,  # If None, will be generated dynamically
         max_active_positions: int = 10,
         waitlist_size: int = 10,
         max_articles_per_ticker: int = 5,
@@ -80,7 +67,8 @@ class DynamicTradingManager:
         portfolio_value: float = 10_000,
         analyst_model: Optional[str] = None
     ):
-        self.ticker_universe = ticker_universe
+        # If a fixed universe is provided, use it; otherwise generate dynamically each pre-market scan
+        self.fixed_ticker_universe = ticker_universe
         self.max_active_positions = max_active_positions
         self.waitlist_size = waitlist_size
         self.max_articles_per_ticker = max_articles_per_ticker
@@ -105,21 +93,160 @@ class DynamicTradingManager:
 
         self.shared_app = build_graph()
 
+        # Placeholders for discovery logging
+        self._last_universe: List[str] = []
+        self._last_random_list: List[str] = []
+        self._last_date: Optional[str] = None
+
         print(f"DynamicTradingManager initialized:")
-        print(f"  Universe: {len(ticker_universe)} tickers")
+        if self.fixed_ticker_universe is not None:
+            print(f"  Using fixed universe: {len(self.fixed_ticker_universe)} tickers")
+        else:
+            print(f"  Universe will be generated dynamically each pre-market scan")
         print(f"  Max active positions: {max_active_positions}")
         print(f"  Waitlist size: {waitlist_size}")
         if total_article_cap is not None:
             print(f"  Total article budget: {total_article_cap} across the whole universe")
 
+    def _get_discovery_components(self) -> dict:
+        """Get all discovery components for logging and universe generation."""
+        # Get current open positions to exclude from discovery
+        open_positions = set(self.risk_manager.positions.keys())
+        
+        # Get previous trading day for data cutoff
+        previous_day = get_previous_trading_day()
+        
+        # ------------------------------------------------------------------
+        # 1. S&P 500 universe (excluding open positions)
+        # ------------------------------------------------------------------
+        all_sp500_symbols = get_sp500_universe()
+        sp500_symbols = [s for s in all_sp500_symbols if s not in open_positions]
+        print(f"Filtered S&P 500 universe (excluding open positions): {len(sp500_symbols)} symbols")
+        
+        # Need company names for Google News discovery
+        sp500_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        sp500_df = pd.read_html(sp500_url)[0]
+        ticker_to_company, company_to_ticker = build_company_map(sp500_df)
+        # Remove open positions from company mapping lookup if needed
+        for pos in open_positions:
+            company_to_ticker = {k: v for k, v in company_to_ticker.items() if v != pos}
+        
+        # ------------------------------------------------------------------
+        # 2. Random exploration (from filtered pool)
+        # ------------------------------------------------------------------
+        random_candidates = get_random_base(
+            sp500_symbols, 
+            target_date=None,  # uses today
+            exclude_positions=open_positions
+        )
+        print(f"Random exploration sample: {len(random_candidates)} (excluded {len(open_positions)} positions)")
+        
+        # ------------------------------------------------------------------
+        # 3. Download market data for entire filtered S&P 500
+        # ------------------------------------------------------------------
+        raw_sp500_data = fetch_previous_session_data(sp500_symbols, target_date=None)
+        print(f"Downloaded market data for {len(sp500_symbols)} symbols")
+        
+        # ------------------------------------------------------------------
+        # 4. Google News discovery
+        # ------------------------------------------------------------------
+        google_news = discover_tickers_from_news(
+            sp500_symbols,
+            ticker_to_company,
+            company_to_ticker,
+            target_date=None,
+            exclude_positions=open_positions,
+        )
+        news_candidates = list(google_news.keys())[:10]  # NEWS_DISCOVERY_COUNT
+        print(f"Google News discovered {len(google_news)} S&P 500 candidates.")
+        
+        # ------------------------------------------------------------------
+        # 5. Previous-session market movers
+        # ------------------------------------------------------------------
+        market_movers = discover_market_movers(
+            sp500_symbols, 
+            raw_sp500_data, 
+            target_date=None, 
+            exclude_positions=open_positions
+        )
+        mover_candidates = list(market_movers.keys())  # MARKET_MOVER_COUNT
+        print(f"Dynamic market movers discovered: {len(market_movers)}")
+        
+        # ------------------------------------------------------------------
+        # 6. Build unique 50 candidates (guaranteed no open positions)
+        # ------------------------------------------------------------------
+        candidates = build_candidate_base(random_candidates, news_candidates, mover_candidates)
+        # Absolute safety check against open positions
+        candidates = [c for c in candidates if c not in open_positions]
+        print(f"Final candidate base (excl. positions): {len(candidates)} symbols")
+        
+        return {
+            'candidates': candidates,
+            'random_list': random_candidates,
+            'news_candidates': news_candidates,
+            'mover_candidates': mover_candidates,
+            'sp500_filtered': sp500_symbols,
+            'previous_day': previous_day,
+            'open_positions': open_positions
+        }
+
+    def _generate_dynamic_universe(self) -> List[str]:
+        """Generate the ticker universe for today using the discovery layer.
+        Excludes currently open positions to avoid churning.
+        Returns a list of ticker symbols (aiming for ~50).
+        """
+        print("\n" + "="*60)
+        print("GENERATING DYNAMIC TICKER UNIVERSE VIA DISCOVERY LAYER")
+        print("="*60)
+        
+        components = self._get_discovery_components()
+        self._last_universe = components['candidates']
+        self._last_random_list = components['random_list']
+        return self._last_universe
+
     def pre_market_scan(self) -> Tuple[List[str], List[str], Dict[str, float]]:
-        """Fetch news, score sentiment, generate active/waitlist arrays."""
+        """
+        Fetch news, score sentiment, generate active/waitlist arrays.
+        Uses discovery layer to generate the ticker universe, then
+        delegates to the existing watchlist manager for news fetching,
+        sentiment scoring, and list generation.
+        """
         print("\n" + "="*60)
         print("PRE-MARKET SCAN: Fetching news and generating watchlists")
         print("="*60)
 
+        # Determine ticker universe
+        if self.fixed_ticker_universe is not None:
+            tickers = self.fixed_ticker_universe
+            # For static case, we still want to log something sensible for random list
+            self._last_universe = tickers[:50]  # cap at 50 for logging consistency
+            self._last_random_list = []  # no random exploration in static mode
+            print(f"Using fixed ticker universe of {len(tickers)} symbols")
+        else:
+            tickers = self._generate_dynamic_universe()
+            if not tickers:
+                print("WARNING: Dynamic universe generation returned empty list. Falling back to default watchlist.")
+                # Fallback to a small default list to avoid crashing
+                tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
+                self._last_universe = tickers[:50]
+                self._last_random_list = []
+
+        # Limit universe size to reasonable bounds (e.g., 50-100) as per original spec
+        max_universe = 100
+        if len(tickers) > max_universe:
+            print(f"Universe size {len(tickers)} exceeds max {max_universe}. Truncating.")
+            tickers = tickers[:max_universe]
+            # Also truncate the stored universe for logging
+            self._last_universe = tickers[:50]
+        print(f"Final ticker universe size: {len(tickers)}")
+        
+        # Store date for logging
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        self._last_date = today_str
+
+        # Delegate to existing watchlist manager for news fetching, sentiment scoring, and list generation
         active_list, waitlist, sentiment_scores = get_top_tickers_by_sentiment(
-            tickers=self.ticker_universe,
+            tickers=tickers,
             top_n=self.max_active_positions,
             waitlist_n=self.waitlist_size,
             max_articles_per_ticker=self.max_articles_per_ticker,
@@ -136,6 +263,15 @@ class DynamicTradingManager:
         print(f"  Active list ({len(self.active_list)}): {self.active_list}")
         print(f"  Waiting list ({len(self.waitlist)}): {self.waitlist}")
 
+        # Log start-of-day watchlist snapshot
+        log_daily_watchlist(
+            date=today_str,
+            top50=self._last_universe,
+            random_list=self._last_random_list,
+            top10_active=self.active_list,
+            open_trades=[],  # no open trades yet at start of day
+        )
+
         return self.active_list, self.waitlist, self.all_sentiment_scores
 
     def update_lists_after_trades(self, newly_closed_positions: List[str]) -> None:
@@ -150,7 +286,7 @@ class DynamicTradingManager:
             closed_positions=newly_closed_positions,
             current_active=self.active_list,
             current_waitlist=self.waitlist,
-            all_tickers=self.ticker_universe,
+            all_tickers=self.fixed_ticker_universe if self.fixed_ticker_universe is not None else self._last_universe,
             sentiment_scores=self.all_sentiment_scores,
             top_n=self.max_active_positions,
             waitlist_n=self.waitlist_size
@@ -198,14 +334,28 @@ class DynamicTradingManager:
 
         self._print_session_summary()
 
+        # Log end-of-day watchlist snapshot (open trades at close of day)
+        if self._last_date:
+            # The logger expects serializable dictionaries, while the risk
+            # manager stores Position objects.
+            open_trades_at_close = [
+                vars(position) for position in self.risk_manager.positions.values()
+            ]
+            log_daily_watchlist(
+                date=self._last_date,
+                top50=self._last_universe,
+                random_list=self._last_random_list,
+                top10_active=self.active_list,
+                open_trades=open_trades_at_close,
+            )
+
         return self.daily_results
 
     def _run_active_list_with_shared_manager(self) -> Tuple[List[Dict[str, Any]], RiskManager]:
         """Run the active list sequentially against THIS session's
         self.risk_manager directly (bypassing run_watchlist's internal
         manager), so positions genuinely persist in the object this
-        class reports on afterward.
-        """
+        class reports on afterward."""
         from src.agents.trading_loop import run_daily_cycle
 
         results = []
@@ -233,8 +383,7 @@ class DynamicTradingManager:
         """Split today's results into EXECUTED / HOLD / UNSTABLE, so the
         report can show "these were on hold" distinctly from "these were
         blocked by the stability filter" - the original conflated both
-        into a single SKIPPED bucket.
-        """
+        into a single SKIPPED bucket."""
         executed, hold, unstable = [], [], []
         for r in self.daily_results:
             ticker = r.get("ticker", "UNKNOWN")
@@ -249,8 +398,7 @@ class DynamicTradingManager:
     def _print_session_summary(self) -> None:
         """Print (and log) a summary of the trading session, using the
         SAME performance-metrics calculation run_simulation.py's report
-        uses, computed from this session's real, shared RiskManager.
-        """
+        uses, computed from this session's real, shared RiskManager."""
         print(f"\n{'='*60}")
         print(f"TRADING SESSION SUMMARY")
         print(f"{'='*60}")

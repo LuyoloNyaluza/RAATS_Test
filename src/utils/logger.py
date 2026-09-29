@@ -147,6 +147,37 @@ def log_session_summary(
     return _write_entry(entry, log_dir)
 
 
+def log_daily_watchlist(
+    *,
+    date: str,
+    top50: list[str],
+    random_list: list[str],
+    top10_active: list[str],
+    open_trades: list[dict],
+    log_dir: str = LOG_DIR,
+) -> dict:
+    """Append a daily watchlist snapshot (start‑of‑day or end‑of‑day).
+
+    Args:
+        date: ISO date string (YYYY-MM-DD) for the session.
+        top50: the ticker universe considered for the day (≈50 symbols).
+        random_list: the 35 deterministic random S&P 500 candidates.
+        top10_active: the top‑10 tickers selected for trading.
+        open_trades: list of open position dicts at the moment of logging.
+                     Each dict should contain at least 'ticker'.
+    """
+    entry = {
+        "timestamp": datetime.now(LOCAL_TZ).isoformat(),
+        "type": "daily_watchlist",
+        "date": date,
+        "top50_tickers": top50,
+        "random_list": random_list,
+        "top10_active": top10_active,
+        "open_trades": open_trades,
+    }
+    return _write_entry(entry, log_dir)
+
+
 def log_trade_event(
     event_type: str,
     trade_id: str,
