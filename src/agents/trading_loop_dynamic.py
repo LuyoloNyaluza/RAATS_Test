@@ -3,13 +3,19 @@
 Enhanced trading loop with dynamic watchlist management using a discovery layer.
 Integrates the discovery layer (src/data/discovery.py) to generate a dynamic
 ticker universe each day based on:
-  1. 35 deterministic random S&P 500 candidates
-  2. Google News RSS discovers ticker/company mentions from previous market day
-  3. yfinance identifies previous-session market movers from S&P 500 universe
-  4. Excludes open positions to avoid churning existing holdings
+  1. 35 deterministic random S&P 500 candidates (for logging)
+  2. Final top 50 universe from comparing previous day's Yahoo Finance top 50 performers
+     with Google RSS top 50 from previous day
 Then uses the existing watchlist manager to fetch news, score sentiment, and
 generate active/waitlist arrays.
 """
+
+import sys
+import os
+# Add the project root to sys.path so we can import src.* modules when this script is run directly
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
@@ -20,14 +26,7 @@ from src.data.watchlist_manager import (
     update_trading_lists
 )
 from src.data.discovery import (
-    get_sp500_universe,
-    get_random_base,
-    discover_tickers_from_news,
-    discover_market_movers,
-    build_candidate_base,
-    build_company_map,
-    fetch_previous_session_data,
-    get_previous_trading_day
+    get_discovery_components
 )
 from src.agents.trading_loop import (
     AgentState,
@@ -61,7 +60,7 @@ class DynamicTradingManager:
         max_active_positions: int = 10,
         waitlist_size: int = 10,
         max_articles_per_ticker: int = 5,
-        total_article_cap: Optional[int] = 30,
+        total_article_cap: Optional[int] = None,
         sentiment_model: str = "mistral",
         news_fetch_pause: float = 0.5,
         portfolio_value: float = 10_000,
@@ -107,87 +106,27 @@ class DynamicTradingManager:
         print(f"  Waitlist size: {waitlist_size}")
         if total_article_cap is not None:
             print(f"  Total article budget: {total_article_cap} across the whole universe")
+        else:
+            print(f"  No total article cap (fetching {max_articles_per_ticker} articles per ticker)")
 
     def _get_discovery_components(self) -> dict:
-        """Get all discovery components for logging and universe generation."""
-        # Get current open positions to exclude from discovery
+        """Get discovery components using the new discovery layer approach."""
+        # Get current open positions to exclude from consideration (though discovery layer now handles this internally)
         open_positions = set(self.risk_manager.positions.keys())
         
-        # Get previous trading day for data cutoff
-        previous_day = get_previous_trading_day()
+        # Get the discovery components from the new discovery layer
+        candidate_universe, random_list, auxiliary = get_discovery_components()
         
-        # ------------------------------------------------------------------
-        # 1. S&P 500 universe (excluding open positions)
-        # ------------------------------------------------------------------
-        all_sp500_symbols = get_sp500_universe()
-        sp500_symbols = [s for s in all_sp500_symbols if s not in open_positions]
-        print(f"Filtered S&P 500 universe (excluding open positions): {len(sp500_symbols)} symbols")
+        # Filter out any open positions from the candidate universe (extra safety)
+        filtered_universe = [ticker for ticker in candidate_universe if ticker not in open_positions]
         
-        # Need company names for Google News discovery
-        sp500_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        sp500_df = pd.read_html(sp500_url)[0]
-        ticker_to_company, company_to_ticker = build_company_map(sp500_df)
-        # Remove open positions from company mapping lookup if needed
-        for pos in open_positions:
-            company_to_ticker = {k: v for k, v in company_to_ticker.items() if v != pos}
-        
-        # ------------------------------------------------------------------
-        # 2. Random exploration (from filtered pool)
-        # ------------------------------------------------------------------
-        random_candidates = get_random_base(
-            sp500_symbols, 
-            target_date=None,  # uses today
-            exclude_positions=open_positions
-        )
-        print(f"Random exploration sample: {len(random_candidates)} (excluded {len(open_positions)} positions)")
-        
-        # ------------------------------------------------------------------
-        # 3. Download market data for entire filtered S&P 500
-        # ------------------------------------------------------------------
-        raw_sp500_data = fetch_previous_session_data(sp500_symbols, target_date=None)
-        print(f"Downloaded market data for {len(sp500_symbols)} symbols")
-        
-        # ------------------------------------------------------------------
-        # 4. Google News discovery
-        # ------------------------------------------------------------------
-        google_news = discover_tickers_from_news(
-            sp500_symbols,
-            ticker_to_company,
-            company_to_ticker,
-            target_date=None,
-            exclude_positions=open_positions,
-        )
-        news_candidates = list(google_news.keys())[:10]  # NEWS_DISCOVERY_COUNT
-        print(f"Google News discovered {len(google_news)} S&P 500 candidates.")
-        
-        # ------------------------------------------------------------------
-        # 5. Previous-session market movers
-        # ------------------------------------------------------------------
-        market_movers = discover_market_movers(
-            sp500_symbols, 
-            raw_sp500_data, 
-            target_date=None, 
-            exclude_positions=open_positions
-        )
-        mover_candidates = list(market_movers.keys())  # MARKET_MOVER_COUNT
-        print(f"Dynamic market movers discovered: {len(market_movers)}")
-        
-        # ------------------------------------------------------------------
-        # 6. Build unique 50 candidates (guaranteed no open positions)
-        # ------------------------------------------------------------------
-        candidates = build_candidate_base(random_candidates, news_candidates, mover_candidates)
-        # Absolute safety check against open positions
-        candidates = [c for c in candidates if c not in open_positions]
-        print(f"Final candidate base (excl. positions): {len(candidates)} symbols")
+        print(f"Discovery universe: {len(candidate_universe)} candidates -> {len(filtered_universe)} after excluding open positions")
+        print(f"Random list for logging: {len(random_list)} tickers")
         
         return {
-            'candidates': candidates,
-            'random_list': random_candidates,
-            'news_candidates': news_candidates,
-            'mover_candidates': mover_candidates,
-            'sp500_filtered': sp500_symbols,
-            'previous_day': previous_day,
-            'open_positions': open_positions
+            'candidates': filtered_universe,
+            'random_list': random_list,
+            'auxiliary': auxiliary
         }
 
     def _generate_dynamic_universe(self) -> List[str]:
@@ -239,7 +178,7 @@ class DynamicTradingManager:
             # Also truncate the stored universe for logging
             self._last_universe = tickers[:50]
         print(f"Final ticker universe size: {len(tickers)}")
-        
+
         # Store date for logging
         today_str = datetime.now().strftime("%Y-%m-%d")
         self._last_date = today_str
@@ -459,7 +398,7 @@ def run_dynamic_trading_session(
     max_active_positions: int = 10,
     waitlist_size: int = 10,
     max_articles_per_ticker: int = 5,
-    total_article_cap: Optional[int] = 30,
+    total_article_cap: Optional[int] = None,
     sentiment_model: str = "mistral",
     news_fetch_pause: float = 0.5,
     portfolio_value: float = 10_000,
@@ -518,10 +457,10 @@ if __name__ == "__main__":
 
     try:
         session = run_dynamic_trading_session(
-            ticker_universe=demo_universe,
+            ticker_universe=demo_universe, # use the demo universe to test fixed mode
             max_active_positions=10,
             waitlist_size=10,
-            total_article_cap=30,
+            total_article_cap=None, # No cap to get 5 articles per ticker
             news_fetch_pause=0.5,
             portfolio_value=10_000
         )

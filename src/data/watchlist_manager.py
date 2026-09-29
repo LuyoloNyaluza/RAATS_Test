@@ -18,6 +18,12 @@ articles scored will exceed the cap (e.g. 50 tickers, cap=30 -> 50
 articles, 1 each) rather than leaving some tickers with zero real
 sentiment data, which would otherwise default them to a neutral 0.0
 score and bias the ranking. A warning is printed when this happens.
+
+NEW: article_split - if provided, each ticker will be fetched with a specific
+number of articles from Google News and Yahoo Finance (e.g., (2,3) for 2 Google
+and 3 yfinance articles). When article_split is used, max_articles_per_ticker
+is set to the sum of the split and total_article_cap is ignored (since each
+ticker gets a fixed number of articles).
 """
 
 import json
@@ -28,7 +34,7 @@ from datetime import datetime, timedelta
 import feedparser
 from urllib.parse import quote
 
-from src.data.fetch_news import fetch_financial_news, fetch_news_for_watchlist
+from src.data.fetch_news import fetch_financial_news, fetch_yfinance_news, fetch_mixed_news_for_ticker
 from src.data.score_sentiment import score_articles, summarize_ticker_sentiment
 from src.utils.logger import log_scan
 
@@ -37,13 +43,21 @@ def _resolve_per_ticker_cap(
     n_tickers: int,
     max_articles_per_ticker: int,
     total_article_cap: Optional[int],
+    article_split: Optional[Tuple[int, int]] = None,
 ) -> int:
     """Resolve the effective per-ticker article cap.
 
-    If total_article_cap is given, distribute it evenly across tickers
-    (floor of 1 each - see module docstring for why). Otherwise fall
-    back to max_articles_per_ticker unchanged.
+    If article_split is given, we ignore max_articles_per_ticker and total_article_cap
+    and use the split (google_count + yf_count) as the fixed per-ticker count.
+
+    If total_article_cap is given (and no split), distribute it evenly across tickers
+    (floor of 1 each - see module docstring for why). Otherwise fall back
+    to max_articles_per_ticker unchanged.
     """
+    if article_split is not None:
+        google_count, yf_count = article_split
+        return google_count + yf_count
+
     if total_article_cap is None:
         return max_articles_per_ticker
 
@@ -64,22 +78,27 @@ def fetch_universe_news(
     max_articles_per_ticker: int = 5,
     total_article_cap: Optional[int] = None,
     pause: float = 0.5,
+    article_split: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, List[Dict]]:
-    """
-    Fetch news for a large universe of tickers.
+    """Fetch news for a large universe of tickers.
 
     Args:
         tickers: List of stock tickers to fetch news for
-        max_articles_per_ticker: Maximum articles to fetch per ticker
-        total_article_cap: Optional cap on TOTAL articles across the
-                            whole universe - see module docstring.
+        max_articles_per_ticker: Maximum articles to fetch per ticker (ignored if article_split is not None)
+        total_article_cap: Optional cap on TOTAL articles across the whole universe (ignored if article_split is not None)
         pause: Pause between requests to avoid rate limiting
+        article_split: Optional tuple (google_count, yf_count) to fetch a mixed of Google News and yfinance articles per ticker.
+                       If provided, each ticker gets exactly google_count + yf_count articles.
 
     Returns:
         Dictionary mapping ticker to list of news articles
     """
-    effective_cap = _resolve_per_ticker_cap(len(tickers), max_articles_per_ticker, total_article_cap)
-    print(f"Fetching news for {len(tickers)} tickers ({effective_cap} article(s) each)...")
+    effective_cap = _resolve_per_ticker_cap(len(tickers), max_articles_per_ticker, total_article_cap, article_split)
+    if article_split is not None:
+        google_count, yf_count = article_split
+        print(f"Fetching news for {len(tickers)} tickers ({google_count} Google + {yf_count} yfinance = {effective_cap} article(s) each)...")
+    else:
+        print(f"Fetching news for {len(tickers)} tickers ({effective_cap} article(s) each)...")
     all_articles = {}
 
     for i, ticker in enumerate(tickers):
@@ -87,10 +106,20 @@ def fetch_universe_news(
             print(f"  Progress: {i}/{len(tickers)} tickers processed")
 
         try:
-            articles = fetch_financial_news(
-                ticker=ticker,
-                max_articles=effective_cap
-            )
+            if article_split is not None:
+                google_count, yf_count = article_split
+                articles = fetch_mixed_news_for_ticker(
+                    ticker=ticker,
+                    max_articles=effective_cap,
+                    google_count=google_count,
+                    yf_count=yf_count,
+                    company_name=None,  # We don't have company names here; fetch_mixed_news_for_ticker will use ticker only
+                )
+            else:
+                articles = fetch_financial_news(
+                    ticker=ticker,
+                    max_articles=effective_cap
+                )
             all_articles[ticker] = articles
             print(f"  {ticker}: {len(articles)} articles")
         except Exception as e:
@@ -106,8 +135,7 @@ def score_universe_sentiment(
     news_data: Dict[str, List[Dict]],
     model_name: str = "mistral"
 ) -> Dict[str, List[Dict]]:
-    """
-    Score sentiment for all news articles in the universe.
+    """Score sentiment for all news articles in the universe.
 
     Args:
         news_data: Dictionary mapping ticker to list of news articles
@@ -142,8 +170,7 @@ def score_universe_sentiment(
 def aggregate_ticker_sentiment(
     scored_news: Dict[str, List[Dict]]
 ) -> Dict[str, float]:
-    """
-    Aggregate sentiment scores for each ticker.
+    """Aggregate sentiment scores for each ticker.
 
     Args:
         scored_news: Dictionary mapping ticker to list of scored articles
@@ -188,8 +215,7 @@ def generate_trading_lists(
     top_n: int = 10,
     waitlist_n: int = 10
 ) -> Tuple[List[str], List[str]]:
-    """
-    Generate active trading list and waiting list based on sentiment scores.
+    """Generate active trading list and waiting list based on sentiment scores.
 
     Args:
         sentiment_scores: Dictionary mapping ticker to sentiment score
@@ -233,8 +259,19 @@ def update_trading_lists(
     top_n: int = 10,
     waitlist_n: int = 10
 ) -> Tuple[List[str], List[str]]:
-    """
-    Update trading lists when positions close.
+    """Update trading lists when positions close.
+
+    Args:
+        closed_positions: List of tickers that were closed today
+        current_active: Current active list before update
+        current_waitlist: Current waitlist before update
+        all_tickers: Full universe of tickers
+        sentiment_scores: Dictionary mapping ticker to sentiment score
+        top_n: Number of tickers for active trading list
+        waitlist_n: Number of tickers for waiting list
+
+    Returns:
+        Tuple of (updated_active, updated_waitlist)
     """
     print(f"Updating lists due to {len(closed_positions)} closed positions: {closed_positions}")
 
@@ -265,6 +302,7 @@ def update_trading_lists(
     if waitlist_slots_needed > 0 and available_sorted:
         to_add_to_waitlist = available_sorted[:waitlist_slots_needed]
         updated_waitlist.extend(to_add_to_waitlist)
+        available_sorted = available_sorted[waitlist_slots_needed:]
         print(f"Added to waitlist: {to_add_to_waitlist}")
 
     updated_active = updated_active[:top_n]
@@ -285,21 +323,21 @@ def get_top_tickers_by_sentiment(
     model_name: str = "mistral",
     pause: float = 0.5,
     log_scans: bool = True,
+    article_split: Optional[Tuple[int, int]] = None,
 ) -> Tuple[List[str], List[str], Dict[str, float]]:
-    """
-    Complete workflow: fetch news, score sentiment, and generate trading lists.
+    """Complete workflow: fetch news, score sentiment, and generate trading lists.
 
     Args:
         tickers: Universe of tickers to evaluate
         top_n: Number of tickers for active trading list
         waitlist_n: Number of tickers for waiting list
-        max_articles_per_ticker: Max news articles to fetch per ticker
-        total_article_cap: Optional cap on TOTAL articles scored across
-                            the whole universe (see module docstring)
+        max_articles_per_ticker: Max news articles to fetch per ticker (ignored if article_split is not None)
+        total_article_cap: Optional cap on TOTAL articles scored across the whole universe (ignored if article_split is not None)
         model_name: Ollama model for sentiment scoring
         pause: Pause between API requests
-        log_scans: write each ticker's scan result to the weekly JSONL
-                   log via src.utils.logger.log_scan (default True)
+        log_scans: write each ticker's scan result to the weekly JSONL log via src.utils.logger.log_scan (default True)
+        article_split: Optional tuple (google_count, yf_count) to fetch a mixed of Google News and yfinance articles per ticker.
+                       If provided, each ticker gets exactly google_count + yf_count articles (e.g., (2,3) for 2 Google and 3 yfinance).
 
     Returns:
         Tuple of (active_list, waitlist, all_sentiment_scores)
@@ -311,7 +349,8 @@ def get_top_tickers_by_sentiment(
         tickers=tickers,
         max_articles_per_ticker=max_articles_per_ticker,
         total_article_cap=total_article_cap,
-        pause=pause
+        pause=pause,
+        article_split=article_split,
     )
 
     scored_news = score_universe_sentiment(
