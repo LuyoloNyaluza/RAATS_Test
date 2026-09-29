@@ -384,7 +384,7 @@ class DynamicTradingManager:
 
 
 def run_dynamic_trading_session(
-    ticker_universe: List[str],
+    ticker_universe: Optional[List[str]],
     simulate_date: Optional[str] = None,
     max_active_positions: int = 10,
     waitlist_size: int = 10,
@@ -444,11 +444,11 @@ if __name__ == "__main__":
         "CAT", "MMM", "BA", "F", "GM",
         "XOM", "CVX", "COP", "EOG", "SLB",
     ]
-    print(f"Universe: {len(demo_universe)} tickers")
+    print(f"Demo universe defined: {len(demo_universe)} tickers (not used in this run)")
 
     try:
         session = run_dynamic_trading_session(
-            ticker_universe=demo_universe, # use the demo universe to test fixed mode
+            ticker_universe=None, # use dynamic discovery
             max_active_positions=10,
             waitlist_size=10,
             total_article_cap=50,
