@@ -172,7 +172,7 @@ def discover_market_movers(universe: list[str] | None = None) -> list[str]:
     try:
         # Download adjusted close and volume for the universe
         data = yf.download(universe, start=start_str, end=end_str, progress=False, threads=True)
-        if data.empty:
+        if data is None or data.empty:
             return []
         # Extract adjusted close and volume; handle multi-index columns
         if isinstance(data.columns, pd.MultiIndex):
@@ -241,7 +241,7 @@ def get_previous_day_top50_yahoo() -> list[str]:
     end_str = _format_date_for_yfinance(prev_day)
     try:
         data = yf.download(universe, start=start_str, end=end_str, progress=False, threads=True)
-        if data.empty:
+        if data is None or data.empty:
             return []
         if isinstance(data.columns, pd.MultiIndex):
             close_data = data['Adj Close'] if 'Adj Close' in data.columns.levels[0] else data['Close']

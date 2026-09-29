@@ -10,13 +10,6 @@ Then uses the existing watchlist manager to fetch news, score sentiment, and
 generate active/waitlist arrays.
 """
 
-import sys
-import os
-# Add the project root to sys.path so we can import src.* modules when this script is run directly
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import pandas as pd
@@ -60,7 +53,7 @@ class DynamicTradingManager:
         max_active_positions: int = 10,
         waitlist_size: int = 10,
         max_articles_per_ticker: int = 5,
-        total_article_cap: Optional[int] = None,
+        total_article_cap: Optional[int] = 50,
         sentiment_model: str = "mistral",
         news_fetch_pause: float = 0.5,
         portfolio_value: float = 10_000,
@@ -106,8 +99,6 @@ class DynamicTradingManager:
         print(f"  Waitlist size: {waitlist_size}")
         if total_article_cap is not None:
             print(f"  Total article budget: {total_article_cap} across the whole universe")
-        else:
-            print(f"  No total article cap (fetching {max_articles_per_ticker} articles per ticker)")
 
     def _get_discovery_components(self) -> dict:
         """Get discovery components using the new discovery layer approach."""
@@ -398,7 +389,7 @@ def run_dynamic_trading_session(
     max_active_positions: int = 10,
     waitlist_size: int = 10,
     max_articles_per_ticker: int = 5,
-    total_article_cap: Optional[int] = None,
+    total_article_cap: Optional[int] = 50,
     sentiment_model: str = "mistral",
     news_fetch_pause: float = 0.5,
     portfolio_value: float = 10_000,
@@ -460,7 +451,7 @@ if __name__ == "__main__":
             ticker_universe=demo_universe, # use the demo universe to test fixed mode
             max_active_positions=10,
             waitlist_size=10,
-            total_article_cap=None, # No cap to get 5 articles per ticker
+            total_article_cap=50,
             news_fetch_pause=0.5,
             portfolio_value=10_000
         )
