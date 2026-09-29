@@ -128,7 +128,7 @@ class DynamicTradingManager:
         self._last_random_list = components['random_list']
         return self._last_universe
 
-    def pre_market_scan(self)  -> None:
+    def pre_market_scan(self) -> Tuple[List[str], List[str], Dict[str, float]]:
         """
         Fetch news, score sentiment, generate active/waitlist arrays.
         Uses discovery layer to generate the ticker universe, then
@@ -155,7 +155,7 @@ class DynamicTradingManager:
                 self.active_list = []
                 self.waitlist = []
                 self.all_sentiment_scores = {}
-                return
+                return self.active_list, self.waitlist, self.all_sentiment_scores
         # Limit universe size to reasonable bounds (e.g., 50-100) as per original spec
         max_universe = 100
         if len(tickers) > max_universe:
