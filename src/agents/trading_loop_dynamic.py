@@ -102,24 +102,18 @@ class DynamicTradingManager:
 
     def _get_discovery_components(self) -> dict:
         """Get discovery components using the new discovery layer approach."""
-        # Get current open positions to exclude from consideration (though discovery layer now handles this internally)
+        # Get current open positions to exclude from consideration
         open_positions = set(self.risk_manager.positions.keys())
         
         # Get the discovery components from the new discovery layer
-        candidate_universe, random_list, auxiliary = get_discovery_components()
-        
-        # Filter out any open positions from the candidate universe (extra safety)
-        filtered_universe = [ticker for ticker in candidate_universe if ticker not in open_positions]
-        
-        print(f"Discovery universe: {len(candidate_universe)} candidates -> {len(filtered_universe)} after excluding open positions")
-        print(f"Random list for logging: {len(random_list)} tickers")
+        # Pass open_positions so discovery layer can handle exclusion internally
+        candidate_universe, random_list, auxiliary = get_discovery_components(open_positions=open_positions)
         
         return {
-            'candidates': filtered_universe,
+            'candidates': candidate_universe,
             'random_list': random_list,
             'auxiliary': auxiliary
         }
-
     def _generate_dynamic_universe(self) -> List[str]:
         """Generate the ticker universe for today using the discovery layer.
         Excludes currently open positions to avoid churning.
@@ -134,7 +128,7 @@ class DynamicTradingManager:
         self._last_random_list = components['random_list']
         return self._last_universe
 
-    def pre_market_scan(self) -> Tuple[List[str], List[str], Dict[str, float]]:
+    def pre_market_scan(self)  -> None:
         """
         Fetch news, score sentiment, generate active/waitlist arrays.
         Uses discovery layer to generate the ticker universe, then
@@ -155,12 +149,13 @@ class DynamicTradingManager:
         else:
             tickers = self._generate_dynamic_universe()
             if not tickers:
-                print("WARNING: Dynamic universe generation returned empty list. Falling back to default watchlist.")
-                # Fallback to a small default list to avoid crashing
-                tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
-                self._last_universe = tickers[:50]
+                print("WARNING: Dynamic universe generation returned empty list. No candidates for this session.")
+                self._last_universe = []
                 self._last_random_list = []
-
+                self.active_list = []
+                self.waitlist = []
+                self.all_sentiment_scores = {}
+                return
         # Limit universe size to reasonable bounds (e.g., 50-100) as per original spec
         max_universe = 100
         if len(tickers) > max_universe:
