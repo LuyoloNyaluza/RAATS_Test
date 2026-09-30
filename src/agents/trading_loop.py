@@ -41,6 +41,9 @@ from src.utils.logger import log_cycle
 class AgentState(TypedDict, total=False):
     ticker: str
     market_data: Dict[str, Any]
+    discovery_news: Dict[str, Any]
+    scored_news: List[Any]
+    sentiment_summary: Dict[str, Any]
     sentiment: float
     llm_analysis: str
     llm_signal: str
@@ -70,11 +73,50 @@ _STABILITY_FILTER = MarketStabilityFilter()
 
 @node_timer("collector")
 def collector_node(state: AgentState) -> AgentState:
-    ticker = state.get("ticker", "AAPL")
+    ticker = state.get("ticker")
+    if ticker is None:
+        raise ValueError("AgentState must include a ticker")
     as_of = state.get("simulate_date")
-    state["market_data"] = collect_market_data(ticker, as_of=as_of)
-    state["sentiment"] = collect_sentiment(ticker, as_of=as_of)
-    state["timestamp"] = state["market_data"]["timestamp"]
+
+    state["market_data"] = collect_market_data(
+        ticker,
+        as_of=as_of,
+    )
+
+    discovery_news = state.get(
+        "discovery_news",
+        {
+            "yfinance_news": [],
+            "google_news": [],
+        },
+    )
+
+    state["sentiment"] = collect_sentiment(
+        ticker,
+        as_of=as_of,
+        discovery_news=discovery_news,
+    )
+
+    state["scored_news"] = []
+
+    for source in (
+        "yfinance_news",
+        "google_news",
+    ):
+        state["scored_news"].extend(
+            discovery_news.get(
+                source,
+                [],
+            )
+        )
+
+    state["sentiment_summary"] = (
+        state.get(
+            "sentiment_summary",
+            {},
+        )
+    )
+
     return state
 
 
@@ -153,14 +195,15 @@ def build_graph():
 
 
 def run_daily_cycle(
-    ticker: str = "AAPL",
+    ticker,
     app=None,
-    risk_manager: Optional[RiskManager] = None,
-    portfolio_value: float = 10_000,
-    is_top_five: bool = False,
-    analyst_model: Optional[str] = None,
-    simulate_date: Optional[str] = None,
-    verbose: bool = True,
+    risk_manager=None,
+    portfolio_value: float = 10000,
+    analyst_model=None,
+    simulate_date=None,
+    verbose=False,
+    discovery_news=None,
+    is_top_five=False,
 ):
     app = app or build_graph()
     initial_state: AgentState = {
@@ -180,6 +223,11 @@ def run_daily_cycle(
         "latencies": {},
         "analyst_model": analyst_model,
         "simulate_date": simulate_date,
+        "discovery_news": discovery_news or {
+        "yfinance_news": [],
+        "google_news": [],
+         "sentiment_summary": {},
+},
     }
     final_state = app.invoke(initial_state)
     signal = str(final_state.get("llm_signal") or final_state.get("signal") or "")

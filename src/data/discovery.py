@@ -1,452 +1,1028 @@
-""" Discovery layer for dynamic ticker universe generation. Implements: 1. 35 deterministic random S&P 500 candidates each day. 2. Google News RSS discovers company/ticker mentions from the previous completed market session. 3. yfinance identifies previous-session market movers. 4. Yahoo Finance news can be filtered by publication timestamp. 5. Excludes open positions from discovery to avoid churning existing holdings. 6. Generates a final candidate universe of up to 50 tickers. """
-from datetime import datetime, timedelta
-from email.utils import parsedate_to_datetime
-from urllib.parse import quote
-import random
-import re
-import time
+import os
 import xml.etree.ElementTree as ET
+from urllib.parse import quote_plus
+
 import pandas as pd
 import requests
 import yfinance as yf
 
-# ============================================================================ # CONFIGURATION # ============================================================================
-BASE_RANDOM_COUNT = 35
-NEWS_DISCOVERY_COUNT = 10
-MARKET_MOVER_COUNT = 10
-MAX_BASE_CANDIDATES = 50
-MARKET_MOVE_THRESHOLD = 0.03
-MIN_VOLUME_RATIO = 1.20
-REQUEST_TIMEOUT = 15
-GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-NEWS_QUERIES = [
-    "US stocks market",
-    "S&P 500 stocks",
-    "Nasdaq stocks",
-    "NYSE stocks",
-    "stock market earnings",
-    "stock market technology",
-    "stocks healthcare",
-    "stocks semiconductor",
-]
-HTTP_HEADERS = {
+from src.data.score_sentiment import (
+    score_articles,
+    summarize_ticker_sentiment,
+    save_scored_news,
+)
+
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+
+TOP_50_COUNT = 50
+TOP_10_COUNT = 10
+WAITING_LIST_COUNT = 20
+
+SENTIMENT_MODEL = os.environ.get(
+    "RAATS_SENTIMENT_MODEL",
+    "mistral",
+)
+
+HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 "
-        "(Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/153.0.0.0 "
-        "Safari/537.36"
-    )
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-# ============================================================================ # HELPER FUNCTIONS # ============================================================================
-def _get_previous_trading_day() -> datetime:
-    """ Return the previous weekday. This currently skips weekends. Exchange holiday handling can be added later if an exchange calendar is introduced. """
-    today = datetime.now().date()
-    day = today - timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= timedelta(days=1)
-    return datetime.combine(day, datetime.min.time())
 
-def _get_day_before(day: datetime) -> datetime:
-    """Return the previous weekday before the supplied day."""
-    previous = day.date() - timedelta(days=1)
-    while previous.weekday() >= 5:
-        previous -= timedelta(days=1)
-    return datetime.combine(previous, datetime.min.time())
+# ==========================================
+# STEP 1: DISCOVER DYNAMIC TICKERS
+# ==========================================
 
-def _format_date_for_yfinance(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d")
+def get_tickers_from_gainers_feed():
+    """
+    Get a dynamic ticker universe from Yahoo Finance
+    day_gainers screener.
+    """
 
-# ============================================================================ # S&P 500 UNIVERSE # ============================================================================
-def get_sp500_universe() -> list[str]:
-    """ Fetch the current S&P 500 ticker list from Wikipedia. Uses requests first so that a browser-like User-Agent is supplied. """
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    print("Extracting trending tickers from Yahoo Finance screener...")
+
     try:
-        response = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        tables = pd.read_html(response.text)
-        if not tables:
-            raise ValueError("No tables found on S&P 500 page")
-        df = tables[0]
-        if "Symbol" not in df.columns:
-            raise ValueError("S&P 500 table does not contain Symbol column")
-        tickers = (
-            df["Symbol"]
-            .astype(str)
-            .str.replace(".", "-", regex=False)
-            .str.upper()
-            .tolist()
+        result = yf.screen(
+            "day_gainers",
+            count=250
         )
-        tickers = list(dict.fromkeys(tickers))
-        print(f"S&P 500 universe loaded: {len(tickers)} tickers")
+
+        quotes = result.get("quotes", [])
+
+        if not quotes:
+            raise ValueError(
+                "Yahoo day_gainers returned no quotes."
+            )
+
+        tickers = []
+
+        for item in quotes:
+
+            symbol = item.get("symbol")
+
+            if not symbol:
+                continue
+
+            symbol = str(symbol).upper().strip()
+
+            # Normal US equity symbols only
+            if not symbol.isalpha():
+                continue
+
+            if len(symbol) > 5:
+                continue
+
+            if symbol not in tickers:
+                tickers.append(symbol)
+
+        if not tickers:
+            raise ValueError(
+                "No usable ticker symbols returned."
+            )
+
+        print(
+            f"Discovered {len(tickers)} dynamic "
+            f"candidate tickers."
+        )
+
         return tickers
+
     except Exception as e:
-        print(f"Warning: Could not fetch S&P 500 list: {e}")
-        # Do not silently pretend this is a dynamic S&P 500 universe.
+
+        print(
+            f"Yahoo screener failed: {e}"
+        )
+
+        # Emergency fallback only
+        fallback = [
+            "AAPL",
+            "NVDA",
+            "MSFT",
+            "AMZN",
+            "META",
+            "GOOGL",
+            "TSLA",
+            "NFLX",
+            "AMD",
+            "INTC",
+            "AVGO",
+            "MU",
+            "QCOM",
+            "AMAT",
+            "MRVL",
+            "ORCL",
+            "CRM",
+            "ADBE",
+            "PLTR",
+            "CRWD",
+        ]
+
+        print(
+            f"Using emergency fallback: "
+            f"{len(fallback)} tickers."
+        )
+
+        return fallback
+
+
+# ==========================================
+# STEP 2: PREVIOUS SESSION PERFORMANCE
+# ==========================================
+
+def get_previous_session_returns(tickers):
+    """
+    Download recent daily prices and calculate
+    previous fully completed market-session returns.
+    """
+
+    print(
+        f"Verifying previous-session performance "
+        f"for {len(tickers)} tickers..."
+    )
+
+    data = yf.download(
+        tickers=tickers,
+        period="7d",
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+        group_by="column",
+        threads=True,
+    )
+
+    if data is None or data.empty:
+        raise ValueError(
+            "No valid market pricing data returned."
+        )
+
+    # ------------------------------------------
+    # Extract Adjusted Close / Close
+    # ------------------------------------------
+
+    if isinstance(data.columns, pd.MultiIndex):
+
+        level_0 = data.columns.get_level_values(0)
+
+        if "Adj Close" in level_0:
+            close_prices = data["Adj Close"]
+
+        elif "Close" in level_0:
+            close_prices = data["Close"]
+
+        else:
+            raise ValueError(
+                "Neither Adj Close nor Close was returned."
+            )
+
+    else:
+
+        if "Adj Close" in data.columns:
+            close_prices = data["Adj Close"]
+
+        elif "Close" in data.columns:
+            close_prices = data["Close"]
+
+        else:
+            raise ValueError(
+                "Neither Adj Close nor Close was returned."
+            )
+
+    if isinstance(close_prices, pd.Series):
+        close_prices = close_prices.to_frame()
+
+    close_prices = close_prices.dropna(
+        how="all",
+        axis=1
+    )
+
+    if close_prices.empty:
+        raise ValueError(
+            "No valid closing prices available."
+        )
+
+    # ------------------------------------------
+    # Calculate daily returns
+    # ------------------------------------------
+
+    daily_returns = (
+        close_prices
+        .pct_change(fill_method=None)
+        .mul(100)
+    )
+
+    daily_returns = daily_returns.dropna(
+        how="all"
+    )
+
+    if len(daily_returns) < 2:
+        raise ValueError(
+            "Insufficient data for return calculation."
+        )
+
+    # ------------------------------------------
+    # Previous completed market session
+    # ------------------------------------------
+
+    previous_session_date = daily_returns.index[-2]
+
+    previous_session_returns = daily_returns.iloc[-2]
+
+    target_date = previous_session_date.strftime(
+        "%A, %B %d, %Y"
+    )
+
+    # ------------------------------------------
+    # Sort all discovered tickers
+    # ------------------------------------------
+
+    performance = (
+        previous_session_returns
+        .dropna()
+        .sort_values(
+            ascending=False
+        )
+    )
+
+    # ------------------------------------------
+    # Keep top 50
+    # ------------------------------------------
+
+    top_50 = performance.head(
+        TOP_50_COUNT
+    )
+
+    df_top_50 = (
+        top_50
+        .rename(
+            "Previous_Day_Return_Pct"
+        )
+        .reset_index()
+    )
+
+    df_top_50.columns = [
+        "Ticker",
+        "Previous_Day_Return_Pct"
+    ]
+
+    return df_top_50, target_date
+
+
+# ==========================================
+# STEP 3: CREATE THREE ARRAYS
+# ==========================================
+
+def build_ticker_arrays(df_top_50):
+
+    # ------------------------------------------
+    # ARRAY 1:
+    # Overall top 50
+    # ------------------------------------------
+
+    top_50_performing = (
+        df_top_50
+        .head(TOP_50_COUNT)
+        .copy()
+    )
+
+    # ------------------------------------------
+    # ARRAY 2:
+    # Top 10 receive news
+    # ------------------------------------------
+
+    top_10_to_fetch_articles = (
+        top_50_performing
+        .head(TOP_10_COUNT)
+        .copy()
+    )
+
+    # ------------------------------------------
+    # ARRAY 3:
+    # Waiting list
+    #
+    # Positions 11 -> 30
+    # ------------------------------------------
+
+    waiting_list = (
+        top_50_performing
+        .iloc[
+            TOP_10_COUNT:
+            TOP_10_COUNT + WAITING_LIST_COUNT
+        ]
+        .copy()
+    )
+
+    return (
+        top_50_performing,
+        top_10_to_fetch_articles,
+        waiting_list,
+    )
+
+
+# ==========================================
+# STEP 4: yfinance NEWS
+# ==========================================
+
+def get_yfinance_news(
+    ticker,
+    max_results=3
+):
+    try:
+
+        search = yf.Search(
+            ticker,
+            max_results=max_results
+        )
+
+        raw_news = search.news
+
+        if not raw_news:
+            return []
+
+        articles = []
+
+        for item in raw_news[:max_results]:
+
+            title = item.get(
+                "title",
+                "No Title"
+            )
+
+            link = item.get(
+                "link",
+                ""
+            )
+
+            if not title:
+                continue
+
+            articles.append({
+                "title": title,
+                "link": link,
+            })
+
+        return articles
+
+    except Exception as e:
+
+        print(
+            f"    [Diagnostic] "
+            f"yfinance news error for "
+            f"{ticker}: {e}"
+        )
+
         return []
 
-# ============================================================================ # COMPANY / TICKER MAPPING # ============================================================================
-def get_sp500_company_map() -> dict[str, str]:
-    """ Return mapping: ticker -> company name Example: AAPL -> Apple Inc. """
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+# ==========================================
+# STEP 5: GOOGLE NEWS
+# ==========================================
+
+def get_google_news_headlines(
+    ticker,
+    max_results=2
+):
+
+    query = quote_plus(
+        f"{ticker} stock performance"
+    )
+
+    rss_url = (
+        "https://news.google.com/rss/search?"
+        f"q={query}"
+        "&hl=en-US"
+        "&gl=US"
+        "&ceid=US:en"
+    )
+
     try:
-        response = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+
+        response = requests.get(
+            rss_url,
+            headers=HEADERS,
+            timeout=10
+        )
+
         response.raise_for_status()
-        tables = pd.read_html(response.text)
-        if not tables:
-            return {}
-        df = tables[0]
-        required = {"Symbol", "Security"}
-        if not required.issubset(df.columns):
-            return {}
-        company_map = {}
-        for _, row in df.iterrows():
-            ticker = str(row["Symbol"]).replace(".", "-").upper()
-            company = str(row["Security"])
-            company_map[ticker] = company
-        return company_map
-    except Exception as e:
-        print(f"Warning: Could not build S&P 500 company map: {e}")
-        return {}
 
-# ============================================================================ # RANDOM EXPLORATION # ============================================================================
-def get_random_base(seed: str | None = None) -> list[str]:
-    """ Return 35 deterministic random S&P 500 tickers. The same date produces the same exploratory sample. """
-    if seed is None:
-        seed = datetime.now().strftime("%Y-%m-%d")
-    universe = get_sp500_universe()
-    if not universe:
-        return []
-    rng = random.Random(seed)
-    count = min(BASE_RANDOM_COUNT, len(universe))
-    return rng.sample(universe, count)
+        root = ET.fromstring(
+            response.content
+        )
 
-# ============================================================================ # GOOGLE NEWS RSS # ============================================================================
-def _parse_google_news_rss(content: str) -> list[dict]:
-    """Parse Google News RSS XML."""
-    try:
-        root = ET.fromstring(content)
-        items = []
-        for item in root.findall(".//item"):
+        items = root.findall(
+            ".//item"
+        )
+
+        headlines = []
+
+        for item in items[:max_results]:
+
             title_elem = item.find("title")
             link_elem = item.find("link")
-            pub_date_elem = item.find("pubDate")
-            description_elem = item.find("description")
+
             title = (
                 title_elem.text
-                if title_elem is not None and title_elem.text
-                else ""
+                if title_elem is not None
+                else "No Title"
             )
+
             link = (
                 link_elem.text
-                if link_elem is not None and link_elem.text
+                if link_elem is not None
                 else ""
             )
-            pub_date = (
-                pub_date_elem.text
-                if pub_date_elem is not None and pub_date_elem.text
-                else ""
-            )
-            description = (
-                description_elem.text
-                if description_elem is not None and description_elem.text
-                else ""
-            )
-            items.append(
-                {
-                    "title": title,
-                    "link": link,
-                    "pub_date": pub_date,
-                    "description": description,
-                }
-            )
-        return items
+
+            if title and " - " in title:
+
+                title = title.rsplit(
+                    " - ",
+                    1
+                )[0]
+
+            headlines.append({
+                "title": title,
+                "link": link,
+            })
+
+        return headlines
+
     except Exception as e:
-        print(f"Error parsing Google News RSS: {e}")
-        return []
 
-def _normalise_company_name(name: str) -> str:
-    """Normalise company names for simple text matching."""
-    name = name.lower()
-    name = re.sub(r"\b(inc|corp|corporation|company|co|ltd|plc|class [a-z])\b", " ", name)
-    name = re.sub(r"[^a-z0-9 ]+", " ", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name
-
-def _find_tickers_in_article(
-    title: str, description: str, company_map: dict[str, str],
-) -> set[str]:
-    """ Identify S&P 500 tickers from article text. Uses both explicit ticker-style matches and company-name matching. """
-    text = f"{title} {description}"
-    text_upper = text.upper()
-    discovered = set()
-    # Explicit uppercase ticker candidates.
-    words = re.findall(r"\b[A-Z]{1,5}\b", text_upper)
-    for ticker in words:
-        if ticker in company_map:
-            discovered.add(ticker)
-    # Company-name matching.
-    text_normalised = _normalise_company_name(text)
-    for ticker, company in company_map.items():
-        company_normalised = _normalise_company_name(company)
-        if not company_normalised:
-            continue
-        if company_normalised in text_normalised:
-            discovered.add(ticker)
-    return discovered
-
-def get_google_news_discoveries(
-    date: datetime | None = None,
-) -> tuple[list[str], dict[str, int]]:
-    """ Discover S&P 500 tickers mentioned in Google News. Returns: tickers mention_counts """
-    if date is None:
-        date = _get_previous_trading_day()
-    company_map = get_sp500_company_map()
-    if not company_map:
-        return [], {}
-    mentions: dict[str, int] = {}
-    target_date = date.date()
-    for query in NEWS_QUERIES:
-        url = GOOGLE_NEWS_RSS.format(query=quote(query))
-        try:
-            response = requests.get(url, headers=HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            items = _parse_google_news_rss(response.text)
-            for item in items:
-                pub_date = item.get("pub_date", "")
-                # Try to enforce the previous-session date.
-                if pub_date:
-                    try:
-                        parsed_date = parsedate_to_datetime(pub_date)
-                        if parsed_date.date() != target_date:
-                            continue
-                    except Exception:
-                        # If Google gives an unexpected date format,
-                        # retain the article rather than crashing discovery.
-                        pass
-                title = item.get("title", "")
-                description = item.get("description", "")
-                tickers = _find_tickers_in_article(title, description, company_map)
-                for ticker in tickers:
-                    mentions[ticker] = mentions.get(ticker, 0) + 1
-        except Exception as e:
-            print(
-                f"Warning: Google News request failed "
-                f"for '{query}': {e}"
-            )
-            time.sleep(0.1)
-    ranked = sorted(mentions.items(), key=lambda item: (-item[1], item[0]))
-    top_tickers = [ticker for ticker, _count in ranked[:NEWS_DISCOVERY_COUNT]]
-    return top_tickers, mentions
-
-# ============================================================================ # MARKET MOVERS # ============================================================================
-def discover_market_movers(
-    universe: list[str] | None = None,
-) -> list[str]:
-    """ Identify previous-session S&P 500 market movers. Requires: - absolute price movement >= 3% - volume ratio >= 1.20 """
-    if universe is None:
-        universe = get_sp500_universe()
-    if not universe:
-        return []
-    prev_day = _get_previous_trading_day()
-    day_before = _get_day_before(prev_day)
-    start_str = _format_date_for_yfinance(day_before)
-    # yfinance end date is exclusive, so add one day.
-    end_str = _format_date_for_yfinance(prev_day + timedelta(days=1))
-    try:
-        data = yf.download(
-            universe,
-            start=start_str,
-            end=end_str,
-            progress=False,
-            threads=True,
-            auto_adjust=False,
-        )
-        if data is None or data.empty:
-            return []
-        if isinstance(data.columns, pd.MultiIndex):
-            close_data = (
-                data["Adj Close"]
-                if "Adj Close" in data.columns.get_level_values(0)
-                else data["Close"]
-            )
-            volume_data = data["Volume"]
-        else:
-            close_data = (
-                data["Adj Close"]
-                if "Adj Close" in data.columns
-                else data["Close"]
-            )
-            volume_data = data["Volume"]
-        if isinstance(close_data, pd.Series):
-            close_data = close_data.to_frame()
-        if isinstance(volume_data, pd.Series):
-            volume_data = volume_data.to_frame()
-        if len(close_data) < 2:
-            return []
-        previous_close = close_data.iloc[-1]
-        day_before_close = close_data.iloc[-2]
-        pct_change = ((previous_close - day_before_close) / day_before_close)
-        volume_ratio = (previous_volume / day_before_volume.replace(0, 1e-9))
-        qualifies = (
-            (pct_change.abs() >= MARKET_MOVE_THRESHOLD)
-            & (volume_ratio >= MIN_VOLUME_RATIO)
-        )
-        movers = pct_change[qualifies].abs()
-        movers = movers.sort_values(ascending=False)
-        return movers.head(MARKET_MOVER_COUNT).index.tolist()
-    except Exception as e:
-        print(f"Error discovering market movers: {e}")
-        return []
-
-# ============================================================================ # PREVIOUS-DAY YAHOO PERFORMERS # ============================================================================
-def get_previous_day_top50_yahoo(
-    universe: list[str] | None = None,
-) -> list[str]:
-    """ Get up to 50 S&P 500 stocks with the largest positive previous-session percentage movement. """
-    if universe is None:
-        universe = get_sp500_universe()
-    if not universe:
-        return []
-    prev_day = _get_previous_trading_day()
-    day_before = _get_day_before(prev_day)
-    start_str = _format_date_for_yfinance(day_before)
-    end_str = _format_date_for_yfinance(prev_day + timedelta(days=1))
-    try:
-        data = yf.download(
-            universe,
-            start=start_str,
-            end=end_str,
-            progress=False,
-            threads=True,
-            auto_adjust=False,
-        )
-        if data is None or data.empty:
-            return []
-        if isinstance(data.columns, pd.MultiIndex):
-            close_data = (
-                data["Adj Close"]
-                if "Adj Close" in data.columns.get_level_values(0)
-                else data["Close"]
-            )
-        else:
-            close_data = (
-                data["Adj Close"]
-                if "Adj Close" in data.columns
-                else data["Close"]
-            )
-        if isinstance(close_data, pd.Series):
-            close_data = close_data.to_frame()
-        if len(close_data) < 2:
-            return []
-        previous_close = close_data.iloc[-1]
-        day_before_close = close_data.iloc[-2]
-        pct_change = ((previous_close - day_before_close) / day_before_close)
-        return (
-            pct_change.dropna().sort_values(ascending=False).head(50).index.tolist()
-        )
-    except Exception as e:
-        print(f"Error getting previous-day Yahoo performers: {e}")
-        return []
-
-# ============================================================================ # FINAL CANDIDATE UNIVERSE # ============================================================================
-def get_final_top50_universe() -> tuple[list[str], dict]:
-    """ Build the final dynamic candidate universe. Sources: 1. Random S&P 500 exploration 2. Google News discoveries 3. Previous-session market movers 4. Previous-session Yahoo performers The final universe is capped at 50. """
-    sp500 = get_sp500_universe()
-    if not sp500:
         print(
-            "ERROR: S&P 500 universe unavailable. "
-            "Dynamic discovery cannot continue."
+            f"    [Diagnostic] "
+            f"Google News error for "
+            f"{ticker}: {e}"
         )
-        return [], {
-            "random": [],
-            "google_news": [],
-            "market_movers": [],
-            "yahoo_top50": [],
-        }
-    print(
-        f"Discovery source universe: "
-        f"{len(sp500)} S&P 500 tickers"
-    )
-    # ------------------------------------------------------------ # 1. Random exploration # ------------------------------------------------------------
-    rng = random.Random(datetime.now().strftime("%Y-%m-%d"))
-    random_count = min(BASE_RANDOM_COUNT, len(sp500))
-    random_list = rng.sample(sp500, random_count)
-    # ------------------------------------------------------------ # 2. Google News # ------------------------------------------------------------
-    google_top, google_mentions = get_google_news_discoveries()
-    # ------------------------------------------------------------ # 3. Previous-session market movers # ------------------------------------------------------------
-    market_movers = discover_market_movers(sp500)
-    # ------------------------------------------------------------ # 4. Previous-session Yahoo performers # ------------------------------------------------------------
-    yahoo_top50 = get_previous_day_top50_yahoo(sp500)
-    # ------------------------------------------------------------ # Combine while preserving source priority # ------------------------------------------------------------
-    final = []
-    def add_ticker(ticker: str) -> None:
-        if ticker in sp500 and ticker not in final:
-            final.append(ticker)
-    # News and market information get priority.
-    for ticker in google_top:
-        add_ticker(ticker)
-    for ticker in market_movers:
-        add_ticker(ticker)
-    for ticker in yahoo_top50:
-        add_ticker(ticker)
-    # Random exploration guarantees that the system
-    # still has exploratory candidates.
-    for ticker in random_list:
-        add_ticker(ticker)
-    final = final[:MAX_BASE_CANDIDATES]
-    print(
-        f"Dynamic candidate universe generated: "
-        f"{len(final)} tickers"
-    )
-    print(f" Google News discoveries: {len(google_top)}")
-    print(f" Market movers: {len(market_movers)}")
-    print(f" Yahoo performers: {len(yahoo_top50)}")
-    print(f" Random exploration: {len(random_list)}")
-    return final, {
-        "random": random_list,
-        "google_news": google_top,
-        "google_mentions": google_mentions,
-        "market_movers": market_movers,
-        "yahoo_top50": yahoo_top50,
-    }
 
-# ============================================================================ # DISCOVERY API USED BY trading_loop_dynamic.py # ============================================================================
-def get_discovery_components(
-    open_positions: set[str] | None = None,
-) -> tuple[list[str], list[str], dict]:
-    """ Return: candidate_universe random_list auxiliary This is the interface used by trading_loop_dynamic.py. """
-    if open_positions is None:
-        open_positions = set()
-    candidate_universe, auxiliary = get_final_top50_universe()
-    # Prevent existing positions from being rediscovered.
-    filtered_universe = [
-        ticker for ticker in candidate_universe if ticker not in open_positions
-    ]
-    random_list = [
-        ticker for ticker in auxiliary["random"] if ticker not in open_positions
-    ]
-    print(
-        f"Discovery universe: "
-        f"{len(candidate_universe)} candidates "
-        f"-> {len(filtered_universe)} "
-        f"after excluding open positions"
-    )
-    return (filtered_universe, random_list, auxiliary, )
+        return []
 
-# ============================================================================ # TEST # ============================================================================
+
+# ==========================================
+# STEP 6: SCORE DISCOVERED NEWS
+# ==========================================
+
+def score_top_10_news(top_10_records):
+    """
+    Score ONLY the articles that were already
+    fetched during discovery.
+
+    No additional news is fetched here.
+    """
+
+    print("\n" + "=" * 60)
+    print("SCORING DISCOVERED NEWS")
+    print("=" * 60)
+
+    scored_top_10 = []
+
+    for item in top_10_records:
+
+        ticker = item["Ticker"]
+
+        yfinance_news = item.get(
+            "yfinance_news",
+            []
+        )
+
+        google_news = item.get(
+            "google_news",
+            []
+        )
+
+        articles = []
+
+        # --------------------------------------
+        # Add yfinance articles
+        # --------------------------------------
+
+        for article in yfinance_news:
+
+            article_copy = dict(article)
+
+            article_copy["discovery_source"] = (
+                "yfinance"
+            )
+
+            articles.append(
+                article_copy
+            )
+
+        # --------------------------------------
+        # Add Google articles
+        # --------------------------------------
+
+        for article in google_news:
+
+            article_copy = dict(article)
+
+            article_copy["discovery_source"] = (
+                "google"
+            )
+
+            articles.append(
+                article_copy
+            )
+
+        print(
+            f"\n{ticker}: "
+            f"{len(yfinance_news)} yfinance + "
+            f"{len(google_news)} Google = "
+            f"{len(articles)} articles"
+        )
+
+        # --------------------------------------
+        # No articles
+        # --------------------------------------
+
+        if not articles:
+
+            updated = dict(item)
+
+            updated["sentiment_summary"] = {
+                "overall": "neutral",
+                "score": 0.0,
+                "positive": 0,
+                "negative": 0,
+                "neutral": 0,
+                "total": 0,
+            }
+
+            scored_top_10.append(
+                updated
+            )
+
+            print(
+                "  No articles available for scoring."
+            )
+
+            continue
+
+        # --------------------------------------
+        # Score exact discovered articles
+        # --------------------------------------
+
+        scored_articles = score_articles(
+            ticker,
+            articles,
+            model_name=SENTIMENT_MODEL,
+        )
+
+        # --------------------------------------
+        # Calculate ticker sentiment
+        # --------------------------------------
+
+        summary = summarize_ticker_sentiment(
+            scored_articles
+        )
+
+        # --------------------------------------
+        # Save scored news
+        # --------------------------------------
+
+        save_scored_news(
+            ticker,
+            scored_articles
+        )
+
+        # --------------------------------------
+        # Separate sources again
+        # --------------------------------------
+
+        scored_yfinance_news = []
+        scored_google_news = []
+
+        for article in scored_articles:
+
+            source = article.get(
+                "discovery_source"
+            )
+
+            if source == "yfinance":
+
+                scored_yfinance_news.append(
+                    article
+                )
+
+            if source == "google":
+
+                scored_google_news.append(
+                    article
+                )
+
+        # --------------------------------------
+        # Create final Top 10 record
+        # --------------------------------------
+
+        updated = dict(item)
+
+        updated["yfinance_news"] = (
+            scored_yfinance_news
+        )
+
+        updated["google_news"] = (
+            scored_google_news
+        )
+
+        updated["sentiment_summary"] = summary
+
+        scored_top_10.append(
+            updated
+        )
+
+        # --------------------------------------
+        # Print scoring result
+        # --------------------------------------
+
+        print(
+            f"  Sentiment: "
+            f"{summary['overall']}"
+        )
+
+        print(
+            f"  Score: "
+            f"{summary['score']:+.4f}"
+        )
+
+        print(
+            f"  Positive: "
+            f"{summary['positive']}"
+        )
+
+        print(
+            f"  Negative: "
+            f"{summary['negative']}"
+        )
+
+        print(
+            f"  Neutral: "
+            f"{summary['neutral']}"
+        )
+
+        # --------------------------------------
+        # Print individual scores
+        # --------------------------------------
+
+        for article in scored_articles:
+
+            source = article.get(
+                "discovery_source",
+                "unknown"
+            )
+
+            sentiment = article.get(
+                "sentiment",
+                "neutral"
+            )
+
+            confidence = article.get(
+                "confidence",
+                0.0
+            )
+
+            title = article.get(
+                "title",
+                "No Title"
+            )
+
+            print(
+                f"    [{source}] "
+                f"{sentiment} "
+                f"({confidence:.2f}) | "
+                f"{title}"
+            )
+
+    print(
+        "\nNews scoring completed."
+    )
+
+    return scored_top_10
+
+
+# ==========================================
+# STEP 7: FORMAT RETURN
+# ==========================================
+
+def format_return(value):
+
+    if pd.isna(value):
+        return "N/A"
+
+    return f"{value:+.2f}%"
+
+
+# ==========================================
+# STEP 8: FETCH + SCORE TOP 10 NEWS
+# ==========================================
+
+def render_top_50_and_news(
+    top_50_performing,
+    top_10_to_fetch_articles,
+    target_date
+):
+    """
+    Print Top 50 and fetch news for Top 10.
+
+    The returned Top 10 contains the exact
+    discovered articles and their sentiment scores.
+    """
+
+    print(
+        f"\n=== TOP 50 PERFORMING TICKERS FOR "
+        f"PREVIOUS MARKET DAY "
+        f"({target_date.upper()}) ==="
+    )
+
+    # ------------------------------------------
+    # Print ALL 50
+    # ------------------------------------------
+
+    for rank, row in enumerate(
+        top_50_performing.itertuples(
+            index=False
+        ),
+        start=1
+    ):
+
+        ticker = row.Ticker
+        performance = (
+            row.Previous_Day_Return_Pct
+        )
+
+        print(
+            f"#{rank} | "
+            f"{ticker} | "
+            f"Return: "
+            f"{format_return(performance)}"
+        )
+
+    # ------------------------------------------
+    # Build Top 10 records
+    # ------------------------------------------
+
+    top_10_records = []
+
+    print(
+        "\n=== TOP 10 NEWS FETCH TARGETS ==="
+    )
+
+    for rank, row in enumerate(
+        top_10_to_fetch_articles.itertuples(
+            index=False
+        ),
+        start=1
+    ):
+
+        ticker = row.Ticker
+
+        performance = (
+            row.Previous_Day_Return_Pct
+        )
+
+        print(
+            f"\n#{rank} | "
+            f"{ticker} | "
+            f"Return: "
+            f"{format_return(performance)}"
+        )
+
+        # --------------------------------------
+        # yfinance
+        # --------------------------------------
+
+        print(
+            "\n  [yfinance News Content]"
+        )
+
+        yf_articles = get_yfinance_news(
+            ticker,
+            max_results=3
+        )
+
+        if yf_articles:
+
+            for article in yf_articles:
+
+                print(
+                    f"\n    - "
+                    f"{article['title']}\n"
+                    f"      URL: "
+                    f"{article['link']}"
+                )
+
+        else:
+
+            print(
+                "    - No yfinance news "
+                "coverage available."
+            )
+
+        # --------------------------------------
+        # Google News
+        # --------------------------------------
+
+        print(
+            "\n  [Google News Feed]"
+        )
+
+        google_articles = (
+            get_google_news_headlines(
+                ticker,
+                max_results=2
+            )
+        )
+
+        if google_articles:
+
+            for article in google_articles:
+
+                print(
+                    f"\n    - "
+                    f"{article['title']}\n"
+                    f"      URL: "
+                    f"{article['link']}"
+                )
+
+        else:
+
+            print(
+                "    - No Google News "
+                "coverage available."
+            )
+
+        # --------------------------------------
+        # Store EXACT discovered articles
+        # --------------------------------------
+
+        top_10_records.append({
+            "Ticker": ticker,
+            "Previous_Day_Return_Pct": (
+                float(performance)
+            ),
+            "yfinance_news": yf_articles,
+            "google_news": google_articles,
+        })
+
+    # ------------------------------------------
+    # SCORE BEFORE TRADING
+    # ------------------------------------------
+
+    scored_top_10 = score_top_10_news(
+        top_10_records
+    )
+
+    return scored_top_10
+
+
+# ==========================================
+# STEP 9: PRINT WAITING LIST
+# ==========================================
+
+def render_waiting_list(
+    waiting_list
+):
+
+    print(
+        "\n\n=== WAITING LIST "
+        "(POSITIONS 11-30) ==="
+    )
+
+    for rank, row in enumerate(
+        waiting_list.itertuples(
+            index=False
+        ),
+        start=11
+    ):
+
+        ticker = row.Ticker
+
+        performance = (
+            row.Previous_Day_Return_Pct
+        )
+
+        print(
+            f"#{rank} | "
+            f"{ticker} | "
+            f"Return: "
+            f"{format_return(performance)}"
+        )
+
+
+# ==========================================
+# MAIN
+# ==========================================
+
+def main():
+
+    # ------------------------------------------
+    # 1. Dynamic discovery
+    # ------------------------------------------
+
+    discovered_tickers = (
+        get_tickers_from_gainers_feed()
+    )
+
+    if not discovered_tickers:
+
+        raise ValueError(
+            "No tickers discovered."
+        )
+
+    # ------------------------------------------
+    # 2. Previous-session performance
+    # ------------------------------------------
+
+    df_top_50, target_date = (
+        get_previous_session_returns(
+            discovered_tickers
+        )
+    )
+
+    # ------------------------------------------
+    # 3. Build THREE arrays
+    # ------------------------------------------
+
+    (
+        top_50_performing,
+        top_10_to_fetch_articles,
+        waiting_list,
+    ) = build_ticker_arrays(
+        df_top_50
+    )
+
+    # ------------------------------------------
+    # 4. Array sizes
+    # ------------------------------------------
+
+    print(
+        f"\nDiscovered performance universe: "
+        f"{len(df_top_50)} tickers"
+    )
+
+    print(
+        f"Top 50 array: "
+        f"{len(top_50_performing)} tickers"
+    )
+
+    print(
+        f"Top 10 article array: "
+        f"{len(top_10_to_fetch_articles)} tickers"
+    )
+
+    print(
+        f"Waiting list array: "
+        f"{len(waiting_list)} tickers"
+    )
+
+    # ------------------------------------------
+    # 5. Print Top 50
+    #    Fetch Top 10 news
+    #    SCORE Top 10 news
+    # ------------------------------------------
+
+    scored_top_10 = (
+        render_top_50_and_news(
+            top_50_performing,
+            top_10_to_fetch_articles,
+            target_date
+        )
+    )
+
+    # ------------------------------------------
+    # 6. Print waiting list
+    # ------------------------------------------
+
+    render_waiting_list(
+        waiting_list
+    )
+
+    # ------------------------------------------
+    # 7. Return THREE arrays
+    #
+    # top_50_performing:
+    #     DataFrame with 50 tickers
+    #
+    # scored_top_10:
+    #     List containing exact discovered
+    #     yfinance + Google articles,
+    #     already sentiment scored
+    #
+    # waiting_list:
+    #     DataFrame containing positions 11-30
+    # ------------------------------------------
+
+    return (
+        top_50_performing,
+        scored_top_10,
+        waiting_list,
+    )
+
+
 if __name__ == "__main__":
-    print("=" * 60)
-    print("DYNAMIC DISCOVERY TEST")
-    print("=" * 60)
-    candidates, random_list, auxiliary = get_discovery_components()
-    print()
-    print(f"Final candidates ({len(candidates)}):")
-    print(candidates)
-    print()
-    print(f"Random exploration ({len(random_list)}):")
-    print(random_list)
-    print()
-    print("Discovery complete.")
+
+    main()
