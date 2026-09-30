@@ -188,7 +188,7 @@ def summarize_universe_sentiment(
             continue
 
         try:
-            score = summarize_ticker_sentiment(ticker, articles)
+            score = summarize_ticker_sentiment(articles)
             ticker_scores[ticker] = score
         except Exception as e:
             print(f"  ERROR summarizing sentiment for {ticker}: {e}")
