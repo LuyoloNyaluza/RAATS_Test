@@ -1,364 +1,965 @@
-# File: src/agents/trading_loop_dynamic.py
 """
-Enhanced trading loop with dynamic watchlist management using a discovery layer.
-Integrates the discovery layer (src/data/discovery.py) to generate a dynamic
-ticker universe each day based on:
-  1. 35 deterministic random S&P 500 candidates (for logging)
-  2. Final top 50 universe from comparing previous day's Yahoo Finance top 50 performers
-     with Google RSS top 50 from previous day
-Then uses the existing watchlist manager to fetch news, score sentiment, and
-generate active/waitlist arrays.
+Dynamic trading loop using the three arrays produced by discovery.py.
+
+Input arrays:
+
+1. top_50_performing
+   - Complete top-50 performance universe.
+
+2. top_10
+   - First 10 tickers from the top-50.
+   - News articles are attached to these tickers.
+
+3. waiting_list
+   - Positions 11-30 from the top-50.
+   - No news fetching is performed for these tickers.
+
+The trading loop uses:
+    top_50_performing -> complete trading universe
+    top_10           -> initial active list
+    waiting_list     -> replacement/waiting list
 """
 
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
+
 import pandas as pd
 
-from src.data.watchlist_manager import (
-    get_top_tickers_by_sentiment,
-    update_trading_lists
-)
-from src.data.discovery import (
-    get_discovery_components
-)
 from src.agents.trading_loop import (
-    AgentState,
-    build_graph
+    build_graph,
+    run_daily_cycle,
 )
 from src.risk.risk_manager import RiskManager
 from src.simulation.orchestrator import compute_performance_metrics
-from src.utils.logger import log_session_summary, log_daily_watchlist
+from src.utils.logger import log_session_summary
 
+
+# ==========================================
+# HELPERS
+# ==========================================
 
 def _format_price(price: Optional[float]) -> str:
-    """Safe price formatting - the original f'{price:8.2f}' crashed
-    whenever price was None (which is the NORMAL value for any
-    Unstable/HOLD/rejected ticker, not an edge case)."""
-    return f"{price:8.2f}" if price is not None else "     n/a"
+    """Safely format an execution price."""
 
+    return (
+        f"{price:8.2f}"
+        if price is not None
+        else "     n/a"
+    )
+
+
+def _classify_result(
+    result: Dict[str, Any]
+) -> str:
+    """Classify one ticker's trading result."""
+
+    if (
+        result.get("signal") == "ERROR"
+        or result.get("stability_status") == "n/a"
+    ):
+        return "error"
+
+    if result.get("closed_trade"):
+        return "closed"
+
+    if result.get("executed"):
+        return "executed"
+
+    reason = str(
+        result.get("risk_reason") or ""
+    )
+
+    if reason.startswith(
+        "Position already open"
+    ):
+        return "monitoring"
+
+    if result.get(
+        "stability_status"
+    ) == "Unstable":
+        return "unstable"
+
+    if result.get(
+        "llm_signal"
+    ) == "HOLD":
+        return "hold"
+
+    return "blocked"
+
+
+# ==========================================
+# ARRAY CONVERSION
+# ==========================================
+
+def _extract_ticker(
+    item: Any
+) -> Optional[str]:
+    """
+    Extract a ticker from either:
+
+    - DataFrame row
+    - dictionary
+    - string
+    """
+
+    if isinstance(item, str):
+        return item.upper().strip()
+
+    if isinstance(item, dict):
+
+        ticker = item.get("Ticker")
+
+        if ticker is None:
+            ticker = item.get("ticker")
+
+        if ticker is None:
+            return None
+
+        return str(ticker).upper().strip()
+
+    return None
+
+
+def _array_to_tickers(
+    data: Any
+) -> List[str]:
+    """
+    Convert an input array/DataFrame into a simple
+    list of ticker symbols.
+    """
+
+    tickers = []
+
+    if data is None:
+        return tickers
+
+    if isinstance(data, pd.DataFrame):
+
+        if "Ticker" not in data.columns:
+            raise ValueError(
+                "Expected DataFrame column 'Ticker'."
+            )
+
+        values = data["Ticker"].tolist()
+
+    elif isinstance(data, (list, tuple)):
+
+        values = data
+
+    else:
+
+        raise TypeError(
+            "Ticker array must be a DataFrame, "
+            "list or tuple."
+        )
+
+    for item in values:
+
+        ticker = _extract_ticker(item)
+
+        if ticker and ticker not in tickers:
+            tickers.append(ticker)
+
+    return tickers
+
+
+def _build_performance_scores(
+    top_50_performing: Any
+) -> Dict[str, float]:
+    """
+    Build scores from the previous-session return.
+
+    These scores replace the old sentiment-ranking
+    dependency because discovery.py has already
+    ranked the universe.
+    """
+
+    scores = {}
+
+    if isinstance(
+        top_50_performing,
+        pd.DataFrame
+    ):
+
+        if (
+            "Ticker" not in top_50_performing.columns
+            or
+            "Previous_Day_Return_Pct"
+            not in top_50_performing.columns
+        ):
+            return scores
+
+        for row in top_50_performing.itertuples(
+            index=False
+        ):
+
+            ticker = str(
+                row.Ticker
+            ).upper().strip()
+
+            value = getattr(
+                row,
+                "Previous_Day_Return_Pct"
+            )
+
+            if value is None:
+                continue
+
+            try:
+                scores[ticker] = float(value)
+            except (
+                TypeError,
+                ValueError
+            ):
+                continue
+
+    elif isinstance(
+        top_50_performing,
+        (list, tuple)
+    ):
+
+        for item in top_50_performing:
+
+            if not isinstance(item, dict):
+                continue
+
+            ticker = _extract_ticker(item)
+
+            value = item.get(
+                "Previous_Day_Return_Pct"
+            )
+
+            if ticker is None:
+                continue
+
+            if value is None:
+                continue
+
+            try:
+                scores[ticker] = float(value)
+            except (
+                TypeError,
+                ValueError
+            ):
+                continue
+
+    return scores
+
+
+def _build_news_by_ticker(
+    top_10: Any
+) -> Dict[str, Dict[str, Any]]:
+    """Index news fields attached to top-10 ticker records."""
+
+    if isinstance(top_10, pd.DataFrame):
+        records = top_10.to_dict("records")
+    elif isinstance(top_10, (list, tuple)):
+        records = top_10
+    else:
+        return {}
+
+    news_by_ticker: Dict[str, Dict[str, Any]] = {}
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+
+        ticker = _extract_ticker(item)
+        if ticker:
+            news_by_ticker[ticker] = {
+                "yfinance_news": item.get("yfinance_news", []),
+                "google_news": item.get("google_news", []),
+                "sentiment_summary": item.get("sentiment_summary", {}),
+            }
+
+    return news_by_ticker
+
+
+# ==========================================
+# DYNAMIC TRADING MANAGER
+# ==========================================
 
 class DynamicTradingManager:
+
     """
-    Manages dynamic watchlist based on news sentiment and position tracking.
-    - Read news before market opens (via discovery layer + watchlist manager)
-    - Hold top-N array (ranked by sentiment)
-    - Open trades for the top active_list
-    - As trades close, fill from waiting list
-    - Keep waiting list filled from initial ranking
+    Manages the three discovery arrays.
+
+    top_50_performing:
+        Complete trading universe.
+
+    top_10:
+        Initial active trading list.
+
+    waiting_list:
+        Positions 11-30 used as replacements.
     """
 
     def __init__(
         self,
-        ticker_universe: Optional[List[str]] = None,  # If None, will be generated dynamically
-        max_active_positions: int = 10,
-        waitlist_size: int = 10,
-        max_articles_per_ticker: int = 5,
-        total_article_cap: Optional[int] = 50,
-        sentiment_model: str = "mistral",
-        news_fetch_pause: float = 0.5,
+        top_50_performing: Any,
+        top_10: Any,
+        waiting_list: Any,
         portfolio_value: float = 10_000,
-        analyst_model: Optional[str] = None
+        analyst_model: Optional[str] = None,
     ):
-        # If a fixed universe is provided, use it; otherwise generate dynamically each pre-market scan
-        self.fixed_ticker_universe = ticker_universe
-        self.max_active_positions = max_active_positions
-        self.waitlist_size = waitlist_size
-        self.max_articles_per_ticker = max_articles_per_ticker
-        self.total_article_cap = total_article_cap
-        self.sentiment_model = sentiment_model
-        self.news_fetch_pause = news_fetch_pause
-        self.portfolio_value = portfolio_value
-        self.analyst_model = analyst_model
 
-        self.active_list: List[str] = []
-        self.waitlist: List[str] = []
-        self._initial_active: List[str] = []
-        self._initial_waitlist: List[str] = []
-        self.all_sentiment_scores: Dict[str, float] = {}
+        # ----------------------------------
+        # Store original arrays
+        # ----------------------------------
+        self.news_by_ticker = _build_news_by_ticker(
+    top_10
+)
+        self.top_50_performing = (
+            top_50_performing
+        )
 
-        # ONE RiskManager for the whole session - see fix #2 in the
-        # module docstring for why this is now the single source of
-        # truth for the final summary, instead of being unused.
-        self.risk_manager = RiskManager()
-        self.closed_positions_today: List[str] = []
-        self.daily_results: List[Dict[str, Any]] = []
+        self.top_10 = top_10
+
+        self.initial_waiting_list = (
+            waiting_list
+        )
+
+        # ----------------------------------
+        # Convert to ticker lists
+        # ----------------------------------
+
+        self.ticker_universe = (
+            _array_to_tickers(
+                top_50_performing
+            )
+        )
+
+        self.active_list = (
+            _array_to_tickers(
+                top_10
+            )
+        )
+
+        self.waitlist = (
+            _array_to_tickers(
+                waiting_list
+            )
+        )
+
+        # ----------------------------------
+        # Configuration
+        # ----------------------------------
+
+        self.max_active_positions = len(
+            self.active_list
+        )
+
+        self.waitlist_size = len(
+            self.waitlist
+        )
+
+        self.portfolio_value = (
+            portfolio_value
+        )
+
+        self.analyst_model = (
+            analyst_model
+        )
+
+        # ----------------------------------
+        # Performance ranking
+        # ----------------------------------
+
+        self.all_sentiment_scores = (
+            _build_performance_scores(
+                top_50_performing
+            )
+        )
+
+        # ----------------------------------
+        # Session state
+        # ----------------------------------
+
+        self.closed_positions_today = []
+
+        self.daily_results = []
+
+        self._initial_active = (
+            self.active_list.copy()
+        )
+
+        self._initial_waitlist = (
+            self.waitlist.copy()
+        )
+
+        # ----------------------------------
+        # Shared trading graph
+        # ----------------------------------
 
         self.shared_app = build_graph()
 
-        # Placeholders for discovery logging
-        self._last_universe: List[str] = []
-        self._last_random_list: List[str] = []
-        self._last_date: Optional[str] = None
+        # ONE RiskManager for the entire
+        # session.
+        self.risk_manager = RiskManager()
 
-        print(f"DynamicTradingManager initialized:")
-        if self.fixed_ticker_universe is not None:
-            print(f"  Using fixed universe: {len(self.fixed_ticker_universe)} tickers")
-        else:
-            print(f"  Universe will be generated dynamically each pre-market scan")
-        print(f"  Max active positions: {max_active_positions}")
-        print(f"  Waitlist size: {waitlist_size}")
-        if total_article_cap is not None:
-            print(f"  Total article budget: {total_article_cap} across the whole universe")
+        # ----------------------------------
+        # Diagnostics
+        # ----------------------------------
 
-    def _get_discovery_components(self) -> dict:
-        """Get discovery components using the new discovery layer approach."""
-        # Get current open positions to exclude from consideration
-        open_positions = set(self.risk_manager.positions.keys())
-        
-        # Get the discovery components from the new discovery layer
-        # Pass open_positions so discovery layer can handle exclusion internally
-        candidate_universe, random_list, auxiliary = get_discovery_components(open_positions=open_positions)
-        
-        return {
-            'candidates': candidate_universe,
-            'random_list': random_list,
-            'auxiliary': auxiliary
-        }
-    def _generate_dynamic_universe(self) -> List[str]:
-        """Generate the ticker universe for today using the discovery layer.
-        Excludes currently open positions to avoid churning.
-        Returns a list of ticker symbols (aiming for ~50).
-        """
-        print("\n" + "="*60)
-        print("GENERATING DYNAMIC TICKER UNIVERSE VIA DISCOVERY LAYER")
-        print("="*60)
-        
-        components = self._get_discovery_components()
-        self._last_universe = components['candidates']
-        self._last_random_list = components['random_list']
-        return self._last_universe
-
-    def pre_market_scan(self) -> Tuple[List[str], List[str], Dict[str, float]]:
-        """
-        Fetch news, score sentiment, generate active/waitlist arrays.
-        Uses discovery layer to generate the ticker universe, then
-        delegates to the existing watchlist manager for news fetching,
-        sentiment scoring, and list generation.
-        """
-        print("\n" + "="*60)
-        print("PRE-MARKET SCAN: Fetching news and generating watchlists")
-        print("="*60)
-
-        # Determine ticker universe
-        if self.fixed_ticker_universe is not None:
-            tickers = self.fixed_ticker_universe
-            # For static case, we still want to log something sensible for random list
-            self._last_universe = tickers[:50]  # cap at 50 for logging consistency
-            self._last_random_list = []  # no random exploration in static mode
-            print(f"Using fixed ticker universe of {len(tickers)} symbols")
-        else:
-            tickers = self._generate_dynamic_universe()
-            if not tickers:
-                print("WARNING: Dynamic universe generation returned empty list. No candidates for this session.")
-                self._last_universe = []
-                self._last_random_list = []
-                self.active_list = []
-                self.waitlist = []
-                self.all_sentiment_scores = {}
-                return self.active_list, self.waitlist, self.all_sentiment_scores
-        # Limit universe size to reasonable bounds (e.g., 50-100) as per original spec
-        max_universe = 100
-        if len(tickers) > max_universe:
-            print(f"Universe size {len(tickers)} exceeds max {max_universe}. Truncating.")
-            tickers = tickers[:max_universe]
-            # Also truncate the stored universe for logging
-            self._last_universe = tickers[:50]
-        print(f"Final ticker universe size: {len(tickers)}")
-
-        # Store date for logging
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        self._last_date = today_str
-
-        # Delegate to existing watchlist manager for news fetching, sentiment scoring, and list generation
-        active_list, waitlist, sentiment_scores = get_top_tickers_by_sentiment(
-            tickers=tickers,
-            top_n=self.max_active_positions,
-            waitlist_n=self.waitlist_size,
-            max_articles_per_ticker=self.max_articles_per_ticker,
-            total_article_cap=self.total_article_cap,
-            model_name=self.sentiment_model,
-            pause=self.news_fetch_pause
+        print(
+            "\nDynamicTradingManager initialized:"
         )
 
-        self.active_list = active_list
-        self.waitlist = waitlist
-        self.all_sentiment_scores = sentiment_scores
-
-        print(f"\nPRE-MARKET RESULTS:")
-        print(f"  Active list ({len(self.active_list)}): {self.active_list}")
-        print(f"  Waiting list ({len(self.waitlist)}): {self.waitlist}")
-
-        # Log start-of-day watchlist snapshot
-        log_daily_watchlist(
-            date=today_str,
-            top50=self._last_universe,
-            random_list=self._last_random_list,
-            top10_active=self.active_list,
-            open_trades=[],  # no open trades yet at start of day
+        print(
+            f"  Top-50 universe: "
+            f"{len(self.ticker_universe)} tickers"
         )
 
-        return self.active_list, self.waitlist, self.all_sentiment_scores
+        print(
+            f"  Active top-10: "
+            f"{len(self.active_list)} tickers"
+        )
 
-    def update_lists_after_trades(self, newly_closed_positions: List[str]) -> None:
-        """Update trading lists when positions close during the day."""
+        print(
+            f"  Waiting list: "
+            f"{len(self.waitlist)} tickers"
+        )
+
+    # ======================================
+    # PRE-MARKET ARRAYS
+    # ======================================
+
+    def pre_market_scan(
+        self
+    ) -> Tuple[
+        List[str],
+        List[str],
+        Dict[str, float]
+    ]:
+        """
+        Use discovery.py output directly.
+
+        No additional news fetching or
+        sentiment ranking occurs here.
+        """
+
+        print(
+            "\n"
+            + "=" * 60
+        )
+
+        print(
+            "PRE-MARKET DISCOVERY ARRAYS"
+        )
+
+        print(
+            "=" * 60
+        )
+
+        print(
+            f"Top-50 universe "
+            f"({len(self.ticker_universe)}):"
+        )
+
+        print(
+            self.ticker_universe
+        )
+
+        print(
+            f"\nActive top-10 "
+            f"({len(self.active_list)}):"
+        )
+
+        print(
+            self.active_list
+        )
+
+        print(
+            f"\nWaiting list "
+            f"({len(self.waitlist)}):"
+        )
+
+        print(
+            self.waitlist
+        )
+
+        return (
+            self.active_list,
+            self.waitlist,
+            self.all_sentiment_scores,
+        )
+
+    # ======================================
+    # UPDATE AFTER CLOSED TRADES
+    # ======================================
+
+    def update_lists_after_trades(
+        self,
+        newly_closed_positions: List[str]
+    ) -> None:
+        """
+        Fill an empty active slot from the
+        waiting list.
+
+        Waiting-list order is preserved.
+        """
+
         if not newly_closed_positions:
             return
 
-        print(f"\n{len(newly_closed_positions)} positions closed: {newly_closed_positions}")
-        self.closed_positions_today.extend(newly_closed_positions)
-
-        updated_active, updated_waitlist = update_trading_lists(
-            closed_positions=newly_closed_positions,
-            current_active=self.active_list,
-            current_waitlist=self.waitlist,
-            all_tickers=self.fixed_ticker_universe if self.fixed_ticker_universe is not None else self._last_universe,
-            sentiment_scores=self.all_sentiment_scores,
-            top_n=self.max_active_positions,
-            waitlist_n=self.waitlist_size
+        print(
+            f"\n"
+            f"{len(newly_closed_positions)} "
+            f"positions closed: "
+            f"{newly_closed_positions}"
         )
 
-        self.active_list = updated_active
-        self.waitlist = updated_waitlist
+        self.closed_positions_today.extend(
+            newly_closed_positions
+        )
 
-        print(f"UPDATED LISTS:")
-        print(f"  Active list ({len(self.active_list)}): {self.active_list}")
-        print(f"  Waiting list ({len(self.waitlist)}): {self.waitlist}")
+        # Remove closed tickers from active list.
+        for ticker in newly_closed_positions:
 
-    def get_trading_tickers(self) -> List[str]:
+            if ticker in self.active_list:
+                self.active_list.remove(
+                    ticker
+                )
+
+        # ----------------------------------
+        # Fill active positions from waitlist
+        # ----------------------------------
+
+        while (
+            len(self.active_list)
+            < self.max_active_positions
+            and self.waitlist
+        ):
+
+            next_ticker = (
+                self.waitlist.pop(0)
+            )
+
+            if (
+                next_ticker
+                not in self.active_list
+                and
+                next_ticker
+                not in self.closed_positions_today
+            ):
+
+                self.active_list.append(
+                    next_ticker
+                )
+
+                print(
+                    f"  Promoted from waiting "
+                    f"list: {next_ticker}"
+                )
+
+        print(
+            "\nUPDATED LISTS:"
+        )
+
+        print(
+            f"  Active list "
+            f"({len(self.active_list)}): "
+            f"{self.active_list}"
+        )
+
+        print(
+            f"  Waiting list "
+            f"({len(self.waitlist)}): "
+            f"{self.waitlist}"
+        )
+
+    # ======================================
+    # ACTIVE TICKERS
+    # ======================================
+
+    def get_trading_tickers(
+        self
+    ) -> List[str]:
+
         return self.active_list.copy()
 
-    def run_trading_session(self, simulate_date: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Run a complete trading session with dynamic watchlist management."""
-        print(f"\n{'='*60}")
-        print(f"STARTING TRADING SESSION")
+    # ======================================
+    # TRADING SESSION
+    # ======================================
+
+    def run_trading_session(
+        self,
+        simulate_date: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Run one complete trading session.
+        """
+
+        print(
+            "\n"
+            + "=" * 60
+        )
+
+        print(
+            "STARTING DYNAMIC TRADING SESSION"
+        )
+
         if simulate_date:
-            print(f"Simulated date: {simulate_date}")
-        print(f"{'='*60}")
+            print(
+                f"Simulated date: "
+                f"{simulate_date}"
+            )
+
+        print(
+            "=" * 60
+        )
 
         self.pre_market_scan()
 
         if self.active_list:
-            print(f"\nRunning sequential trading for {len(self.active_list)} active "
-                  f"positions (one shared portfolio, so the final summary is accurate)...")
-            results, self.risk_manager = self._run_active_list_with_shared_manager()
 
-            self.daily_results.extend(results)
+            print(
+                f"\nRunning trading for "
+                f"{len(self.active_list)} "
+                f"active tickers..."
+            )
+
+            if simulate_date:
+
+                print(
+                    f"NOTE: simulate_date="
+                    f"{simulate_date}"
+                )
+
+            results, self.risk_manager = (
+                self._run_active_list_with_shared_manager(
+                    simulate_date
+                )
+            )
+
+            self.daily_results.extend(
+                results
+            )
 
             newly_closed = [
-                ticker for r in results
-                if r.get("closed_trade")
-                and isinstance((ticker := r.get("ticker")), str)
-                and ticker not in self.closed_positions_today
+                ticker
+                for result in results
+                if result.get(
+                    "closed_trade"
+                )
+                and isinstance(
+                    (
+                        ticker :=
+                        result.get("ticker")
+                    ),
+                    str
+                )
+                and ticker
+                not in self.closed_positions_today
             ]
 
             if newly_closed:
-                self.update_lists_after_trades(newly_closed)
+
+                self.update_lists_after_trades(
+                    newly_closed
+                )
+
         else:
-            print("WARNING: No active positions to trade!")
+
+            print(
+                "WARNING: "
+                "No active positions to trade!"
+            )
+
             results = []
 
         self._print_session_summary()
 
-        # Log end-of-day watchlist snapshot (open trades at close of day)
-        if self._last_date:
-            # The logger expects serializable dictionaries, while the risk
-            # manager stores Position objects.
-            open_trades_at_close = [
-                vars(position) for position in self.risk_manager.positions.values()
-            ]
-            log_daily_watchlist(
-                date=self._last_date,
-                top50=self._last_universe,
-                random_list=self._last_random_list,
-                top10_active=self.active_list,
-                open_trades=open_trades_at_close,
-            )
-
         return self.daily_results
 
-    def _run_active_list_with_shared_manager(self) -> Tuple[List[Dict[str, Any]], RiskManager]:
-        """Run the active list sequentially against THIS session's
-        self.risk_manager directly (bypassing run_watchlist's internal
-        manager), so positions genuinely persist in the object this
-        class reports on afterward."""
-        from src.agents.trading_loop import run_daily_cycle
+    # ======================================
+    # RUN ACTIVE LIST
+    # ======================================
+
+    def _run_active_list_with_shared_manager(
+        self,
+        simulate_date: Optional[str] = None
+    ) -> Tuple[
+        List[Dict[str, Any]],
+        RiskManager
+    ]:
+        """
+        Run each active ticker sequentially
+        using one shared RiskManager.
+        """
 
         results = []
+
         for ticker in self.active_list:
             try:
+                news_by_ticker = getattr(self, "news_by_ticker", {})
+                news = news_by_ticker.get(
+    ticker,
+    {
+        "yfinance_news": [],
+        "google_news": [],
+        "sentiment_summary": {},
+    },
+)
                 result = run_daily_cycle(
                     ticker,
                     app=self.shared_app,
                     risk_manager=self.risk_manager,
                     portfolio_value=self.portfolio_value,
                     analyst_model=self.analyst_model,
+                    simulate_date=simulate_date,
                     verbose=True,
+                    discovery_news=news,
                 )
-                results.append(result)
+
+                results.append(
+                    result
+                )
+
             except Exception as exc:
-                print(f"  ERROR processing {ticker}: {exc}")
+
+                print(
+                    f"  ERROR processing "
+                    f"{ticker}: {exc}"
+                )
+
                 results.append({
-                    "ticker": ticker, "signal": "ERROR", "confidence": 0.0,
-                    "executed": False, "executed_price": None,
-                    "risk_reason": str(exc), "stability_status": "n/a",
+                    "ticker": ticker,
+                    "signal": "ERROR",
+                    "confidence": 0.0,
+                    "executed": False,
+                    "executed_price": None,
+                    "risk_reason": str(exc),
+                    "stability_status": "n/a",
                 })
-        return results, self.risk_manager
 
-    def _categorize_results(self) -> Dict[str, List[str]]:
-        """Split today's results into EXECUTED / HOLD / UNSTABLE, so the
-        report can show "these were on hold" distinctly from "these were
-        blocked by the stability filter" - the original conflated both
-        into a single SKIPPED bucket."""
-        executed, hold, unstable = [], [], []
-        for r in self.daily_results:
-            ticker = r.get("ticker", "UNKNOWN")
-            if r.get("executed"):
-                executed.append(ticker)
-            elif r.get("stability_status") == "Unstable":
-                unstable.append(ticker)
-            else:
-                hold.append(ticker)
-        return {"executed": executed, "hold": hold, "unstable": unstable}
+        return (
+            results,
+            self.risk_manager
+        )
 
-    def _print_session_summary(self) -> None:
-        """Print (and log) a summary of the trading session, using the
-        SAME performance-metrics calculation run_simulation.py's report
-        uses, computed from this session's real, shared RiskManager."""
-        print(f"\n{'='*60}")
-        print(f"TRADING SESSION SUMMARY")
-        print(f"{'='*60}")
+    # ======================================
+    # CATEGORIZE RESULTS
+    # ======================================
 
-        print(f"Pre-market scan completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Final active list ({len(self.active_list)}): {self.active_list}")
-        print(f"Final waiting list ({len(self.waitlist)}): {self.waitlist}")
-        print(f"Closed positions today ({len(self.closed_positions_today)}): {self.closed_positions_today}")
+    def _categorize_results(
+        self
+    ) -> Dict[str, List[str]]:
 
-        categories = self._categorize_results()
-        print(f"\nExecuted ({len(categories['executed'])}): {categories['executed']}")
-        print(f"On HOLD  ({len(categories['hold'])}): {categories['hold']}")
-        print(f"Unstable ({len(categories['unstable'])}): {categories['unstable']}")
+        categories = {
+            "executed": [],
+            "closed": [],
+            "monitoring": [],
+            "hold": [],
+            "blocked": [],
+            "unstable": [],
+            "error": [],
+        }
+
+        for result in self.daily_results:
+
+            category = _classify_result(
+                result
+            )
+
+            categories[
+                category
+            ].append(
+                result.get(
+                    "ticker",
+                    "UNKNOWN"
+                )
+            )
+
+        return categories
+
+    # ======================================
+    # SESSION SUMMARY
+    # ======================================
+
+    def _print_session_summary(
+        self
+    ) -> None:
+
+        print(
+            "\n"
+            + "=" * 60
+        )
+
+        print(
+            "TRADING SESSION SUMMARY"
+        )
+
+        print(
+            "=" * 60
+        )
+
+        print(
+            "Pre-market discovery completed at: "
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        print(
+            f"Top-50 universe "
+            f"({len(self.ticker_universe)}): "
+            f"{self.ticker_universe}"
+        )
+
+        print(
+            f"Final active list "
+            f"({len(self.active_list)}): "
+            f"{self.active_list}"
+        )
+
+        print(
+            f"Final waiting list "
+            f"({len(self.waitlist)}): "
+            f"{self.waitlist}"
+        )
+
+        print(
+            f"Closed positions today "
+            f"({len(self.closed_positions_today)}): "
+            f"{self.closed_positions_today}"
+        )
+
+        categories = (
+            self._categorize_results()
+        )
+
+        labels = [
+            (
+                "executed",
+                "Executed (new position)"
+            ),
+            (
+                "closed",
+                "Closed"
+            ),
+            (
+                "monitoring",
+                "Already open, monitored"
+            ),
+            (
+                "hold",
+                "On HOLD (LLM said no)"
+            ),
+            (
+                "blocked",
+                "INVEST but blocked"
+            ),
+            (
+                "unstable",
+                "Deferred, market unstable"
+            ),
+            (
+                "error",
+                "Errors"
+            ),
+        ]
+
+        print()
+
+        for key, label in labels:
+
+            if (
+                categories[key]
+                or key
+                in (
+                    "executed",
+                    "hold",
+                    "unstable"
+                )
+            ):
+
+                print(
+                    f"{label:<34} "
+                    f"({len(categories[key])}): "
+                    f"{categories[key]}"
+                )
 
         if self.daily_results:
-            print(f"\n{'Ticker':<8} | {'Status':<10} | {'Signal':<8} | {'Price':>10}")
-            for result in self.daily_results:
-                ticker = result.get("ticker", "UNKNOWN")
-                if result.get("executed"):
-                    status = "EXECUTED"
-                elif result.get("stability_status") == "Unstable":
-                    status = "UNSTABLE"
-                else:
-                    status = "HOLD"
-                signal = result.get("llm_signal", result.get("signal", "N/A")) or "N/A"
-                price = _format_price(result.get("executed_price"))
-                print(f"  {ticker:<6} | {status:<10} | {signal:<8} | {price}")
 
-        # Real metrics, from the shared RiskManager's actual closed
-        # trades - same function run_simulation.py's report uses.
-        metrics = compute_performance_metrics(
-            self.risk_manager.closed_trades, self.portfolio_value
+            print(
+                f"\n"
+                f"{'Ticker':<7} | "
+                f"{'Outcome':<10} | "
+                f"{'Signal':<7} | "
+                f"{'Conf':>4} | "
+                f"{'Price':>9} | Reason"
+            )
+
+            for result in self.daily_results:
+
+                ticker = result.get(
+                    "ticker",
+                    "UNKNOWN"
+                )
+
+                outcome = (
+                    _classify_result(
+                        result
+                    ).upper()
+                )
+
+                signal = (
+                    result.get(
+                        "llm_signal"
+                    )
+                    or "-"
+                )
+
+                conf = result.get(
+                    "confidence"
+                )
+
+                conf_str = (
+                    f"{conf:.1f}"
+                    if isinstance(
+                        conf,
+                        (int, float)
+                    )
+                    and signal != "-"
+                    else "  -"
+                )
+
+                price = _format_price(
+                    result.get(
+                        "executed_price"
+                    )
+                )
+
+                reason = str(
+                    result.get(
+                        "risk_reason"
+                    )
+                    or ""
+                )[:70]
+
+                print(
+                    f"{ticker:<7} | "
+                    f"{outcome:<10} | "
+                    f"{signal:<7} | "
+                    f"{conf_str:>4} | "
+                    f"{price:>9} | "
+                    f"{reason}"
+                )
+
+        metrics = (
+            compute_performance_metrics(
+                self.risk_manager.closed_trades,
+                self.portfolio_value
+            )
         )
-        print(f"\nPortfolio: {self.risk_manager.portfolio_summary()}")
-        print(f"Performance metrics: {metrics}")
+
+        print(
+            f"\nPortfolio: "
+            f"{self.risk_manager.portfolio_summary()}"
+        )
+
+        print(
+            f"Performance metrics: "
+            f"{metrics}"
+        )
 
         log_session_summary(
             active_list=self.active_list,
@@ -367,102 +968,208 @@ class DynamicTradingManager:
             metrics=metrics,
         )
 
-    def get_waitlist_opportunities(self, count: int = 5) -> List[Tuple[str, float]]:
-        excluded = set(self.active_list) | set(self.closed_positions_today)
+    # ======================================
+    # WAITLIST OPPORTUNITIES
+    # ======================================
+
+    def get_waitlist_opportunities(
+        self,
+        count: int = 5
+    ) -> List[Tuple[str, float]]:
+
+        excluded = (
+            set(self.active_list)
+            |
+            set(self.closed_positions_today)
+        )
+
         available = [
-            (ticker, score)
-            for ticker, score in self.all_sentiment_scores.items()
+            (
+                ticker,
+                score
+            )
+            for ticker, score
+            in self.all_sentiment_scores.items()
             if ticker not in excluded
         ]
-        available.sort(key=lambda x: x[1], reverse=True)
+
+        available.sort(
+            key=lambda x: x[1],
+            reverse=True
+        )
+
         return available[:count]
 
 
-def run_dynamic_trading_session(
-    ticker_universe: Optional[List[str]],
-    simulate_date: Optional[str] = None,
-    max_active_positions: int = 10,
-    waitlist_size: int = 10,
-    max_articles_per_ticker: int = 5,
-    total_article_cap: Optional[int] = 50,
-    sentiment_model: str = "mistral",
-    news_fetch_pause: float = 0.5,
-    portfolio_value: float = 10_000,
-    analyst_model: Optional[str] = None
-) -> Dict[str, Any]:
-    """Convenience function to run a complete dynamic trading session."""
-    print("Initializing Dynamic Trading Manager...")
+# ==========================================
+# PUBLIC ENTRY POINT
+# ==========================================
 
-    manager = DynamicTradingManager(
-        ticker_universe=ticker_universe,
-        max_active_positions=max_active_positions,
-        waitlist_size=waitlist_size,
-        max_articles_per_ticker=max_articles_per_ticker,
-        total_article_cap=total_article_cap,
-        sentiment_model=sentiment_model,
-        news_fetch_pause=news_fetch_pause,
-        portfolio_value=portfolio_value,
-        analyst_model=analyst_model
+def run_dynamic_trading_session(
+    top_50_performing: Any,
+    top_10: Any,
+    waiting_list: Any,
+    simulate_date: Optional[str] = None,
+    portfolio_value: float = 10_000,
+    analyst_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Run the dynamic trading session using the
+    three arrays generated by discovery.py.
+
+    Parameters
+    ----------
+    top_50_performing:
+        Complete top-50 performance array.
+
+    top_10:
+        Top-10 array. News can be attached to
+        each ticker.
+
+    waiting_list:
+        Positions 11-30.
+
+    simulate_date:
+        Optional historical simulation date.
+
+    portfolio_value:
+        Starting portfolio value.
+
+    analyst_model:
+        Optional LLM analyst model.
+    """
+
+    print(
+        "Initializing Dynamic Trading Manager..."
     )
 
-    manager._initial_active = manager.active_list.copy()
-    manager._initial_waitlist = manager.waitlist.copy()
+    manager = DynamicTradingManager(
+        top_50_performing=top_50_performing,
+        top_10=top_10,
+        waiting_list=waiting_list,
+        portfolio_value=portfolio_value,
+        analyst_model=analyst_model,
+    )
 
-    results = manager.run_trading_session(simulate_date=simulate_date)
+    results = manager.run_trading_session(
+        simulate_date=simulate_date
+    )
 
     session_results = {
         "manager": manager,
         "results": results,
-        "active_list": manager.active_list,
-        "waitlist": manager.waitlist,
-        "closed_positions": manager.closed_positions_today,
-        "sentiment_scores": manager.all_sentiment_scores,
-        "waitlist_opportunities": manager.get_waitlist_opportunities(10)
+
+        # Original discovery arrays
+        "top_50_performing":
+            manager.top_50_performing,
+
+        "top_10":
+            manager.top_10,
+
+        "initial_waiting_list":
+            manager.initial_waiting_list,
+
+        # Current trading state
+        "active_list":
+            manager.active_list,
+
+        "waitlist":
+            manager.waitlist,
+
+        "closed_positions":
+            manager.closed_positions_today,
+
+        "performance_scores":
+            manager.all_sentiment_scores,
+
+        "waitlist_opportunities":
+            manager.get_waitlist_opportunities(10),
     }
 
     return session_results
 
 
-if __name__ == "__main__":
-    print("=== Dynamic Trading System Demo ===")
+# ==========================================
+# MAIN
+# ==========================================
 
-    # Deduplicated (the original list had PG and IBM listed twice)
-    demo_universe = [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA",
-        "META", "NVDA", "NFLX", "AMD", "INTC",
-        "CSCO", "ADBE", "CRM", "ORCL", "IBM",
-        "QCOM", "TXN", "HON", "UNH", "JNJ",
-        "PG", "JPM", "BAC", "WFC", "C",
-        "V", "MA", "DIS", "NKE", "SBUX",
-        "MCD", "WMT", "TGT", "COST", "HD",
-        "LOW", "CL", "KMB", "GE",
-        "CAT", "MMM", "BA", "F", "GM",
-        "XOM", "CVX", "COP", "EOG", "SLB",
-    ]
-    print(f"Demo universe defined: {len(demo_universe)} tickers (not used in this run)")
+if __name__ == "__main__":
+
+    print(
+        "\n=== RAATS DYNAMIC TRADING SYSTEM ==="
+    )
 
     try:
-        session = run_dynamic_trading_session(
-            ticker_universe=None, # use dynamic discovery
-            max_active_positions=10,
-            waitlist_size=10,
-            total_article_cap=50,
-            news_fetch_pause=0.5,
-            portfolio_value=10_000
+
+        # ----------------------------------
+        # STEP 1: RUN DISCOVERY
+        # ----------------------------------
+
+        from src.data import discovery
+
+        (
+            top_50_performing,
+            top_10,
+            waiting_list,
+        ) = discovery.main()
+
+        print(
+            "\nDiscovery completed."
         )
 
-        print(f"\n=== SESSION COMPLETE ===")
-        print(f"Active list: {session['active_list']}")
-        print(f"Waiting list: {session['waitlist']}")
-        print(f"Closed positions: {session['closed_positions']}")
-        print(f"Top waitlist opportunities: {session['waitlist_opportunities']}")
+        print(
+            f"Top-50 array: "
+            f"{len(top_50_performing)}"
+        )
+
+        print(
+            f"Top-10 array: "
+            f"{len(top_10)}"
+        )
+
+        print(
+            f"Waiting-list array: "
+            f"{len(waiting_list)}"
+        )
+
+        # ----------------------------------
+        # STEP 2: PASS ALL THREE ARRAYS
+        # ----------------------------------
+
+        session = run_dynamic_trading_session(
+            top_50_performing=top_50_performing,
+            top_10=top_10,
+            waiting_list=waiting_list,
+            portfolio_value=10_000,
+        )
+
+        # ----------------------------------
+        # STEP 3: FINAL OUTPUT
+        # ----------------------------------
+
+        print(
+            "\n=== SESSION COMPLETE ==="
+        )
+
+        print(
+            f"Active list: "
+            f"{session['active_list']}"
+        )
+
+        print(
+            f"Waiting list: "
+            f"{session['waitlist']}"
+        )
+
+        print(
+            f"Closed positions: "
+            f"{session['closed_positions']}"
+        )
 
     except Exception as e:
-        print(f"Error running demo: {e}")
-        print("Make sure:")
-        print("1. Ollama is running (ollama serve)")
-        print("2. Required models are installed (ollama pull mistral)")
-        print("3. All required Python packages are installed")
-        print("4. You have internet access for news fetching")
 
-    print("\nDemo completed.")
+        print(
+            f"\nERROR: {e}"
+        )
+
+        raise
