@@ -188,3 +188,4 @@ if __name__ == "__main__":
         print(f"\n{len(errors)} days with errors:")
         for e in errors:
             print(e["date"], "->", e["error"])
+            
