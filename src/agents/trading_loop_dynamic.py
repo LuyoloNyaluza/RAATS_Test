@@ -999,7 +999,7 @@ class DynamicTradingManager:
         )
 
         return available[:count]
-def _replace_holds_until_all_invest(self):
+def replace_holds_until_all_invest(self):
     """
     Remove HOLD candidates from the active list and replace them
     from the waiting list until all active candidates are INVEST.
