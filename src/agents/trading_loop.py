@@ -36,6 +36,9 @@ from src.risk.risk_manager import RiskManager
 from src.risk.stability_filter import MarketStabilityFilter
 from src.utils.timer import node_timer
 from src.utils.logger import log_cycle
+from src.data.news_relevance import (
+    filter_relevant_articles,
+)
 
 
 class AgentState(TypedDict, total=False):
@@ -66,6 +69,10 @@ class AgentState(TypedDict, total=False):
     latencies: Dict[str, float]
     analyst_model: Optional[str]
     simulate_date: Optional[str]
+    news_relevance: List[Dict[str, Any]]
+    news_articles_retrieved: int
+    news_articles_relevant: int
+    treat_as_closed: bool
 
 
 _STABILITY_FILTER = MarketStabilityFilter()
@@ -91,10 +98,46 @@ def collector_node(state: AgentState) -> AgentState:
         },
     )
 
+    # Validate news relevance.
+    company_name = discovery_news.get("company_name")
+    all_articles = []
+    for source in ("yfinance_news", "google_news"):
+        all_articles.extend(discovery_news.get(source, []))
+
+    relevant_articles, relevance_results = filter_relevant_articles(
+        articles=all_articles,
+        ticker=ticker,
+        company_name=company_name,
+    )
+
+    # Rebuild news using only relevant news.
+    filtered_news = {
+        "yfinance_news": [],
+        "google_news": [],
+        "sentiment_summary": {},
+    }
+    relevant_ids = {id(article) for article in relevant_articles}
+    for source in ("yfinance_news", "google_news"):
+        filtered_news[source] = [
+            article
+            for article in discovery_news.get(source, [])
+            if id(article) in relevant_ids
+        ]
+
+    filtered_news["sentiment_summary"] = discovery_news.get(
+        "sentiment_summary", {}
+    )
+
+    # Keep diagnostics in state.
+    state["news_relevance"] = relevance_results
+    state["news_articles_retrieved"] = len(all_articles)
+    state["news_articles_relevant"] = len(relevant_articles)
+
+    # Sentiment receives filtered news only.
     state["sentiment"] = collect_sentiment(
         ticker,
         as_of=as_of,
-        discovery_news=discovery_news,
+        discovery_news=filtered_news,
     )
 
     state["scored_news"] = []
@@ -203,6 +246,7 @@ def run_daily_cycle(
     simulate_date=None,
     verbose=False,
     discovery_news=None,
+    treat_as_closed=False,
     is_top_five=False,
 ):
     app = app or build_graph()
@@ -227,6 +271,7 @@ def run_daily_cycle(
         "yfinance_news": [],
         "google_news": [],
          "sentiment_summary": {},
+         "treat_as_closed": treat_as_closed
 },
     }
     final_state = app.invoke(initial_state)

@@ -439,7 +439,7 @@ def _score_discovery_news(
         articles,
         model_name=os.environ.get(
             "RAATS_SENTIMENT_MODEL",
-            "mistral",
+            "mistral-nemo",
         ),
     )
 

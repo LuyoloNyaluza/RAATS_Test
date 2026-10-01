@@ -23,7 +23,7 @@ WAITING_LIST_COUNT = 20
 
 SENTIMENT_MODEL = os.environ.get(
     "RAATS_SENTIMENT_MODEL",
-    "mistral",
+    "mistral-nemo",
 )
 
 HEADERS = {
