@@ -999,7 +999,138 @@ class DynamicTradingManager:
         )
 
         return available[:count]
+def _replace_holds_until_all_invest(self):
+    """
+    Remove HOLD candidates from the active list and replace them
+    from the waiting list until all active candidates are INVEST.
+    """
 
+    hold_history = []
+    replacement_round = 0
+
+    while True:
+        replacement_round += 1
+
+        print(
+            f"\n========== ACTIVE LIST ROUND {replacement_round} =========="
+        )
+
+        results = []
+
+        # Analyse current active list
+        for ticker in list(self.active_list):
+
+            print(f"\nAnalyzing {ticker}...")
+
+            news = self.news_by_ticker.get(
+                ticker,
+                {
+                    "yfinance_news": [],
+                    "google_news": [],
+                    "sentiment_summary": {},
+                },
+            )
+
+            result = run_daily_cycle(
+                ticker,
+                app=self.shared_app,
+                risk_manager=self.risk_manager,
+                portfolio_value=self.portfolio_value,
+                analyst_model=self.analyst_model,
+                simulate_date=self.simulate_date,
+                verbose=True,
+                discovery_news=news,
+                treat_as_closed=True,
+            )
+
+            results.append(
+                {
+                    "ticker": ticker,
+                    "result": result,
+                }
+            )
+
+        # Find HOLD candidates
+        holds = []
+
+        for item in results:
+            ticker = item["ticker"]
+            result = item["result"]
+
+            if self._classify_result(result) == "HOLD":
+                holds.append(ticker)
+
+        # No HOLDs means active list is complete
+        if not holds:
+            print("\nAll active candidates are INVEST.")
+            break
+
+        print(
+            f"\nHOLD candidates: {len(holds)}"
+        )
+
+        # Keep record for final summary
+        for ticker in holds:
+            hold_history.append(
+                {
+                    "ticker": ticker,
+                    "round": replacement_round,
+                }
+            )
+
+        # Remove HOLDs
+        self.active_list = [
+            ticker
+            for ticker in self.active_list
+            if ticker not in holds
+        ]
+
+        # Replace each HOLD from waiting list
+        replacements = []
+
+        for _ in holds:
+
+            if not self.waitlist:
+                print(
+                    "\nWaiting list exhausted. "
+                    "Cannot replace remaining HOLD candidates."
+                )
+                break
+
+            replacement = self.waitlist.pop(0)
+
+            self.active_list.append(replacement)
+            replacements.append(replacement)
+
+        if not replacements:
+            break
+
+        print(
+            f"\nReplacing HOLDs with: {replacements}"
+        )
+
+        # Fresh article retrieval + scoring
+        for ticker in replacements:
+
+            print(
+                f"\nFetching fresh articles for {ticker}..."
+            )
+
+            news = self._fetch_and_score_articles(
+                ticker
+            )
+
+            self.news_by_ticker[ticker] = news
+
+            print(
+                f"{ticker}: "
+                f"{len(news.get('yfinance_news', []))} "
+                f"Yahoo/yfinance articles, "
+                f"{len(news.get('google_news', []))} "
+                f"Google articles"
+            )
+
+    return hold_history
 
 # ==========================================
 # PUBLIC ENTRY POINT
