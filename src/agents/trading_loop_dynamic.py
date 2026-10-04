@@ -66,6 +66,11 @@ from src.data.discovery import (
 from src.risk.risk_manager import RiskManager
 from src.simulation.orchestrator import compute_performance_metrics
 from src.utils.logger import log_session_summary
+from src.utils.logger import (
+    log_cycle,
+    log_error,
+    log_sentiment_analysis,
+)
 
 
 # ==========================================
@@ -1138,12 +1143,36 @@ class DynamicTradingManager:
                 "=" * 60
             )
 
-            news = (
-                self._fetch_and_score_articles(
-                    ticker,
-                    self.simulate_date,
+            try:
+                news = (
+                    self._fetch_and_score_articles(
+                        ticker,
+                        self.simulate_date,
+                    )
                 )
-            )
+            except Exception as exc:
+                log_error(
+                    ticker=ticker,
+                    date=(
+                        self.simulate_date
+                        if self.simulate_date
+                        else datetime.now().strftime(
+                            "%Y-%m-%d"
+                        )
+                    ),
+                    error=str(exc),
+                    stage="replacement_discovery",
+                    context={
+                        "round": getattr(
+                            self,
+                            "current_round",
+                            None,
+                        ),
+                        "final_invest": self.final_invest,
+                        "waiting_list": self.waitlist,
+                    },
+                )
+                continue
 
             self.news_by_ticker[
                 ticker
@@ -1171,7 +1200,6 @@ class DynamicTradingManager:
             )
 
         return replacements
-
     # ======================================
     # TRADING SESSION
     # ======================================
