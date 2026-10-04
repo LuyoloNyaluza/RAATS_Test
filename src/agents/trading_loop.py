@@ -20,8 +20,9 @@ with no new entry considered.
 """
 
 import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TypedDict, Dict, Any, List, Optional
+from typing import TypedDict, Dict, Any, List, Optional, Mapping
 
 from langgraph.graph import StateGraph, END
 
@@ -35,7 +36,7 @@ from src.agents.executor import execute_trade
 from src.risk.risk_manager import RiskManager
 from src.risk.stability_filter import MarketStabilityFilter
 from src.utils.timer import node_timer
-from src.utils.logger import log_cycle
+from src.utils.logger import log_cycle, log_sentiment_analysis, log_error
 from src.data.news_relevance import (
     filter_relevant_articles,
 )
@@ -236,6 +237,80 @@ def build_graph():
     workflow.add_edge("executor", END)
     return workflow.compile()
 
+def build_daily_cycle_terminal_output(
+    result: Mapping[str, Any],
+) -> str:
+    """
+    Build the Daily Cycle Result text used for terminal output
+    and persistent sentiment-analysis logging.
+    """
+
+    ticker = result.get(
+        "ticker",
+        "UNKNOWN",
+    )
+
+    stability = result.get(
+        "stability_status",
+        "n/a",
+    )
+
+    llm_signal = result.get(
+        "llm_signal",
+        result.get(
+            "signal",
+            "N/A",
+        ),
+    )
+
+    confidence = result.get(
+        "confidence",
+        0.0,
+    )
+
+    model = result.get(
+        "model",
+        result.get(
+            "analyst_model",
+            "unknown",
+        ),
+    )
+
+    executed = result.get(
+        "executed",
+        False,
+    )
+
+    executed_price = result.get(
+        "executed_price"
+    )
+
+    risk_note = result.get(
+        "risk_reason",
+        "",
+    )
+
+    latencies = result.get(
+        "latencies_ms",
+        {},
+    )
+
+    return (
+        "=== Daily Cycle Result ===\n"
+        "\n"
+        f"Ticker:      {ticker}\n"
+        "\n"
+        f"Stability:   {stability}\n"
+        "\n"
+        f"LLM signal:  {llm_signal} "
+        f"(confidence: {confidence}, model: {model})\n"
+        "\n"
+        f"Executed:    {executed} @ {executed_price}\n"
+        "\n"
+        f"Risk note:   {risk_note}\n"
+        "\n"
+        f"Latencies:   {latencies}"
+    )
 
 def run_daily_cycle(
     ticker,
@@ -275,6 +350,8 @@ def run_daily_cycle(
 },
     }
     final_state = app.invoke(initial_state)
+    terminal_output = build_daily_cycle_terminal_output(final_state)
+    print(terminal_output)
     signal = str(final_state.get("llm_signal") or final_state.get("signal") or "")
     log_cycle(
         ticker=ticker,
@@ -283,6 +360,18 @@ def run_daily_cycle(
         latencies=final_state.get("latencies", {}),
         pnl=final_state.get("closed_trade", {}).get("pnl", 0.0),
     )
+    log_sentiment_analysis(
+    ticker=ticker,
+    sentiment=final_state.get("sentiment", 0.0),
+    sentiment_score=final_state.get("sentiment", 0.0),
+    positive=final_state.get("sentiment_summary", {}).get("positive", 0),
+    negative=final_state.get("sentiment_summary", {}).get("negative", 0),
+    neutral=final_state.get("sentiment_summary", {}).get("neutral", 0),
+    articles=final_state.get("scored_news", []),
+    daily_cycle_result=final_state,
+    terminal_output=terminal_output,
+    model=analyst_model,
+)
 
     if verbose:
         print("=== Daily Cycle Result ===")
@@ -307,7 +396,6 @@ def run_daily_cycle(
         print(f"Latencies:   {final_state.get('latencies')}")
     return final_state
 
-
 def run_watchlist(
     tickers: List[str],
     portfolio_value: float = 10_000,
@@ -329,11 +417,31 @@ def run_watchlist(
             )
             results.append(final_state)
         except Exception as exc:
-            print(f"  ERROR processing {ticker}: {exc}")
+            print(
+                f"  ERROR processing "
+                f"{ticker}: {exc}"
+            )
+
+            log_error(
+                ticker=ticker,
+                date=datetime.now().strftime("%Y-%m-%d"),
+                error=str(exc),
+                stage="daily_cycle",
+                context={
+                    "portfolio_value": portfolio_value,
+                    "active_list": tickers,
+                    "round": None,
+                },
+            )
+
             results.append({
-                "ticker": ticker, "signal": "ERROR", "confidence": 0.0,
-                "executed": False, "executed_price": None,
-                "risk_reason": str(exc), "stability_status": "n/a",
+                "ticker": ticker,
+                "signal": "ERROR",
+                "confidence": 0.0,
+                "executed": False,
+                "executed_price": None,
+                "risk_reason": str(exc),
+                "stability_status": "n/a",
             })
 
     print(f"\n\n{'=' * 50}\nWATCHLIST SUMMARY\n{'=' * 50}")
