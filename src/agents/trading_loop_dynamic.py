@@ -468,6 +468,11 @@ class DynamicTradingManager:
         )
 
         # ----------------------------------
+        # Pointer to next ticker in universe for replenishing waiting list
+        # ----------------------------------
+        self._next_universe_index = len(self.active_list) + len(self.waitlist)
+
+        # ----------------------------------
         # Target number of final INVEST
         # ----------------------------------
 
@@ -1085,6 +1090,27 @@ class DynamicTradingManager:
     # GET REPLACEMENTS
     # ======================================
 
+    # ----------------------------------
+    # Helper to replenish waiting list from universe
+    # ----------------------------------
+    def _replenish_waitlist_from_universe(self, count: int) -> None:
+        """Add up to `count` new tickers from ticker_universe to waiting list,
+        skipping those already in active list, final_invest, waiting list,
+        or closed positions.
+        """
+        added = 0
+        while added < count and self._next_universe_index < len(self.ticker_universe):
+            ticker = self.ticker_universe[self._next_universe_index]
+            self._next_universe_index += 1
+            if (
+                ticker not in self.active_list
+                and ticker not in self.final_invest
+                and ticker not in self.waitlist
+                and ticker not in self.closed_positions_today
+            ):
+                self.waitlist.append(ticker)
+                added += 1
+
     def _get_replacements(
         self,
         number_needed: int,
@@ -1199,6 +1225,10 @@ class DynamicTradingManager:
                 f"{ticker}"
             )
 
+        # ----------------------------------
+        # Replenish waiting list from universe for each replacement used
+        # ----------------------------------
+        self._replenish_waitlist_from_universe(len(replacements))
         return replacements
     # ======================================
     # TRADING SESSION

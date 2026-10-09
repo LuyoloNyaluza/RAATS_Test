@@ -1,4 +1,5 @@
 from fastapi import FastAPI, BackgroundTasks
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 import os
 import sys
@@ -11,9 +12,10 @@ project_root = os.path.join(current_dir, '..', '..')
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from agents.trading_loop_dynamic import run_dynamic_trading_session
+from src.agents.trading_loop_dynamic import run_dynamic_trading_session
 
 app = FastAPI(title="RAATS Agent API")
+Instrumentator().instrument(app).expose(app)
 
 class TradeResponse(BaseModel):
     status: str
@@ -21,14 +23,26 @@ class TradeResponse(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"message": "RAATS Agent API is running"}
+    return {
+        
+        "message": "RAATS Agent API is running"}
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "service": "raats-agent-api"
+    }
 
 @app.post("/run-trading-session", response_model=TradeResponse)
 def run_trading_session(background_tasks: BackgroundTasks):
     def run_session():
         # Run the dynamic trading session with empty ticker_universe to trigger discovery
         # This function will block until the session ends (market close or error)
-        run_dynamic_trading_session(ticker_universe=None, use_dynamic_discovery=True)
+        run_dynamic_trading_session(
+            top_50_performing=[],
+            top_10=[],
+            waiting_list=[],
+        )
     background_tasks.add_task(run_session)
     return TradeResponse(status="started", message="Trading session started in background")
 

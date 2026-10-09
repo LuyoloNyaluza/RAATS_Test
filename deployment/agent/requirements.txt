@@ -5,3 +5,4 @@ yfinance
 pandas-ta
 numpy
 python-dotenv
+prometheus-fastapi-instrumentator==8.1.0
