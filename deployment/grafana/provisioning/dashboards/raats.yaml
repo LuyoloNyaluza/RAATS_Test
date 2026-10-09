@@ -1,0 +1,12 @@
+
+apiVersion: 1
+
+providers:
+  - name: RAATS dashboards
+    orgId: 1
+    folder: RAATS
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
