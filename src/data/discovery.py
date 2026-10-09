@@ -18,13 +18,42 @@ from src.data.score_sentiment import (
 # ==========================================
 
 TOP_50_COUNT = 50
+TOP_40_EQUITIES_COUNT = 40
+COMMODITIES_COUNT = 5
+CURRENCIES_COUNT = 5
+
 TOP_10_COUNT = 10
 WAITING_LIST_COUNT = 20
 
 SENTIMENT_MODEL = os.environ.get(
     "RAATS_SENTIMENT_MODEL",
-    "mistral-nemo",
+    "qwen2.5:3b",
 )
+
+# ------------------------------------------
+# Yahoo Finance commodity instruments
+# ------------------------------------------
+
+COMMODITY_TICKERS = [
+    "GC=F",   # Gold
+    "SI=F",   # Silver
+    "CL=F",   # Crude Oil
+    "NG=F",   # Natural Gas
+    "HG=F",   # Copper
+]
+
+# ------------------------------------------
+# Yahoo Finance currency instruments
+# ------------------------------------------
+
+CURRENCY_TICKERS = [
+    "EURUSD=X",  # Euro / US Dollar
+    "GBPUSD=X",  # British Pound / US Dollar
+    "USDJPY=X",  # US Dollar / Japanese Yen
+    "AUDUSD=X",  # Australian Dollar / US Dollar
+    "USDCAD=X",  # US Dollar / Canadian Dollar
+]
+
 
 HEADERS = {
     "User-Agent": (
@@ -37,21 +66,33 @@ HEADERS = {
 
 
 # ==========================================
-# STEP 1: DISCOVER DYNAMIC TICKERS
+# STEP 1: DISCOVER TOP 40 EQUITY GAINERS
 # ==========================================
 
 def get_tickers_from_gainers_feed():
     """
-    Get a dynamic ticker universe from Yahoo Finance
-    day_gainers screener.
+    Get the top 40 equity gainers from Yahoo Finance.
+
+    Only normal US equity symbols are retained here.
+
+    Commodities and currencies are added separately so that
+    the final universe always contains:
+
+        40 equities
+        5 commodities
+        5 currencies
     """
 
-    print("Extracting trending tickers from Yahoo Finance screener...")
+    print(
+        "Extracting top 40 equity gainers "
+        "from Yahoo Finance..."
+    )
 
     try:
+
         result = yf.screen(
             "day_gainers",
-            count=250
+            count=40,
         )
 
         quotes = result.get("quotes", [])
@@ -82,14 +123,18 @@ def get_tickers_from_gainers_feed():
             if symbol not in tickers:
                 tickers.append(symbol)
 
-        if not tickers:
-            raise ValueError(
-                "No usable ticker symbols returned."
+            if len(tickers) >= TOP_40_EQUITIES_COUNT:
+                break
+
+        if len(tickers) < TOP_40_EQUITIES_COUNT:
+            print(
+                f"Yahoo returned only {len(tickers)} "
+                f"usable equity gainers."
             )
 
         print(
-            f"Discovered {len(tickers)} dynamic "
-            f"candidate tickers."
+            f"Discovered {len(tickers)} "
+            f"Yahoo equity gainers."
         )
 
         return tickers
@@ -97,10 +142,10 @@ def get_tickers_from_gainers_feed():
     except Exception as e:
 
         print(
-            f"Yahoo screener failed: {e}"
+            f"Yahoo gainers screener failed: {e}"
         )
 
-        # Emergency fallback only
+        # Emergency equity fallback only
         fallback = [
             "AAPL",
             "NVDA",
@@ -122,10 +167,32 @@ def get_tickers_from_gainers_feed():
             "ADBE",
             "PLTR",
             "CRWD",
+            "JPM",
+            "BAC",
+            "WMT",
+            "COST",
+            "HD",
+            "LOW",
+            "DIS",
+            "V",
+            "MA",
+            "PYPL",
+            "UBER",
+            "ABNB",
+            "SHOP",
+            "SNOW",
+            "PANW",
+            "NET",
+            "DDOG",
+            "MDB",
+            "COIN",
+            "SOFI",
         ]
 
+        fallback = fallback[:TOP_40_EQUITIES_COUNT]
+
         print(
-            f"Using emergency fallback: "
+            f"Using emergency equity fallback: "
             f"{len(fallback)} tickers."
         )
 
@@ -133,18 +200,107 @@ def get_tickers_from_gainers_feed():
 
 
 # ==========================================
-# STEP 2: PREVIOUS SESSION PERFORMANCE
+# STEP 2: BUILD 40 + 5 + 5 UNIVERSE
 # ==========================================
 
-def get_previous_session_returns(tickers):
+def build_market_universe(equity_tickers):
     """
-    Download recent daily prices and calculate
-    previous fully completed market-session returns.
+    Build the complete 50-instrument discovery universe.
+
+    Structure:
+
+        40 equities
+        5 commodities
+        5 currencies
     """
 
+    equities = equity_tickers[
+        :TOP_40_EQUITIES_COUNT
+    ]
+
+    commodities = COMMODITY_TICKERS[
+        :COMMODITIES_COUNT
+    ]
+
+    currencies = CURRENCY_TICKERS[
+        :CURRENCIES_COUNT
+    ]
+
+    universe = []
+
+    for ticker in equities:
+        universe.append({
+            "Ticker": ticker,
+            "Asset_Type": "equity",
+        })
+
+    for ticker in commodities:
+        universe.append({
+            "Ticker": ticker,
+            "Asset_Type": "commodity",
+        })
+
+    for ticker in currencies:
+        universe.append({
+            "Ticker": ticker,
+            "Asset_Type": "currency",
+        })
+
     print(
-        f"Verifying previous-session performance "
-        f"for {len(tickers)} tickers..."
+        "\n=== MARKET UNIVERSE ==="
+    )
+
+    print(
+        f"Equities:    {len(equities)}"
+    )
+
+    print(
+        f"Commodities: {len(commodities)}"
+    )
+
+    print(
+        f"Currencies:  {len(currencies)}"
+    )
+
+    print(
+        f"Total:       {len(universe)}"
+    )
+
+    return universe
+
+
+# ==========================================
+# STEP 3: PREVIOUS SESSION PERFORMANCE
+# ==========================================
+
+def get_previous_session_returns(
+    market_universe
+):
+    """
+    Calculate previous fully completed market-session
+    returns for the complete 40 + 5 + 5 universe.
+
+    The final structure remains:
+
+        40 equities
+        5 commodities
+        5 currencies
+
+    Equities are sorted by previous-session return.
+
+    Commodities are sorted within the commodity group.
+
+    Currencies are sorted within the currency group.
+    """
+
+    tickers = [
+        item["Ticker"]
+        for item in market_universe
+    ]
+
+    print(
+        f"\nVerifying previous-session performance "
+        f"for {len(tickers)} instruments..."
     )
 
     data = yf.download(
@@ -199,7 +355,7 @@ def get_previous_session_returns(tickers):
 
     close_prices = close_prices.dropna(
         how="all",
-        axis=1
+        axis=1,
     )
 
     if close_prices.empty:
@@ -239,43 +395,91 @@ def get_previous_session_returns(tickers):
     )
 
     # ------------------------------------------
-    # Sort all discovered tickers
+    # Build performance records
     # ------------------------------------------
 
-    performance = (
-        previous_session_returns
-        .dropna()
+    performance_records = []
+
+    for item in market_universe:
+
+        ticker = item["Ticker"]
+        asset_type = item["Asset_Type"]
+
+        if ticker not in previous_session_returns.index:
+            continue
+
+        value = previous_session_returns[ticker]
+
+        if pd.isna(value):
+            continue
+
+        performance_records.append({
+            "Ticker": ticker,
+            "Previous_Day_Return_Pct": float(value),
+            "Asset_Type": asset_type,
+        })
+
+    if not performance_records:
+        raise ValueError(
+            "No valid previous-session performance "
+            "was available."
+        )
+
+    performance = pd.DataFrame(
+        performance_records
+    )
+
+    # ------------------------------------------
+    # Keep the 40 + 5 + 5 structure
+    # ------------------------------------------
+
+    equities = (
+        performance[
+            performance["Asset_Type"] == "equity"
+        ]
         .sort_values(
-            ascending=False
+            "Previous_Day_Return_Pct",
+            ascending=False,
         )
+        .head(TOP_40_EQUITIES_COUNT)
     )
 
-    # ------------------------------------------
-    # Keep top 50
-    # ------------------------------------------
-
-    top_50 = performance.head(
-        TOP_50_COUNT
-    )
-
-    df_top_50 = (
-        top_50
-        .rename(
-            "Previous_Day_Return_Pct"
+    commodities = (
+        performance[
+            performance["Asset_Type"] == "commodity"
+        ]
+        .sort_values(
+            "Previous_Day_Return_Pct",
+            ascending=False,
         )
-        .reset_index()
+        .head(COMMODITIES_COUNT)
     )
 
-    df_top_50.columns = [
-        "Ticker",
-        "Previous_Day_Return_Pct"
-    ]
+    currencies = (
+        performance[
+            performance["Asset_Type"] == "currency"
+        ]
+        .sort_values(
+            "Previous_Day_Return_Pct",
+            ascending=False,
+        )
+        .head(CURRENCIES_COUNT)
+    )
+
+    df_top_50 = pd.concat(
+        [
+            equities,
+            commodities,
+            currencies,
+        ],
+        ignore_index=True,
+    )
 
     return df_top_50, target_date
 
 
 # ==========================================
-# STEP 3: CREATE THREE ARRAYS
+# STEP 4: CREATE THREE ARRAYS
 # ==========================================
 
 def build_ticker_arrays(df_top_50):
@@ -326,7 +530,7 @@ def build_ticker_arrays(df_top_50):
 
 
 # ==========================================
-# STEP 4: yfinance NEWS
+# STEP 5: yfinance NEWS
 # ==========================================
 
 def get_yfinance_news(
@@ -381,7 +585,7 @@ def get_yfinance_news(
 
 
 # ==========================================
-# STEP 5: GOOGLE NEWS
+# STEP 6: GOOGLE NEWS
 # ==========================================
 
 def get_google_news_headlines(
@@ -464,7 +668,7 @@ def get_google_news_headlines(
 
 
 # ==========================================
-# STEP 6: SCORE DISCOVERED NEWS
+# STEP 7: SCORE DISCOVERED NEWS
 # ==========================================
 
 def score_top_10_news(top_10_records):
@@ -705,7 +909,7 @@ def score_top_10_news(top_10_records):
 
 
 # ==========================================
-# STEP 7: FORMAT RETURN
+# STEP 8: FORMAT RETURN
 # ==========================================
 
 def format_return(value):
@@ -717,7 +921,7 @@ def format_return(value):
 
 
 # ==========================================
-# STEP 8: FETCH + SCORE TOP 10 NEWS
+# STEP 9: FETCH + SCORE TOP 10 NEWS
 # ==========================================
 
 def render_top_50_and_news(
@@ -733,7 +937,7 @@ def render_top_50_and_news(
     """
 
     print(
-        f"\n=== TOP 50 PERFORMING TICKERS FOR "
+        f"\n=== TOP 50 MARKET UNIVERSE FOR "
         f"PREVIOUS MARKET DAY "
         f"({target_date.upper()}) ==="
     )
@@ -750,13 +954,19 @@ def render_top_50_and_news(
     ):
 
         ticker = row.Ticker
+
         performance = (
             row.Previous_Day_Return_Pct
+        )
+
+        asset_type = (
+            row.Asset_Type
         )
 
         print(
             f"#{rank} | "
             f"{ticker} | "
+            f"{asset_type} | "
             f"Return: "
             f"{format_return(performance)}"
         )
@@ -784,9 +994,14 @@ def render_top_50_and_news(
             row.Previous_Day_Return_Pct
         )
 
+        asset_type = (
+            row.Asset_Type
+        )
+
         print(
             f"\n#{rank} | "
             f"{ticker} | "
+            f"{asset_type} | "
             f"Return: "
             f"{format_return(performance)}"
         )
@@ -861,6 +1076,7 @@ def render_top_50_and_news(
 
         top_10_records.append({
             "Ticker": ticker,
+            "Asset_Type": asset_type,
             "Previous_Day_Return_Pct": (
                 float(performance)
             ),
@@ -880,7 +1096,7 @@ def render_top_50_and_news(
 
 
 # ==========================================
-# STEP 9: PRINT WAITING LIST
+# STEP 10: PRINT WAITING LIST
 # ==========================================
 
 def render_waiting_list(
@@ -905,9 +1121,14 @@ def render_waiting_list(
             row.Previous_Day_Return_Pct
         )
 
+        asset_type = (
+            row.Asset_Type
+        )
+
         print(
             f"#{rank} | "
             f"{ticker} | "
+            f"{asset_type} | "
             f"Return: "
             f"{format_return(performance)}"
         )
@@ -920,31 +1141,48 @@ def render_waiting_list(
 def main():
 
     # ------------------------------------------
-    # 1. Dynamic discovery
+    # 1. Discover TOP 40 equity gainers
     # ------------------------------------------
 
-    discovered_tickers = (
+    equity_tickers = (
         get_tickers_from_gainers_feed()
     )
 
-    if not discovered_tickers:
+    if not equity_tickers:
 
         raise ValueError(
-            "No tickers discovered."
+            "No equity gainers discovered."
         )
 
     # ------------------------------------------
-    # 2. Previous-session performance
+    # 2. Add 5 commodities + 5 currencies
+    # ------------------------------------------
+
+    market_universe = (
+        build_market_universe(
+            equity_tickers
+        )
+    )
+
+    if len(market_universe) != TOP_50_COUNT:
+
+        raise ValueError(
+            f"Expected {TOP_50_COUNT} instruments, "
+            f"but built {len(market_universe)}."
+        )
+
+    # ------------------------------------------
+    # 3. Previous-session performance
     # ------------------------------------------
 
     df_top_50, target_date = (
         get_previous_session_returns(
-            discovered_tickers
+            market_universe
         )
     )
 
     # ------------------------------------------
-    # 3. Build THREE arrays
+    # 4. Build THREE arrays
     # ------------------------------------------
 
     (
@@ -956,31 +1194,31 @@ def main():
     )
 
     # ------------------------------------------
-    # 4. Array sizes
+    # 5. Array sizes
     # ------------------------------------------
 
     print(
         f"\nDiscovered performance universe: "
-        f"{len(df_top_50)} tickers"
+        f"{len(df_top_50)} instruments"
     )
 
     print(
         f"Top 50 array: "
-        f"{len(top_50_performing)} tickers"
+        f"{len(top_50_performing)} instruments"
     )
 
     print(
         f"Top 10 article array: "
-        f"{len(top_10_to_fetch_articles)} tickers"
+        f"{len(top_10_to_fetch_articles)} instruments"
     )
 
     print(
         f"Waiting list array: "
-        f"{len(waiting_list)} tickers"
+        f"{len(waiting_list)} instruments"
     )
 
     # ------------------------------------------
-    # 5. Print Top 50
+    # 6. Print Top 50
     #    Fetch Top 10 news
     #    SCORE Top 10 news
     # ------------------------------------------
@@ -994,7 +1232,7 @@ def main():
     )
 
     # ------------------------------------------
-    # 6. Print waiting list
+    # 7. Print waiting list
     # ------------------------------------------
 
     render_waiting_list(
@@ -1002,10 +1240,13 @@ def main():
     )
 
     # ------------------------------------------
-    # 7. Return THREE arrays
+    # 8. Return THREE arrays
     #
     # top_50_performing:
-    #     DataFrame with 50 tickers
+    #     DataFrame with:
+    #       40 equities
+    #       5 commodities
+    #       5 currencies
     #
     # scored_top_10:
     #     List containing exact discovered
@@ -1024,5 +1265,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
