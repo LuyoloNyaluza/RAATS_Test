@@ -64,12 +64,15 @@ from src.data.discovery import (
 )
 
 from src.risk.risk_manager import RiskManager
+from src.data.rgr_screen import screen_candidate
+from src.data.mt5_bridge import enrich_final_invest
 from src.simulation.orchestrator import compute_performance_metrics
-from src.utils.logger import log_session_summary
 from src.utils.logger import (
-    log_cycle,
+    log_daily_watchlist,
+    log_session_summary,
+)
+from src.utils.logger import (
     log_error,
-    log_sentiment_analysis,
 )
 
 
@@ -419,7 +422,24 @@ class DynamicTradingManager:
         waiting_list: Any,
         portfolio_value: float = 10_000,
         analyst_model: Optional[str] = None,
+        enable_rgr_gate: bool = True,
+        rgr_threshold: float = 0.0,
+        rgr_hold_days: int = 5,
+        enable_mt5: bool = False,
     ):
+
+        # ----------------------------------
+        # RGR gate / MT5 configuration
+        # ----------------------------------
+
+        self.enable_rgr_gate = enable_rgr_gate
+        self.rgr_threshold = rgr_threshold
+        self.rgr_hold_days = rgr_hold_days
+        self.enable_mt5 = enable_mt5
+
+        self.rgr_results = {}      # ticker -> diagnostics
+        self.rgr_rejected = []     # tickers refused entry to active list
+        self.mt5_data = {}         # ticker -> MT5 info for final INVEST
 
         # ----------------------------------
         # Original discovery arrays
@@ -1087,6 +1107,80 @@ class DynamicTradingManager:
         return replacements_needed
 
     # ======================================
+    # RGR GATE
+    # ======================================
+
+    def _passes_rgr_gate(self, ticker: str) -> bool:
+        """
+        One of the tests for joining the active list.
+
+        Fails OPEN on data errors (insufficient history, download failure):
+        a data outage must not empty the whole list, and the analyst and
+        stability checks still apply afterwards.
+        """
+
+        if not self.enable_rgr_gate:
+            return True
+
+        try:
+            diag = screen_candidate(
+                ticker,
+                as_of=self.simulate_date,
+                hold_days=self.rgr_hold_days,
+                threshold=self.rgr_threshold,
+            )
+        except Exception as exc:
+            print(f"  RGR gate: {ticker} data error ({exc}) - allowed.")
+            return True
+
+        self.rgr_results[ticker] = diag
+
+        if diag.get("passed") is None:
+            print(
+                f"  RGR gate: {ticker} skipped "
+                f"({diag.get('error')}) - allowed."
+            )
+            return True
+
+        verdict = "PASS" if diag["passed"] else "REJECT"
+        print(
+            f"  RGR gate: {ticker} {verdict} | "
+            f"RGR={diag['rgr']:+.5f} "
+            f"(RoR={diag['ror']:+.4f}, RPR={diag['rpr']:.4f}, "
+            f"{diag['direction']}, threshold={self.rgr_threshold})"
+        )
+
+        if not diag["passed"]:
+            self.rgr_rejected.append(ticker)
+
+        return bool(diag["passed"])
+
+    def _screen_initial_active_list(self) -> None:
+        """
+        Apply the RGR gate to the initial top-10. Failures are removed and
+        backfilled from the waiting list (replacements are gated too).
+        """
+
+        if not self.enable_rgr_gate:
+            return
+
+        print("\n" + "=" * 60)
+        print("RGR SCREEN: INITIAL ACTIVE LIST")
+        print("=" * 60)
+
+        failed = [
+            t for t in list(self.active_list)
+            if not self._passes_rgr_gate(t)
+        ]
+
+        for t in failed:
+            self.active_list.remove(t)
+
+        if failed:
+            print(f"\nRGR removed {len(failed)}: {failed}")
+            self._get_replacements(len(failed))
+
+    # ======================================
     # GET REPLACEMENTS
     # ======================================
 
@@ -1149,6 +1243,13 @@ class DynamicTradingManager:
             if ticker in (
                 self.closed_positions_today
             ):
+                continue
+
+            # ----------------------------------
+            # RGR gate (before paying for news)
+            # ----------------------------------
+
+            if not self._passes_rgr_gate(ticker):
                 continue
 
             # ----------------------------------
@@ -1283,6 +1384,9 @@ class DynamicTradingManager:
         )
 
         self.pre_market_scan()
+        self._log_watchlist_snapshot(include_open_trades=False)
+
+        self._screen_initial_active_list()
 
         replacement_round = 0
 
@@ -1467,6 +1571,13 @@ class DynamicTradingManager:
                 break
 
         # ==================================
+        # MT5 DATA FOR FINAL INVEST LIST
+        # ==================================
+
+        if self.enable_mt5 and self.final_invest:
+            self.mt5_data = enrich_final_invest(self.final_invest)
+
+        # ==================================
         # FINAL SUMMARY
         # ==================================
 
@@ -1515,6 +1626,38 @@ class DynamicTradingManager:
             )
 
         return categories
+
+    def _open_trades_snapshot(self):
+        """Open positions from the session's one shared RiskManager."""
+        trades = []
+        for ticker, p in getattr(self.risk_manager, "positions", {}).items():
+            trades.append({
+                "ticker": ticker,
+                "direction": "LONG" if getattr(p, "direction", 1) == 1 else "SHORT",
+                "entry_price": getattr(p, "entry_price", None),
+                "size": getattr(p, "size", None),
+                "stop_loss": getattr(p, "stop_loss", None),
+                "take_profit": getattr(p, "take_profit", None),
+            })
+        return trades
+
+    def _log_watchlist_snapshot(self, include_open_trades: bool = False) -> None:
+        """Write the day's candidate arrays to the weekly JSONL log.
+
+        Called at start of day (arrays only) and end of day (arrays plus open
+        trades). random_list stays empty: discovery.py has no random-exploration
+        step, so there is nothing real to record there yet.
+        """
+        try:
+            log_daily_watchlist(
+                date=datetime.now().strftime("%Y-%m-%d"),
+                top50=list(self.ticker_universe),
+                random_list=[],
+                top10_active=list(self._initial_active),
+                open_trades=self._open_trades_snapshot() if include_open_trades else [],
+            )
+        except Exception as exc:  # logging must never break trading
+            print(f"  WARNING: daily watchlist log failed: {exc}")
 
     def _print_session_summary(
         self,
@@ -1583,6 +1726,27 @@ class DynamicTradingManager:
         print(
             self.replacement_history
         )
+
+        print(
+            f"\nRGR gate rejections "
+            f"({len(self.rgr_rejected)}):"
+        )
+
+        print(
+            self.rgr_rejected
+        )
+
+        if self.mt5_data:
+
+            print("\nMT5 DATA (final INVEST):")
+
+            for t, d in self.mt5_data.items():
+                print(
+                    f"  {t:<10} -> {str(d.get('mt5_symbol')):<10} "
+                    f"tradable={d.get('tradable')} "
+                    f"bid={d.get('bid')} ask={d.get('ask')} "
+                    f"spread_pts={d.get('spread_points')}"
+                )
 
         print(
             f"\nClosed positions today "
@@ -1825,6 +1989,7 @@ class DynamicTradingManager:
             ],
             metrics=metrics,
         )
+        self._log_watchlist_snapshot(include_open_trades=True)
 
     # ======================================
     # WAITLIST OPPORTUNITIES
@@ -1884,6 +2049,9 @@ def run_dynamic_trading_session(
     simulate_date: Optional[str] = None,
     portfolio_value: float = 10_000,
     analyst_model: Optional[str] = None,
+    enable_rgr_gate: bool = True,
+    rgr_threshold: float = 0.0,
+    enable_mt5: bool = False,
 ) -> Dict[str, Any]:
     """
     Run the dynamic trading session using
@@ -1900,6 +2068,9 @@ def run_dynamic_trading_session(
         waiting_list=waiting_list,
         portfolio_value=portfolio_value,
         analyst_model=analyst_model,
+        enable_rgr_gate=enable_rgr_gate,
+        rgr_threshold=rgr_threshold,
+        enable_mt5=enable_mt5,
     )
 
     results = (
@@ -1949,6 +2120,15 @@ def run_dynamic_trading_session(
             len(
                 manager.risk_manager.positions
             ),
+
+        "rgr_results":
+            manager.rgr_results,
+
+        "rgr_rejected":
+            manager.rgr_rejected,
+
+        "mt5_data":
+            manager.mt5_data,
 
         "performance_scores":
             manager.all_sentiment_scores,

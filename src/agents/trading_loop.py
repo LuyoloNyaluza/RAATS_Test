@@ -19,6 +19,7 @@ while Unstable-and-flat tickers still correctly defer to observation
 with no new entry considered.
 """
 
+import os
 import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,6 +38,7 @@ from src.risk.risk_manager import RiskManager
 from src.risk.stability_filter import MarketStabilityFilter
 from src.utils.timer import node_timer
 from src.utils.logger import log_cycle, log_sentiment_analysis, log_error
+from src.data.score_sentiment import summarize_ticker_sentiment
 from src.data.news_relevance import (
     filter_relevant_articles,
 )
@@ -79,6 +81,33 @@ class AgentState(TypedDict, total=False):
 _STABILITY_FILTER = MarketStabilityFilter()
 
 
+def _article_key(article: Mapping[str, Any]) -> tuple:
+    """Identity for an article that survives copying (title + url)."""
+    return (
+        str(article.get("title", "")).strip().lower(),
+        str(article.get("link") or article.get("url") or "").strip(),
+    )
+
+
+def _compact_articles(articles: Optional[List[Any]]) -> List[Dict[str, Any]]:
+    """Only the audit fields - not full article bodies - go into the JSONL log."""
+    keep = ("title", "url", "link", "discovery_source", "sentiment", "confidence", "reasoning")
+    return [{k: a[k] for k in keep if k in a} for a in (articles or []) if isinstance(a, Mapping)]
+
+
+def _compact_cycle_result(state: Mapping[str, Any]) -> Dict[str, Any]:
+    """Small, JSON-safe view of the cycle. The full state holds the RiskManager
+    object, 30 closes and every article body; logging that duplicated all of it
+    into every sentiment_analysis line."""
+    keep = (
+        "ticker", "stability_status", "llm_signal", "signal", "confidence",
+        "executed", "executed_price", "direction", "position_size", "stop_loss",
+        "take_profit", "risk_reason", "latencies", "analyst_model", "simulate_date",
+        "news_articles_retrieved", "news_articles_relevant", "closed_trade",
+    )
+    return {k: state.get(k) for k in keep if k in state}
+
+
 @node_timer("collector")
 def collector_node(state: AgentState) -> AgentState:
     ticker = state.get("ticker")
@@ -91,13 +120,10 @@ def collector_node(state: AgentState) -> AgentState:
         as_of=as_of,
     )
 
-    discovery_news = state.get(
-        "discovery_news",
-        {
-            "yfinance_news": [],
-            "google_news": [],
-        },
-    )
+    discovery_news = state.get("discovery_news") or {
+        "yfinance_news": [],
+        "google_news": [],
+    }
 
     # Validate news relevance.
     company_name = discovery_news.get("company_name")
@@ -105,34 +131,59 @@ def collector_node(state: AgentState) -> AgentState:
     for source in ("yfinance_news", "google_news"):
         all_articles.extend(discovery_news.get(source, []))
 
-    relevant_articles, relevance_results = filter_relevant_articles(
-        articles=all_articles,
-        ticker=ticker,
-        company_name=company_name,
-    )
+    try:
+        relevant_articles, relevance_results = filter_relevant_articles(
+            articles=all_articles,
+            ticker=ticker,
+            company_name=company_name,
+        )
+    except Exception as exc:
+        # Relevance filtering is an enhancement: if it fails, fall back to all
+        # articles rather than killing the cycle, and leave a durable record.
+        print(f"  WARNING: relevance filter failed for {ticker}: {exc}")
+        try:
+            log_error(
+                ticker=ticker,
+                date=str(as_of or datetime.now().date()),
+                error=str(exc),
+                stage="relevance_filter",
+            )
+        except Exception:
+            pass
+        relevant_articles, relevance_results = list(all_articles), []
 
-    # Rebuild news using only relevant news.
-    filtered_news = {
-        "yfinance_news": [],
-        "google_news": [],
-        "sentiment_summary": {},
-    }
-    relevant_ids = {id(article) for article in relevant_articles}
+    # Rebuild news using only relevant articles. Matching is by object identity
+    # OR by (title, url): matching by id() alone silently returned ZERO articles
+    # for every ticker whenever the filter returned copies instead of the
+    # original dict objects.
+    relevant_ids = {id(a) for a in relevant_articles}
+    relevant_keys = {_article_key(a) for a in relevant_articles}
+    filtered_news = {"yfinance_news": [], "google_news": [], "sentiment_summary": {}}
     for source in ("yfinance_news", "google_news"):
         filtered_news[source] = [
-            article
-            for article in discovery_news.get(source, [])
-            if id(article) in relevant_ids
+            a for a in discovery_news.get(source, [])
+            if id(a) in relevant_ids or _article_key(a) in relevant_keys
         ]
 
-    filtered_news["sentiment_summary"] = discovery_news.get(
-        "sentiment_summary", {}
-    )
+    # Last-resort safety net: the filter kept articles but none matched.
+    if relevant_articles and not (filtered_news["yfinance_news"] or filtered_news["google_news"]):
+        for a in relevant_articles:
+            tag = "yfinance_news" if a.get("discovery_source") == "yfinance" else "google_news"
+            filtered_news[tag].append(a)
+
+    filtered_scored = filtered_news["yfinance_news"] + filtered_news["google_news"]
+
+    # The summary must describe the articles sentiment actually uses. It used to be
+    # carried over from BEFORE filtering, so irrelevant articles still counted.
+    if any(a.get("sentiment") for a in filtered_scored):
+        filtered_news["sentiment_summary"] = summarize_ticker_sentiment(filtered_scored)
+    else:
+        filtered_news["sentiment_summary"] = discovery_news.get("sentiment_summary", {})
 
     # Keep diagnostics in state.
     state["news_relevance"] = relevance_results
     state["news_articles_retrieved"] = len(all_articles)
-    state["news_articles_relevant"] = len(relevant_articles)
+    state["news_articles_relevant"] = len(filtered_scored)
 
     # Sentiment receives filtered news only.
     state["sentiment"] = collect_sentiment(
@@ -141,25 +192,10 @@ def collector_node(state: AgentState) -> AgentState:
         discovery_news=filtered_news,
     )
 
-    state["scored_news"] = []
-
-    for source in (
-        "yfinance_news",
-        "google_news",
-    ):
-        state["scored_news"].extend(
-            discovery_news.get(
-                source,
-                [],
-            )
-        )
-
-    state["sentiment_summary"] = (
-        state.get(
-            "sentiment_summary",
-            {},
-        )
-    )
+    # Audit trail = exactly what sentiment used. sentiment_summary was previously
+    # a no-op self-assignment, so it was always {} and logged counts were always 0.
+    state["scored_news"] = filtered_scored
+    state["sentiment_summary"] = filtered_news["sentiment_summary"]
 
     return state
 
@@ -290,10 +326,7 @@ def build_daily_cycle_terminal_output(
         "",
     )
 
-    latencies = result.get(
-        "latencies_ms",
-        {},
-    )
+    latencies = result.get("latencies") or result.get("latencies_ms") or {}
 
     return (
         "=== Daily Cycle Result ===\n"
@@ -349,51 +382,44 @@ def run_daily_cycle(
          "treat_as_closed": treat_as_closed
 },
     }
+    # treat_as_closed was previously only inside the fallback discovery_news dict:
+    # dropped whenever real news was passed, and never a top-level state key.
+    initial_state["treat_as_closed"] = treat_as_closed
+    _dn = dict(initial_state.get("discovery_news") or {})
+    _dn.setdefault("treat_as_closed", treat_as_closed)
+    initial_state["discovery_news"] = _dn
     final_state = app.invoke(initial_state)
     terminal_output = build_daily_cycle_terminal_output(final_state)
-    print(terminal_output)
-    signal = str(final_state.get("llm_signal") or final_state.get("signal") or "")
-    log_cycle(
-        ticker=ticker,
-        signal=signal,
-        executed_price=final_state.get("executed_price"),
-        latencies=final_state.get("latencies", {}),
-        pnl=final_state.get("closed_trade", {}).get("pnl", 0.0),
-    )
-    log_sentiment_analysis(
-    ticker=ticker,
-    sentiment=final_state.get("sentiment", 0.0),
-    sentiment_score=final_state.get("sentiment", 0.0),
-    positive=final_state.get("sentiment_summary", {}).get("positive", 0),
-    negative=final_state.get("sentiment_summary", {}).get("negative", 0),
-    neutral=final_state.get("sentiment_summary", {}).get("neutral", 0),
-    articles=final_state.get("scored_news", []),
-    daily_cycle_result=final_state,
-    terminal_output=terminal_output,
-    model=analyst_model,
-)
-
     if verbose:
-        print("=== Daily Cycle Result ===")
-        print(f"Ticker:      {final_state.get('ticker')}"
-              + (f"  (as of {simulate_date})" if simulate_date else ""))
-        print(f"Stability:   {final_state.get('stability_status')}")
-        if final_state.get("stability_status") != "Stable":
-            print(f"Deferred:    {final_state.get('risk_reason')}")
-            # NOTE: no longer an early return here - if a position was
-            # actually open and monitored via the executor-direct route,
-            # its result (closed_trade, updated stop, etc.) still needs
-            # to print below rather than being cut off at this point.
-        if final_state.get("analyst_model") is not None:
-            print(f"LLM signal:  {final_state.get('llm_signal')} "
-                  f"(confidence: {final_state.get('confidence')}, model: {final_state.get('analyst_model')})")
-        print(f"Executed:    {final_state.get('executed')}  "
-              f"@ {final_state.get('executed_price')}")
-        if final_state.get("executed") and final_state.get("stop_loss") is not None:
-            print(f"Direction:   {final_state.get('direction')}  size={final_state.get('position_size'):.4f}")
-            print(f"SL / TP:     {final_state.get('stop_loss'):.2f} / {final_state.get('take_profit'):.2f}")
-        print(f"Risk note:   {final_state.get('risk_reason')}")
-        print(f"Latencies:   {final_state.get('latencies')}")
+        print(terminal_output)
+    signal = str(final_state.get("llm_signal") or final_state.get("signal") or "")
+    try:
+        log_cycle(
+            ticker=ticker,
+            signal=signal,
+            executed_price=final_state.get("executed_price"),
+            latencies=final_state.get("latencies", {}),
+            pnl=final_state.get("closed_trade", {}).get("pnl", 0.0),
+        )
+    except Exception as exc:  # logging must never break the trading cycle
+        print(f"  WARNING: cycle log failed for {ticker}: {exc}")
+    try:
+        _summary = final_state.get("sentiment_summary") or {}
+        log_sentiment_analysis(
+            ticker=ticker,
+            sentiment=_summary.get("overall"),
+            sentiment_score=_summary.get("score"),
+            positive=_summary.get("positive", 0),
+            negative=_summary.get("negative", 0),
+            neutral=_summary.get("neutral", 0),
+            articles=_compact_articles(final_state.get("scored_news")),
+            daily_cycle_result=_compact_cycle_result(final_state),
+            terminal_output=terminal_output,
+            model=os.environ.get("RAATS_SENTIMENT_MODEL"),
+        )
+    except Exception as exc:  # logging must never break the trading cycle
+        print(f"  WARNING: sentiment log failed for {ticker}: {exc}")
+
     return final_state
 
 def run_watchlist(

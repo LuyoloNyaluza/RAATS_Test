@@ -28,10 +28,15 @@ Typical usage (in a script or strategy):
 from typing import Optional, List, Dict, Any
 import pandas as pd
 
+# MetaTrader5 ships no type stubs, so Pylance cannot see its functions.
+# Declaring the name as Any silences those false warnings; it is None when
+# the package is not installed (checked in _ensure_mt5_available()).
+mt5: Any
 try:
-    import MetaTrader5 as mt5
+    import MetaTrader5 as _mt5_module
+    mt5 = _mt5_module
 except ImportError:
-    mt5 = None  # type: ignore
+    mt5 = None
     # The functions below will raise an error if called without the package.
 
 

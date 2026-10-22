@@ -1,4 +1,5 @@
 # yaml-language-server: $schema=https://json.schemastore.org/prometheus.json
+
 global:
   scrape_interval: 15s
 
@@ -10,4 +11,4 @@ scrape_configs:
 
   - job_name: "node-exporter"
     static_configs:
-      - targets: ["172.30.103.42:9100"]
+      - targets: ["node-exporter:9100"]
