@@ -1,0 +1,21 @@
+{
+  "request_id": "5e2de040",
+  "timestamp": "2026-10-23T23:06:46.780832",
+  "final_invest": [
+    "AAPL"
+  ],
+  "mt5_data": {
+    "AAPL": {
+      "mt5_symbol": "AAPL.US"
+    }
+  },
+  "account_balance": 10000,
+  "options": [
+    "APPROVE",
+    "REJECT",
+    "MODIFY"
+  ],
+  "status": "PENDING",
+  "user_response": null,
+  "response_time": null
+}

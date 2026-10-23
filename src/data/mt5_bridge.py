@@ -22,6 +22,8 @@ instead of raising, so the trading loop keeps working.
 
 import json
 import os
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.data.mt5_fetch import get_latest_tick, get_symbol_info
@@ -105,6 +107,85 @@ def shutdown_mt5() -> None:
         mt5.shutdown()
 
 
+def get_account_balance() -> Optional[float]:
+    """
+    Fetch current MT5 account balance.
+    Returns None if MT5 unavailable.
+    """
+    if not initialize_mt5():
+        return None
+    
+    try:
+        account_info = mt5.account_info()
+        if account_info is None:
+            print(f"MT5: account_info() failed: {mt5.last_error()}")
+            return None
+        
+        balance = account_info.balance
+        print(f"MT5 Account Balance: ${balance:.2f}")
+        return float(balance)
+    except Exception as e:
+        print(f"MT5 balance fetch error: {e}")
+        return None
+    finally:
+        shutdown_mt5()
+
+
+def check_balance_and_notify(min_balance: float = 20.0) -> bool:
+    """
+    Check MT5 balance and send alert if below threshold.
+    Returns True if balance >= min_balance, False otherwise.
+    """
+    balance = get_account_balance()
+    
+    if balance is None:
+        print("Could not fetch MT5 balance")
+        return False
+    
+    if balance < min_balance:
+        shortfall = min_balance - balance
+        msg = f"⚠️ RAATS: insufficient funds ${balance:.2f}, please deposit ${shortfall:.2f}. a minimum of ${min_balance:.2f} is needed"
+        
+        # Send WhatsApp if configured
+        webhook = os.environ.get("WHATSAPP_WEBHOOK_URL")
+        if webhook:
+            try:
+                import requests
+                requests.post(webhook, json={"text": msg}, timeout=5)
+            except:
+                pass
+        
+        # Write to weekly JSONL log
+        log_path = _get_insufficient_funds_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(json.dumps({
+                "timestamp": datetime.now().isoformat(),
+                "balance": balance,
+                "min_required": min_balance,
+                "shortfall": shortfall,
+                "action": "trades_blocked",
+            }) + "\n")
+        
+        print(msg)
+        return False
+    
+    return True
+
+
+def _get_insufficient_funds_log_path() -> Path:
+    """Generate weekly log path for insufficient funds: insufficient_funds_YYYY-MM-DD_to_YYYY-MM-DD.jsonl"""
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    # Start of week (Monday)
+    week_start = now - timedelta(days=now.weekday())
+    week_end = week_start + timedelta(days=6)
+    start_str = week_start.strftime("%Y-%m-%d")
+    end_str = week_end.strftime("%Y-%m-%d")
+    # Use same directory as approvals: data/approvals/
+    return Path("./data/approvals") / f"insufficient_funds_{start_str}_to_{end_str}.jsonl"
+
+
 # ------------------------------------------------------------------
 # SYMBOL RESOLUTION
 # ------------------------------------------------------------------
@@ -136,7 +217,7 @@ def enrich_final_invest(final_invest: List[str]) -> Dict[str, Dict[str, Any]]:
         {
           "mt5_symbol": "XAUUSD" | None,
           "tradable":   bool,         # broker offers it AND trading enabled
-          "bid", "ask", "spread_points", "tick_time",
+          "bid", "ask", "spread_points", "spread_pct", "tick_time",
           "contract_size", "volume_min", "volume_step", "digits"
         }
 
@@ -169,6 +250,10 @@ def enrich_final_invest(final_invest: List[str]) -> Dict[str, Dict[str, Any]]:
                 "ask": ask,
                 "spread_points": (
                     round((ask - bid) / point) if (bid and ask and point) else None
+                ),
+                "spread_pct": (
+                    round((ask - bid) / ((ask + bid) / 2) * 100, 4)
+                    if (bid and ask) else None
                 ),
                 "tick_time": tick.get("time"),
                 "contract_size": info.get("trade_contract_size"),

@@ -65,7 +65,10 @@ from src.data.discovery import (
 
 from src.risk.risk_manager import RiskManager
 from src.data.rgr_screen import screen_candidate
-from src.data.mt5_bridge import enrich_final_invest
+from src.data.mt5_bridge import enrich_final_invest, get_account_balance, check_balance_and_notify
+from src.data.macro_events import is_trade_blocked_by_macro, MacroEventChecker
+from src.notifications.whatsapp import WhatsAppNotifier
+from src.agents.middleware.summarization_middleware import SummarizationMiddleware
 from src.simulation.orchestrator import compute_performance_metrics
 from src.utils.logger import (
     log_daily_watchlist,
@@ -74,6 +77,9 @@ from src.utils.logger import (
 from src.utils.logger import (
     log_error,
 )
+
+import json
+from pathlib import Path
 
 
 # ==========================================
@@ -1340,23 +1346,11 @@ class DynamicTradingManager:
         simulate_date: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Run the dynamic trading session.
-
-        Round 1:
-
-            Analyse initial Top-10.
-
-        Subsequent rounds:
-
-            HOLD/unresolved candidates are removed.
-
-            Waiting-list replacements receive fresh
-            news discovery and sentiment scoring.
-
-            Only the replacements are analysed.
-
-        Final INVEST candidates are never
-        analysed again.
+        Run the dynamic trading session with:
+        - Macro event blocking (FOMC, CPI, NFP windows)
+        - WhatsApp approval for final INVEST list
+        - MT5 balance check (blocks if < $20)
+        - End-of-day summarization middleware
         """
 
         self.simulate_date = (
@@ -1382,6 +1376,29 @@ class DynamicTradingManager:
         print(
             "=" * 60
         )
+
+        # ==================================
+        # 1. MACRO EVENT CHECK - Block if high-impact event window
+        # ==================================
+        
+        check_time = None
+        if simulate_date:
+            import pandas as pd
+            check_time = pd.Timestamp(simulate_date)
+        
+        blocking_event = MacroEventChecker().is_event_window_active(
+            check_time=check_time,
+            min_impact="MEDIUM",
+        )
+        if blocking_event:
+            msg = f"🚫 TRADING BLOCKED: {blocking_event.name} ({blocking_event.event_type}) window active"
+            print(msg)
+            self._send_alert(msg)
+            return self.daily_results
+
+        # ==================================
+        # 2. PRE-MARKET SCAN & RGR SCREEN
+        # ==================================
 
         self.pre_market_scan()
         self._log_watchlist_snapshot(include_open_trades=False)
@@ -1571,19 +1588,108 @@ class DynamicTradingManager:
                 break
 
         # ==================================
-        # MT5 DATA FOR FINAL INVEST LIST
+        # 3. WHATSAPP APPROVAL INTERRUPT (if enabled)
+        # ==================================
+        
+        require_approval = os.environ.get("RAATS_REQUIRE_APPROVAL", "").lower() in ("1", "true", "yes")
+        
+        if self.final_invest and require_approval:
+            
+            # Get MT5 balance first
+            balance = get_account_balance()
+            
+            # Send WhatsApp approval request
+            notifier = WhatsAppNotifier()
+            approval = notifier.send_approval_request(
+                final_invest=self.final_invest,
+                mt5_data={},  # Will enrich after approval
+                account_balance=balance,
+            )
+            
+            # Wait for human response
+            print(f"\n⏳ Waiting for WhatsApp approval (Request: {approval.request_id})")
+            print(f"   Check your WhatsApp for the approval message")
+            
+            response = self._wait_for_approval_file(approval.request_id)
+            
+            if response != "APPROVE":
+                print(f"❌ Trade rejected by user: {response}")
+                return self.daily_results
+            
+            # Re-check balance after approval
+            if balance is not None and balance < 20:
+                shortfall = 20.0 - balance
+                msg = f"insufficient funds ${balance:.2f}, please deposit ${shortfall:.2f}. a minimum of $20.00 is needed"
+                notifier.send_alert(msg)
+                self._write_insufficient_balance_jsonl(balance)
+                return self.daily_results
+
+        # ==================================
+        # 4. MT5 DATA FOR FINAL INVEST LIST
         # ==================================
 
         if self.enable_mt5 and self.final_invest:
             self.mt5_data = enrich_final_invest(self.final_invest)
 
         # ==================================
-        # FINAL SUMMARY
+        # 5. FINAL SUMMARY + SUMMARIZATION MIDDLEWARE
         # ==================================
 
         self._print_session_summary()
 
+        # Run summarization middleware
+        enable_whatsapp_summary = os.environ.get("RAATS_WHATSAPP_SUMMARY", "").lower() in ("1", "true")
+        middleware = SummarizationMiddleware(
+            enable_whatsapp=enable_whatsapp_summary,
+        )
+        session_results = {
+            "manager": self,
+            "results": self.daily_results,
+        }
+        middleware.process_session_end(session_results)
+
         return self.daily_results
+
+    def _wait_for_approval_file(self, request_id: str, timeout: int = 600) -> str:
+        """Wait for approval response file (polling)."""
+        path = Path("~/.hermes/trading/approvals").expanduser() / f"{request_id}.json"
+        start = time.time()
+        
+        import time
+        while time.time() - start < timeout:
+            if path.exists():
+                with open(path) as f:
+                    data = json.load(f)
+                if data.get("status") != "PENDING":
+                    return data.get("user_response", "TIMEOUT")
+            time.sleep(5)
+        
+        return "TIMEOUT"
+
+    def _write_insufficient_balance_jsonl(self, balance: float) -> None:
+        """Write insufficient balance to JSONL log."""
+        shortfall = 20.0 - balance
+        log_path = Path("~/.hermes/trading/insufficient_balance.jsonl").expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(json.dumps({
+                "timestamp": datetime.now().isoformat(),
+                "balance": balance,
+                "min_required": 20.0,
+                "shortfall": shortfall,
+                "action": "trades_blocked",
+                "final_invest": self.final_invest,
+            }) + "\n")
+
+    def _send_alert(self, message: str) -> None:
+        """Send alert via WhatsApp if configured."""
+        webhook = os.environ.get("WHATSAPP_WEBHOOK_URL")
+        if webhook:
+            try:
+                import requests
+                requests.post(webhook, json={"text": message}, timeout=5)
+            except:
+                pass
 
     # ======================================
     # SESSION SUMMARY

@@ -1,185 +1,268 @@
 """
 src/data/rgr_screen.py
 
-Pre-trade RGR screen for candidates BEFORE they join the active list.
+RGR screen: decides whether a ticker may JOIN the active list.
 
-RGRCalculator is built for an OPEN position (it needs an entry price and a
-direction).  A candidate has neither, so we build a hypothetical position:
+Called by DynamicTradingManager._passes_rgr_gate() for the initial top-10 and
+for every waiting-list promotion, before any news is fetched or scored.
 
-    entry price : close `hold_days` trading days ago
-    direction   : +1 if close > SMA(10) else -1   (trend direction)
+Why this is not RGRCalculator
+-----------------------------
+RGRCalculator measures an OPEN position (RoR since entry). At screening time
+there is no entry, so RoR from entry is always 0. This module applies the same
+formula to a TRAILING window instead:
 
-RGR = (RoR - RPR) * (1 + volatility scaling) is then computed with the real
-calculator.  RGR > threshold  ->  the recent move has beaten the hurdle in
-the direction of the trend  ->  candidate passes.
+    direction = sign of the price gradient (same functions and deadband the
+                RiskManager uses, so the screen and the executor agree)
+    RoR       = direction * (close_now / close_N_days_ago - 1)
+    RPR       = benchmark return over the SAME N days
+                + risk_tolerance * ATR%                (ATR / close, unitless)
+    vol_ratio = ATR_now / mean(last `vol_lookback` ATR values)
+    RGR       = (RoR - RPR) * (1 + k_factor / vol_ratio)
 
-Two unit fixes are applied on the way in (RGRCalculator is not modified):
+    PASS  if direction != 0 and RGR > threshold
 
-  * ATR is passed as a FRACTION OF PRICE (ATR / close).  RGRCalculator adds
-    ATR * risk_tolerance to a *return*, so a raw ATR in price units would make
-    a $300 stock's hurdle enormous and EURUSD's hurdle ~zero.
-  * A fresh calculator is built for every ticker, because RGRCalculator keeps
-    its benchmark closes in an attribute that is never cleared between
-    positions.
+Fixes relative to rgr_calculator.py: ATR is converted to a fraction of price
+(the old penalty scaled with share price); the benchmark return covers the
+same horizon as RoR; benchmark data is actually used; no state leaks between
+tickers.
+
+Failure policy: data problems return {"passed": None, "error": ...}. The
+caller treats that as "allowed" (fail open). A ticker is only REJECTED when
+the numbers were computed and failed.
+
+Look-ahead: every series is cut at `as_of` before use.
 """
 
-from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+import logging
+import os
+from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import pandas as pd
 
-from src.strategist.rgr_calculator import RGRCalculator
+from src.risk.risk_manager import (
+    compute_gradient,
+    direction_from_gradient,
+    normalize_gradient,
+)
 
-try:
-    import yfinance as yf
-except ImportError:  # pragma: no cover
-    yf = None
+logger = logging.getLogger("raats.data.rgr_screen")
+
+INDICATOR_DIR = os.path.join("data", "processed", "indicators")
+
+# Raw history per symbol, kept for the session so SPY is downloaded once.
+_HISTORY_CACHE: Dict[str, pd.DataFrame] = {}
 
 
-ATR_PERIOD = 14
-SMA_PERIOD = 10
-WARMUP_BARS = 20          # bars replayed into the calculator (needs >= 10)
+class _DataUnavailable(Exception):
+    pass
 
 
-# ------------------------------------------------------------------
-# DATA
-# ------------------------------------------------------------------
+def clear_cache() -> None:
+    """Drop cached history (tests, or a long-running process across days)."""
+    _HISTORY_CACHE.clear()
 
-def _flatten(df: pd.DataFrame) -> pd.DataFrame:
-    """yfinance returns MultiIndex columns for single tickers in new versions."""
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df.copy()
-        df.columns = df.columns.get_level_values(0)
+
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
+    """Sorted, de-duplicated, timezone-naive DatetimeIndex."""
+    df = df.copy()
+    idx = pd.DatetimeIndex(pd.to_datetime(df.index))
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    df.index = idx
+    df = df[~df.index.duplicated(keep="last")].sort_index()
     return df
 
 
-def download_history(
-    ticker: str,
-    as_of: Optional[str] = None,
-    calendar_days: int = 200,
-) -> pd.DataFrame:
-    """Daily OHLC for `ticker`, ending on `as_of` (inclusive) or today."""
-    if yf is None:
-        raise ImportError("yfinance is required for RGR screening.")
+def _load_history(symbol: str, as_of: Optional[str]) -> pd.DataFrame:
+    """
+    OHLC history for `symbol`, cut at `as_of`.
 
-    end = (
-        pd.Timestamp(as_of) + timedelta(days=1)
-        if as_of
-        else pd.Timestamp(datetime.now()) + timedelta(days=1)
-    )
-    start = end - timedelta(days=calendar_days)
+    Prefers the same cached indicator CSV the collector reads, so the screen
+    and the agent see identical data. Falls back to a yfinance download
+    (truncated at as_of, so it cannot leak the future).
+    """
+    raw = _HISTORY_CACHE.get(symbol)
 
-    df = yf.download(
-        ticker,
-        start=start.strftime("%Y-%m-%d"),
-        end=end.strftime("%Y-%m-%d"),
-        interval="1d",
-        progress=False,
-        auto_adjust=False,
-    )
-    if df is None or df.empty:
-        raise ValueError(f"No price history for {ticker}.")
-    return _flatten(df).dropna(subset=["Close"])
+    if raw is None:
+        path = os.path.join(INDICATOR_DIR, f"{symbol}_indicators.csv")
+        if os.path.exists(path):
+            raw = pd.read_csv(path, index_col=0, parse_dates=True)
+        else:
+            try:
+                import yfinance as yf
+            except ImportError as exc:
+                raise _DataUnavailable("yfinance not installed") from exc
+
+            raw = yf.download(
+                symbol, period="1y", progress=False, auto_adjust=False
+            )
+            if raw is None or raw.empty:
+                raise _DataUnavailable(f"no data returned for {symbol}")
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+
+        missing = {"High", "Low", "Close"} - set(raw.columns)
+        if missing:
+            raise _DataUnavailable(
+                f"{symbol} history lacks column(s) {sorted(missing)}"
+            )
+        raw = _clean(raw)
+        _HISTORY_CACHE[symbol] = raw
+
+    df = raw
+    if as_of is not None:
+        df = df[df.index <= pd.Timestamp(as_of)]
+    if df.empty:
+        raise _DataUnavailable(f"no {symbol} data on or before {as_of}")
+    return df
 
 
-# ------------------------------------------------------------------
-# CORE (pure function - easy to test with synthetic data)
-# ------------------------------------------------------------------
-
-def _atr_fraction(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
-    prev_close = df["Close"].shift(1)
+def _wilder_atr(df: pd.DataFrame, length: int) -> pd.Series:
+    """Wilder-smoothed ATR (same smoothing family as pandas_ta ATRr_14)."""
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    prev_close = df["Close"].astype(float).shift(1)
     tr = pd.concat(
-        [
-            df["High"] - df["Low"],
-            (df["High"] - prev_close).abs(),
-            (df["Low"] - prev_close).abs(),
-        ],
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
         axis=1,
-    ).max(axis=1)
-    return (tr.rolling(period).mean() / df["Close"]).dropna()
+    ).max(axis=1, skipna=False)
+    return tr.iloc[1:].ewm(alpha=1.0 / length, adjust=False).mean()
 
 
-def evaluate_rgr(
-    df: pd.DataFrame,
-    benchmark: pd.DataFrame,
-    hold_days: int = 5,
-    threshold: float = 0.0,
-    k_factor: float = 1.0,
-    risk_tolerance: float = 0.02,
-) -> Dict[str, Any]:
-    """Compute RGR for a hypothetical position on `df`. Never raises on
-    thin data - returns passed=None with an 'error' instead."""
+def _skip(ticker: str, error: str) -> Dict[str, Any]:
+    logger.info("RGR screen skipped for %s: %s", ticker, error)
+    return {"passed": None, "error": error, "ticker": ticker}
 
-    atr = _atr_fraction(df)
-    need = max(hold_days + 1, SMA_PERIOD, WARMUP_BARS)
-    if len(df) < ATR_PERIOD + need or len(atr) < WARMUP_BARS:
-        return {"passed": None, "rgr": None, "error": "insufficient history"}
-
-    close = df["Close"].astype(float)
-    bench_close = (
-        benchmark["Close"].astype(float)
-        .reindex(close.index)
-        .ffill()
-        .bfill()
-    )
-    if bench_close.isna().any():
-        return {"passed": None, "rgr": None, "error": "benchmark unavailable"}
-
-    last = float(close.iloc[-1])
-    entry = float(close.iloc[-(hold_days + 1)])
-    sma = float(close.tail(SMA_PERIOD).mean())
-    direction = 1 if last > sma else -1
-
-    calc = RGRCalculator(k_factor=k_factor, risk_tolerance=risk_tolerance)
-    calc.initialize_position(
-        entry_price=entry,
-        direction=direction,
-        benchmark_data=pd.DataFrame({"Close": bench_close}),
-    )
-
-    # Warm up ATR history + benchmark closes the way a live loop would.
-    for ts in atr.index[-WARMUP_BARS:]:
-        calc.update_market_data(
-            current_price=float(close.loc[ts]),
-            current_atr=float(atr.loc[ts]),
-            benchmark_close=float(bench_close.loc[ts]),
-        )
-
-    rgr, diag = calc.calculate_rgr(
-        current_price=last,
-        current_atr=float(atr.iloc[-1]),
-        benchmark_close=float(bench_close.iloc[-1]),
-    )
-
-    diag.update(
-        {
-            "rgr": rgr,
-            "passed": bool(rgr > threshold),
-            "threshold": threshold,
-            "direction": "LONG" if direction == 1 else "SHORT",
-            "entry_price": entry,
-            "last_price": last,
-            "hold_days": hold_days,
-        }
-    )
-    return diag
-
-
-# ------------------------------------------------------------------
-# PUBLIC ENTRY POINT
-# ------------------------------------------------------------------
 
 def screen_candidate(
     ticker: str,
     as_of: Optional[str] = None,
-    benchmark_ticker: str = "SPY",
-    **kwargs: Any,
+    hold_days: int = 10,
+    threshold: float = 0.0,
+    benchmark: str = "SPY",
+    gradient_lookback: int = 10,
+    gradient_deadband: float = 0.3,
+    atr_length: int = 14,
+    vol_lookback: int = 10,
+    k_factor: float = 1.0,
+    risk_tolerance: float = 0.5,
+    loader: Optional[Callable[[str, Optional[str]], pd.DataFrame]] = None,
 ) -> Dict[str, Any]:
-    """Download data and run evaluate_rgr. Raises on download errors so the
-    caller decides whether to fail open or closed."""
-    df = download_history(ticker, as_of)
-    bench = download_history(benchmark_ticker, as_of)
-    result = evaluate_rgr(df, bench, **kwargs)
-    result["ticker"] = ticker
-    return result
+    """
+    Returns a diagnostics dict.
+
+        passed     True / False, or None when the screen could not run
+        rgr, ror, rpr, direction ("LONG" | "SHORT" | "NONE"), m_norm,
+        ticker_return, benchmark_return, atr_pct, vol_ratio,
+        vol_scaling, hold_days, data_end, reason, error
+
+    `hold_days` is the trailing window N (in bars) for RoR and the benchmark.
+    `loader(symbol, as_of)` can be injected for tests.
+    """
+    load = loader or _load_history
+
+    try:
+        df = _clean(load(ticker, as_of))
+        bench = _clean(load(benchmark, as_of))
+    except _DataUnavailable as exc:
+        return _skip(ticker, str(exc))
+    except Exception as exc:  # network, parse, ...
+        return _skip(ticker, f"{type(exc).__name__}: {exc}")
+
+    df = df.dropna(subset=["High", "Low", "Close"])
+    need = max(
+        atr_length + vol_lookback + 1, hold_days + 1, gradient_lookback + 1
+    )
+    if len(df) < need:
+        return _skip(ticker, f"only {len(df)} bars, need {need}")
+
+    closes = df["Close"].astype(float)
+    atr_series = _wilder_atr(df, atr_length).dropna()
+    if len(atr_series) < vol_lookback:
+        return _skip(ticker, "ATR history too short")
+
+    close_now = float(closes.iloc[-1])
+    atr_now = float(atr_series.iloc[-1])
+    if close_now <= 0 or not np.isfinite(atr_now) or atr_now <= 0:
+        return _skip(ticker, "invalid price or ATR")
+
+    # ---- direction: identical rule to RiskManager ----
+    try:
+        m = compute_gradient(closes.tolist(), gradient_lookback)
+        m_norm = normalize_gradient(m, gradient_lookback, atr_now)
+    except ValueError as exc:
+        return _skip(ticker, f"gradient unavailable: {exc}")
+    d = direction_from_gradient(m_norm, gradient_deadband)
+    direction = {1: "LONG", -1: "SHORT", 0: "NONE"}[d]
+
+    # ---- trailing returns over the same dates ----
+    t_end = closes.index[-1]
+    t_start = closes.index[-1 - hold_days]
+    p_start = float(closes.iloc[-1 - hold_days])
+    if p_start <= 0:
+        return _skip(ticker, "invalid start price")
+    ticker_return = close_now / p_start - 1.0
+
+    bclose = bench["Close"].astype(float).dropna()
+    b_end = bclose.asof(t_end)
+    b_start = bclose.asof(t_start)
+    if np.asarray(pd.isna(b_end)).item() or np.asarray(pd.isna(b_start)).item():
+        return _skip(
+            ticker, f"{benchmark} has no data covering {t_start.date()}..{t_end.date()}"
+        )
+    b_end_value = float(np.asarray(b_end).item())
+    b_start_value = float(np.asarray(b_start).item())
+    if (
+        not np.isfinite(b_end_value)
+        or not np.isfinite(b_start_value)
+        or b_start_value <= 0
+    ):
+        return _skip(
+            ticker, f"{benchmark} has no data covering {t_start.date()}..{t_end.date()}"
+        )
+    benchmark_return = b_end_value / b_start_value - 1.0
+
+    # ---- RGR ----
+    atr_pct = atr_now / close_now
+    rpr = benchmark_return + risk_tolerance * atr_pct
+    vol_ratio = atr_now / float(atr_series.iloc[-vol_lookback:].mean())
+    vol_scaling = k_factor / vol_ratio
+
+    ror = d * ticker_return
+    rgr = (ror - rpr) * (1.0 + vol_scaling)
+
+    diag: Dict[str, Any] = {
+        "ticker": ticker,
+        "passed": None,
+        "error": None,
+        "reason": "",
+        "rgr": float(rgr),
+        "ror": float(ror),
+        "rpr": float(rpr),
+        "direction": direction,
+        "m_norm": float(m_norm),
+        "ticker_return": float(ticker_return),
+        "benchmark_return": float(benchmark_return),
+        "atr_pct": float(atr_pct),
+        "vol_ratio": float(vol_ratio),
+        "vol_scaling": float(vol_scaling),
+        "hold_days": hold_days,
+        "data_end": str(t_end.date()),
+    }
+
+    if d == 0:
+        diag["passed"] = False
+        diag["reason"] = (
+            f"no clear direction (|m_norm|={abs(m_norm):.3f} < {gradient_deadband})"
+        )
+        diag["rgr"] = 0.0
+        diag["ror"] = 0.0
+        return diag
+
+    diag["passed"] = bool(rgr > threshold)
+    diag["reason"] = (
+        f"RGR {rgr:+.5f} {'>' if diag['passed'] else '<='} threshold {threshold}"
+    )
+    return diag
