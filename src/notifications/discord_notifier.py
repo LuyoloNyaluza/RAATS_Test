@@ -42,7 +42,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 from urllib.parse import quote
 
 import requests
+from dotenv import load_dotenv
 
+load_dotenv()
 API_BASE = "https://discord.com/api/v10"
 CHUNK_LIMIT = 1900                      # Discord's hard limit is 2000 characters
 
