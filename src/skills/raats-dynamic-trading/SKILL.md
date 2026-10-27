@@ -1,395 +1,259 @@
 ---
 name: raats-dynamic-trading
 category: trading
-description: Full RAATS dynamic trading pipeline with macro events, MT5 filter, WhatsApp approval, and summarization
+description: RAATS dynamic trading pipeline - discovery, macro-event check, MT5 broker filter, RGR gate, iterative analysis with replacements, Discord approval, minimum-balance guard and end-of-day summary
 trigger: "run dynamic trading session" or "run RAATS trading"
-version: "1.0.0"
+version: "1.1.0"
 ---
 
 # RAATS Dynamic Trading Skill
 
-This skill executes the complete RAATS trading pipeline:
-1. **Discovery** - Get top 50 performers, top 10 with news, waiting list
-2. **Macro Event Check** - Block trades during FOMC/CPI/NFP windows
-3. **MT5 Broker Filter** - Filter by tradable symbols on your broker
-4. **RGR Gate Screening** - Risk-adjusted return screening
-5. **Dynamic Trading** - Iterative analysis with replacements
-6. **WhatsApp Approval** - Human-in-the-loop for final INVEST list
-7. **MT5 Balance Check** - Blocks if account < $20
-8. **Summarization Middleware** - End-of-day summary to memory/WhatsApp
+Runs the full RAATS pipeline, in this order:
 
-# Quick Start
+1. **Discovery** (`discovery.main()`) - day-gainers screener, previous-session returns, optional MT5 broker filter, macro check, then the three arrays: top 50, top 10 (with news), waiting list.
+2. **Macro event check** - blocks the session inside a high-impact event window.
+3. **Starting balance** - read once from MT5 (only when MT5 is enabled) for the end-of-day summary.
+4. **RGR gate** - every ticker must pass `rgr_screen.screen_candidate()` to join the active list (initial top 10 and every waiting-list replacement).
+5. **Analysis rounds** - collector, stability, analyst, executor; HOLD tickers are replaced from the waiting list until every active ticker is INVEST or the waiting list is empty. Paper positions are opened during these rounds.
+6. **MT5 data for the final INVEST list** - broker symbol, tradable flag, spread (so the approver sees them).
+7. **Minimum-balance guard** - blocks the session if the MT5 balance is below `RAATS_MIN_BALANCE` (default $20). Runs whether or not approval is required.
+8. **Discord approval** (optional) - you react on the message. Anything other than APPROVE discards this session's paper positions.
+9. **Balance re-check** after approval.
+10. **Summary** - JSONL summary, standard logger, optional Discord post.
 
-```bash
-# Set required environment variables
-export RAATS_USE_MT5=1                    # Enable MT5 filter
-export RAATS_MT5_SYMBOL_MAP='{"CL=F": "USOIL"}'  # Custom symbol mappings
-export RAATS_MACRO_API_KEY=your_key       # TradingEconomics API key
-export RAATS_REQUIRE_APPROVAL=1           # Enable WhatsApp approval
-export WHATSAPP_WEBHOOK_URL=https://your-webhook.com/webhook  # WhatsApp Business API webhook
-export WHATSAPP_PHONE=+27685265175        # YOUR MOBILE NUMBER SET HERE
-export RAATS_WHATSAPP_SUMMARY=1           # Send EOD summary to WhatsApp
+## Quick start (Windows PowerShell)
 
-# Run the pipeline
+```powershell
+# Discord (required for approval / summary)
+$env:DISCORD_BOT_TOKEN   = "..."        # bot token - treat like a password
+$env:DISCORD_CHANNEL_ID  = "..."        # channel the bot posts in
+$env:DISCORD_APPROVER_ID = "..."        # YOUR Discord user id - the only person who can approve
+
+# Behaviour
+$env:RAATS_USE_MT5           = "1"      # MT5 filter in discovery AND symbol lookup + balance guard in the loop
+$env:RAATS_REQUIRE_APPROVAL  = "1"      # ask on Discord before finishing the session
+$env:RAATS_DISCORD_SUMMARY   = "1"      # post the end-of-day summary to Discord
+
 python -m src.agents.trading_loop_dynamic
 ```
 
+If you keep these in a `.env` file instead, something in the project must load it (for example `python-dotenv`), and `.env` must be in `.gitignore`. Never commit the bot token; if it is ever pasted or committed, reset it in the Discord Developer Portal.
+
 ## Configuration
 
-### Required Environment Variables
+### Discord
+
+| Variable | Description |
+|----------|-------------|
+| `DISCORD_BOT_TOKEN` | Bot token from the Developer Portal |
+| `DISCORD_CHANNEL_ID` | Channel the bot posts in |
+| `DISCORD_APPROVER_ID` | Your Discord user id. Reactions from anyone else (and from the bot) are ignored |
+
+If any of the three is missing, nothing is posted and approvals can still be given by hand (see below).
+
+### Pipeline
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `WHATSAPP_PHONE` | **YOUR MOBILE NUMBER** with country code | **+27685265175** |
-| `WHATSAPP_WEBHOOK_URL` | WhatsApp Business API webhook endpoint | Required for approval/summary |
-| `RAATS_MACRO_API_KEY` | TradingEconomics or similar API key | Uses static calendar if not set |
+| `RAATS_USE_MT5` | Enable the MT5 broker filter in discovery, and `enable_mt5` in the trading loop's entry point | off |
+| `RAATS_MT5_SYMBOL_MAP` | JSON overrides for symbol names, e.g. `{"CL=F": "USOIL"}` | `{}` |
+| `RAATS_MIN_BALANCE` | Minimum MT5 balance in dollars | `20` |
+| `RAATS_REQUIRE_APPROVAL` | Ask for approval on Discord | off |
+| `RAATS_DISCORD_SUMMARY` | Post the end-of-day summary to Discord | off |
+| `RAATS_MACRO_API_KEY` | TradingEconomics key; without it the static calendar is used | unset |
+| `RAATS_MEMORY_DIR` | Folder for the summary JSONL | `data/summaries` |
+| `RAATS_SENTIMENT_MODEL` | Ollama model that scores news | `mistral-nemo` |
 
-### Optional Environment Variables
+`RAATS_WHATSAPP_SUMMARY`, `WHATSAPP_PHONE` and `WHATSAPP_WEBHOOK_URL` no longer exist. Delete `whatsapp.py`: it contains a hard-coded phone number.
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RAATS_USE_MT5` | Enable MT5 broker filter | 0 (off) |
-| `RAATS_MT5_SYMBOL_MAP` | JSON symbol overrides | {} |
-| `RAATS_REQUIRE_APPROVAL` | Require WhatsApp approval before trades | 0 (off) |
-| `RAATS_WHATSAPP_SUMMARY` | Send EOD summary to WhatsApp | 0 (off) |
-| `RAATS_MEMORY_DIR` | Directory for session JSONL logs | **data/summaries/** |
+## Discord setup (about 10 minutes, free, no review process)
 
-## Macro Events
+The bot only makes outbound calls to Discord, so there is no webhook, public URL or ngrok.
 
-The system blocks trades during high-impact event windows (30 min before/after):
-- **FOMC** - Federal Reserve rate decisions
-- **CPI** - Consumer Price Index
-- **NFP** - Non-Farm Payrolls
-- **PCE** - Personal Consumption Expenditures
-- **GDP** - Gross Domestic Product
-- **ISM** - Manufacturing/Services PMI
-- **Retail Sales**
-- **Jobless Claims**
-
-### Static Calendar
-Update `src/data/macro_calendar.json` quarterly with scheduled events.
-
-### Live Calendar
-Set `RAATS_MACRO_API_KEY` for TradingEconomics API (auto-refreshes every 6 hours).
-
-## WhatsApp Integration
-
-### Setting Up Your Mobile Number
-
-**Option 1: Environment Variable (Recommended)**
-```bash
-export WHATSAPP_PHONE="+27685265175"  # ← YOUR NUMBER SET HERE
-```
-
-**Option 2: Edit the Source File**
-Edit `src/notifications/whatsapp.py` line 32:
-```python
-self.phone_number = phone_number or os.environ.get("WHATSAPP_PHONE", "+27685265175")  # ← ALREADY SET
-```
-
-**Option 3: Pass at Runtime**
-```python
-from src.notifications.whatsapp import WhatsAppNotifier
-notifier = WhatsAppNotifier(phone_number="+27685265175")
-```
-
-### WhatsApp Business API Setup
-
-1. Get a WhatsApp Business Account
-2. Configure webhook URL for incoming messages
-3. Set `WHATSAPP_WEBHOOK_URL` to your webhook endpoint
-4. The webhook should accept POST with JSON: `{"to": "...", "text": "...", "request_id": "..."}`
-
-#### Webhook Setup - Step by Step
-
-**Option A: Meta WhatsApp Business API (Official)**
-1. Go to [Meta for Developers](https://developers.facebook.com/)
-2. Create a Business Manager account
-3. Create a WhatsApp Business App
-4. Go to WhatsApp → Getting Started
-5. Note your **Phone Number ID** and **Access Token**
-6. Set webhook:
-   - In App Dashboard → WhatsApp → Configuration → Webhooks
-   - Add Callback URL: `https://your-domain.com/webhook/whatsapp`
-   - Verify Token: create a random string
-   - Subscribe to `messages` field
-7. Your webhook endpoint must:
-   - Accept GET (for verification): `?hub.mode=subscribe&hub.challenge=123&hub.verify_token=YOUR_TOKEN`
-   - Accept POST with JSON body:
-     ```json
-     {
-       "object": "whatsapp_business_account",
-       "entry": [{
-         "changes": [{
-           "value": {
-             "messages": [{
-               "from": "+27685265175",
-               "text": {"body": "APPROVE"},
-               "id": "wamid.xxx"
-             }]
-           },
-           "field": "messages"
-         }]
-       }]
-     }
-     ```
-   - Respond with 200 OK within 20 seconds
-
-**Option B: Twilio WhatsApp API (Easier Setup)**
-1. Sign up at [Twilio](https://www.twilio.com/)
-2. Get Account SID and Auth Token
-3. Enable WhatsApp in Console → Messaging → Try WhatsApp
-4. Use sandbox number or verify your own
-5. Set webhook in Console → Messaging → Settings → WhatsApp Sandbox
-6. Webhook URL: `https://your-domain.com/webhook/twilio`
-7. Install: `pip install twilio`
-8. Use TwiML for responses:
-   ```python
-   from flask import Flask, request
-   from twilio.twiml.messaging_response import MessagingResponse
-   
-   app = Flask(__name__)
-   
-   @app.route("/webhook/twilio", methods=["POST"])
-   def whatsapp_webhook():
-       incoming_msg = request.values.get("Body", "").strip().upper()
-       from_number = request.values.get("From", "")
-       
-       # Process APPROVE/REJECT/MODIFY
-       # ... your logic here ...
-       
-       resp = MessagingResponse()
-       resp.message("Received: " + incoming_msg)
-       return str(resp), 200
+1. discord.com/developers/applications -> **New Application** -> **Bot** -> **Reset Token** and copy it.
+2. **OAuth2 -> URL Generator**: scope `bot`; permissions View Channel, Send Messages, Add Reactions, Read Message History. Open the URL and add the bot to a private server you created. No privileged intents are needed.
+3. Discord Settings -> Advanced -> **Developer Mode** on. Right-click the channel -> Copy Channel ID; right-click your name -> Copy User ID.
+4. Set the three `DISCORD_*` variables.
+5. Test (tap the tick on your phone; it should print `APPROVE`):
+   ```powershell
+   python -c "from src.notifications.discord_notifier import DiscordNotifier as D; print(D().request_approval(['AAPL','MSFT'], None, 10000))"
    ```
 
-**Option C: Ngrok for Local Testing (Development Only)**
-```bash
-# Install ngrok
-# https://ngrok.com/download
+## Approval flow
 
-# Expose local port 5000
-ngrok http 5000
+1. The bot posts the final INVEST list with MT5 symbols, spreads and the balance, and adds the reactions: tick = **APPROVE**, cross = **REJECT**, note = **MODIFY**.
+2. RAATS checks every 5 seconds for up to 10 minutes.
+3. Safety rules: only your reaction counts; if several reactions are present, REJECT beats MODIFY beats APPROVE.
+4. **APPROVE** continues the session. **REJECT, MODIFY or TIMEOUT** return early: this session's paper positions are discarded, no summary is written, and the reason is logged to `analysis_errors_*.jsonl` with `stage: "approval"`. MODIFY has no edit step yet, so it is treated as not approved.
 
-# Use the HTTPS URL: https://abc123.ngrok.io/webhook
-export WHATSAPP_WEBHOOK_URL=https://abc123.ngrok.io/webhook
+The approval timeout is 10 minutes. To change it, edit `_get_notifier()` in `trading_loop_dynamic.py`: `DiscordNotifier(approval_timeout_minutes=30)`.
+
+### Approval log (JSONL)
+
+Every request is stored in one weekly file, named like the other logs:
+
+```
+data/approvals/approval_requests_<Monday>_to_<Sunday>.jsonl
+e.g. data/approvals/approval_requests_2026-10-26_to_2026-11-01.jsonl
 ```
 
-**Option D: Simple HTTP Server for File-Based Testing**
-If you don't have a public webhook yet, the system falls back to file-based approvals:
-```bash
-# No webhook needed - approvals saved to:
-# data/approvals/{request_id}.json
+The log is **append-only**: a request writes a `PENDING` line when sent and a new line when it is decided; the newest line for a `request_id` is its current state. All lines of a request stay in the file it started in, even if the week changes while it waits.
 
-# To approve manually:
+| Field | Meaning |
+|-------|---------|
+| `request_id` | 8-character id |
+| `timestamp`, `expires_at` | When it was sent / when it times out |
+| `final_invest`, `mt5_data`, `account_balance` | What the approver was shown |
+| `options` | `["APPROVE","REJECT","MODIFY"]` |
+| `status` | `PENDING` -> `COMPLETED` or `TIMEOUT` |
+| `user_response` | `APPROVE`, `REJECT`, `MODIFY` or `TIMEOUT` |
+| `response_time`, `response_source` | When, and `discord` or `manual` |
+| `message_id`, `log_file`, `send_error` | Discord message id, the file this request lives in, any send failure |
+
+### Approving without Discord
+
+The request id is printed when the request is sent.
+
+```powershell
+python -m src.notifications.discord_notifier pending
+python -m src.notifications.discord_notifier respond <request_id> APPROVE     # or REJECT, MODIFY, 1, 2, 3
 ```
 
-**Option D: Simple HTTP Server for File-Based Testing** (cont.)
-```bash
-# 2. Check: data/approvals/{request_id}.json
-```
+This appends a line to the same weekly file.
 
-### Your Webhook URL Template
+## Macro events
 
-For this project, your webhook should accept:
-```python
-# Expected POST format from our system
-{
-    "to": "+27685265175",
-    "text": "🔔 RAATS Trade Approval Required\nRequest ID: abc123...\n...",
-    "request_id": "abc123"
-}
+The session is blocked when the current time is within the window (default 30 minutes, 15 for jobless claims) of a MEDIUM or HIGH impact event: FOMC, CPI, NFP, PCE, GDP, ISM, retail sales, jobless claims.
 
-# Your webhook should:
-# 1. Forward to WhatsApp (Meta/Twilio/other)
-# 2. Listen for incoming replies
-# 3. Update the approval file:
-#    data/approvals/abc123.json
-#    {
-#      "status": "COMPLETED",
-#      "user_response": "APPROVE",
-#      "response_time": "2026-10-23T14:30:00"
-#    }
-```
+- **Static calendar:** `src/data/macro_calendar.json`, maintained by hand. It is never overwritten.
+- **Live calendar:** with `RAATS_MACRO_API_KEY`, downloads are cached in `macro_calendar_api_cache.json` (refreshed every 6 hours) and used if the static file is missing.
+- A date that falls on a weekend is reported as a warning when the calendar loads. **Check the current file against federalreserve.gov and bls.gov before relying on it:** it contains events on Saturday 2026-11-07 (FOMC) and 2026-11-14 (retail sales), contains only one jobless-claims entry, and starts on 2026-10-30, so earlier dates cannot be checked.
+- Naive times (for example a simulated date) are treated as UTC.
+- The window is minutes wide but RAATS runs once a day on daily bars, so the check rarely blocks. A "high-impact release today" rule would suit a daily strategy better.
 
-### Quick Test Your Webhook
+## MT5
 
-```bash
-# Test with curl
-curl -X POST "https://your-webhook.com/webhook" \
-  -H "Content-Type: application/json" \
-  -d '{"to": "+27685265175", "text": "Test message", "request_id": "test123"}'
-```
+Requirements: Windows, MT5 terminal installed and logged in, `pip install MetaTrader5`.
 
-### Approval Flow
+- Symbols are resolved from Yahoo names (`GC=F` -> `XAUUSD`, equities with suffixes such as `.US`). Override with `RAATS_MT5_SYMBOL_MAP`.
+- A symbol is **tradable** only when its trade mode is FULL (RAATS opens longs and shorts). Close-only, long-only and disabled symbols are not.
+- Broker coverage of small-cap day-gainers is likely to be low; the discovery filter can drop most of the list.
+- If the balance cannot be read, the guard is skipped with a warning and the session continues.
+- A low balance sends a Discord alert and appends to `data/approvals/insufficient_funds_<Monday>_to_<Sunday>.jsonl`.
+- Do not call MT5 from threaded runs (`run_watchlist_concurrent`).
 
-1. System determines final INVEST list
-2. Sends WhatsApp message with:
-   - Final INVEST tickers
-   - MT5 symbols and spreads
-   - Account balance (with warning if < $20)
-3. You reply with: `APPROVE`, `REJECT`, or `MODIFY`
-4. System waits up to 10 minutes (configurable)
-5. On APPROVE: Re-checks balance, executes trades
-6. On REJECT/TIMEOUT: Aborts, logs to JSONL
+## Summarization middleware
 
-### Response File (Fallback)
-If webhook isn't configured, edit the response file:
-```
-data/approvals/{request_id}.json
-```
-Change `"status": "PENDING"` to `"status": "COMPLETED"` and add `"user_response": "APPROVE"`
+At the end of an approved session:
 
-## MT5 Integration
+1. Appends to `data/summaries/sessions_YYYY-MM.jsonl` (monthly file).
+2. Calls the standard `log_session_summary()`.
+3. Posts to Discord if `RAATS_DISCORD_SUMMARY` is set.
 
-### Requirements
-- Windows with MetaTrader 5 terminal installed
-- Logged into your broker account
-- `pip install MetaTrader5`
+The summary holds the final INVEST list, open and closed trades, return / Sharpe / drawdown, realized and daily PnL, win rate (from the portfolio summary), RGR rejections, MT5 data, and starting / closing balance. The cross-session memory hook is a placeholder: nothing reads these files back into the agents yet.
 
-### Symbol Mapping
-Override broker-specific symbols via `RAATS_MT5_SYMBOL_MAP`:
-```json
-{
-  "CL=F": "USOIL",
-  "GC=F": "XAUUSD",
-  "EURUSD=X": "EURUSD"
-}
-```
-
-### Balance Check
-- Fetches account balance via `mt5.account_info()`
-- Blocks trades if balance < $20
-- Sends WhatsApp alert and logs to `insufficient_balance.jsonl`
-
-## Summarization Middleware
-
-Runs at end of every session:
-1. **JSONL Log** - `data/summaries/sessions_YYYY-MM.jsonl`
-2. **WhatsApp** - Optional summary to your phone
-3. **Standard Logger** - Existing `log_session_summary()` call
-
-### Session Summary Includes
-- Final INVEST list
-- Open/closed trades
-- PnL metrics (realized, daily, win rate)
-- RGR rejections
-- MT5 data (symbols, spreads)
-- Portfolio summary
-
-## Files Created
+## Files created
 
 ```
 data/
-├── summaries/
-│   └── sessions_2026-10.jsonl      # Session history
-├── approvals/
-│   ├── approval_requests_YYYY-MM-DD_to_YYYY-MM-DD.jsonl
-│   ├── insufficient_funds_YYYY-MM-DD_to_YYYY-MM-DD.jsonl
-│   └── {request_id}.json           # Approval requests/responses
+|-- approvals/
+|   |-- approval_requests_<Mon>_to_<Sun>.jsonl      approval log (append-only)
+|   `-- insufficient_funds_<Mon>_to_<Sun>.jsonl     balance-guard log
+`-- summaries/
+    `-- sessions_YYYY-MM.jsonl                      end-of-day summaries
+logs/
+|-- agent_performance_<Mon>_to_<Sun>.jsonl
+|-- sentiment_analysis_<Mon>_to_<Sun>.jsonl
+`-- analysis_errors_<Mon>_to_<Sun>.jsonl            includes stage "approval" entries
+src/data/
+|-- macro_calendar.json                             hand-maintained
+`-- macro_calendar_api_cache.json                   API downloads
 ```
 
-## Usage in Code
+## Usage in code
 
 ```python
 from src.agents.trading_loop_dynamic import run_dynamic_trading_session
 from src.data.discovery import main as run_discovery
 
-# Step 1: Run discovery
 top_50, top_10, waiting_list = run_discovery()
 
-# Step 2: Run dynamic trading (with all features)
 session = run_dynamic_trading_session(
     top_50_performing=top_50,
     top_10=top_10,
     waiting_list=waiting_list,
     portfolio_value=10_000,
-    enable_rgr_gate=True,
-    rgr_threshold=0.0,
-    enable_mt5=True,
+    enable_rgr_gate=True,     # default True
+    rgr_threshold=0.0,        # default 0.0
+    enable_mt5=True,          # default False; the entry point sets it from RAATS_USE_MT5
 )
 
-# Access results
-print(f"Final INVEST: {session['final_invest']}")
-print(f"Open trades: {session['open_trades']}")
-print(f"Metrics: {session.get('metrics', {})}")
+print(session["final_invest"])
+print(session["open_trades"])
 ```
 
 ## Testing
 
-```bash
-# Test macro events
+```powershell
+# Macro events
 python -c "from src.data.macro_events import is_trade_blocked_by_macro; print(is_trade_blocked_by_macro())"
 
-# Test MT5 balance
+# MT5 balance
 python -c "from src.data.mt5_bridge import get_account_balance; print(get_account_balance())"
 
-# Test WhatsApp (without webhook - saves to file)
-python -c "from src.notifications.whatsapp import WhatsAppNotifier; n=WhatsAppNotifier(); n.send_approval_request(['AAPL','MSFT'], {}, 10000)"
+# Discord alert and approval
+python -c "from src.notifications.discord_notifier import DiscordNotifier as D; print(D().send_alert('RAATS test'))"
+python -c "from src.notifications.discord_notifier import DiscordNotifier as D; print(D().request_approval(['AAPL','MSFT'], None, 10000))"
 
-# Test summarization
-python -c "from src.agents.middleware.summarization_middleware import SummarizationMiddleware; m=SummarizationMiddleware(); print('Ready')"
+# Waiting requests / answer by hand
+python -m src.notifications.discord_notifier pending
 ```
 
 ## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
+| "Discord not configured" | Set all three `DISCORD_*` variables; approve by hand with the `respond` command meanwhile |
+| Discord send fails with 403 | The bot lacks permission in that channel: View Channel, Send Messages, Add Reactions, Read Message History |
+| Reactions are ignored | `DISCORD_APPROVER_ID` must be your own user id (Developer Mode -> Copy User ID), not the bot's |
+| "Approval timeout" | You have 10 minutes; see the approval flow section to change it |
 | "MT5 package not installed" | `pip install MetaTrader5` (Windows only) |
-| "No macro calendar" | Update `macro_calendar.json` or set `RAATS_MACRO_API_KEY` |
-| "WhatsApp webhook failed" | Check `WHATSAPP_WEBHOOK_URL` and webhook accepts POST JSON |
-| "Approval timeout" | Increase timeout in `WhatsAppNotifier(approval_timeout_minutes=15)` |
-| "Insufficient balance" | Fund MT5 account > $20, check `insufficient_balance.jsonl` |
+| MT5 step does nothing | Set `RAATS_USE_MT5=1`; the loop's MT5 lookup and balance guard need it as well as the discovery filter |
+| "MT5 balance unavailable - guard NOT applied" | Terminal not open / not logged in; the session continues without the guard |
+| "macro calendar has N event(s) on a weekend" | Fix those dates in `macro_calendar.json` |
+| No macro blocking at all | Calendar missing or has no event near now; check the file and its dates |
+| Insufficient balance | Fund the account above `RAATS_MIN_BALANCE`; see `insufficient_funds_*.jsonl` |
 
 ## Architecture
 
 ```
 discovery.py (main)
-    │
-    ├─► get_tickers_from_gainers_feed()
-    ├─► build_market_universe()
-    ├─► get_previous_session_returns()
-    ├─► apply_mt5_filter() ──────► mt5_bridge.py
-    ├─► is_trade_blocked_by_macro() ──► macro_events.py
-    └─► build_ticker_arrays()
-            │
-            ▼
+    |-- get_tickers_from_gainers_feed() -> get_previous_session_returns()
+    |-- apply_mt5_filter()            (RAATS_USE_MT5)      -> mt5_bridge.py
+    |-- is_trade_blocked_by_macro()                        -> macro_events.py
+    `-- build_ticker_arrays() -> top 50 / top 10 + news / waiting list
+            |
+            v
 trading_loop_dynamic.py (run_dynamic_trading_session)
-    │
-    ├─► MacroEventChecker (blocks FOMC/CPI/NFP)
-    ├─► DynamicTradingManager
-    │   ├─► _screen_initial_active_list() ──► rgr_screen.py
-    │   ├─► _get_replacements() (with RGR gate)
-    │   ├─► run_trading_session()
-    │   │   ├─► WhatsApp approval interrupt
-    │   │   ├─► MT5 balance check
-    │   │   └─► enrich_final_invest() ──► mt5_bridge.py
-    │   └─► SummarizationMiddleware
-    │       ├─► JSONL log
-    │       ├─► Hermes memory
-    │       └─► WhatsApp summary
-    └─► LangGraph trading loop (collector→stability→analyst→executor)
+    |-- macro check, starting balance
+    |-- DynamicTradingManager
+    |     |-- RGR gate on the initial list and every replacement   -> rgr_screen.py
+    |     |-- analysis rounds + HOLD replacement (LangGraph: collector -> stability -> analyst -> executor)
+    |     |-- MT5 data for the final INVEST list                   -> mt5_bridge.py
+    |     |-- minimum-balance guard                                -> mt5_bridge.py -> Discord alert
+    |     |-- Discord approval (APPROVE continues, otherwise positions are discarded)
+    |     |                                                        -> discord_notifier.py -> approval_requests_*.jsonl
+    |     |-- balance re-check
+    |     `-- SummarizationMiddleware -> sessions_YYYY-MM.jsonl, log_session_summary, Discord
 ```
 
-## Customization
+## Known limitations
 
-### Change Macro Event Window
-```python
-from src.data.macro_events import MacroEventChecker
-checker = MacroEventChecker(default_window_minutes=60)  # 1 hour window
-```
-
-### Change Balance Threshold
-```python
-from src.data.mt5_bridge import check_balance_and_notify
-check_balance_and_notify(min_balance=50.0)  # $50 minimum
-```
-
-### Change Approval Timeout
-```python
-from src.notifications.whatsapp import WhatsAppNotifier
-notifier = WhatsAppNotifier(approval_timeout_minutes=30)  # 30 minutes
-```
+- Paper positions are opened during the analysis rounds, before you are asked. A rejection discards them. When real MT5 order placement is added, orders must be sent only after approval.
+- Nothing is sent to the broker today.
+- MODIFY is recorded but has no edit step.
+- The memory hook in the summarization middleware is a placeholder.
+- The macro calendar is only as accurate as the file you maintain.
 
 ## License
 

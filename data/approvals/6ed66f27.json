@@ -1,0 +1,23 @@
+{
+  "request_id": "6ed66f27",
+  "timestamp": "2026-10-26T21:15:22.149165",
+  "final_invest": [
+    "AAPL",
+    "MSFT"
+  ],
+  "mt5_data": {},
+  "account_balance": 10000,
+  "options": [
+    "APPROVE",
+    "REJECT",
+    "MODIFY"
+  ],
+  "status": "COMPLETED",
+  "user_response": "APPROVE",
+  "response_time": "2026-10-26T21:15:53.173356",
+  "channel": "discord",
+  "message_id": "1564356797140045837",
+  "expires_at": "2026-10-26T19:25:22.149165+00:00",
+  "send_error": null,
+  "response_source": "discord"
+}

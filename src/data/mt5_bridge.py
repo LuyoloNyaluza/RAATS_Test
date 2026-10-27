@@ -62,6 +62,9 @@ EQUITY_SUFFIXES = ["", ".US", ".NAS", ".NYSE", "#", ".O", ".N"]
 
 _cache: Dict[str, Optional[str]] = {}
 
+# MT5 SYMBOL_TRADE_MODE_*: 0 disabled, 1 long only, 2 short only, 3 close only, 4 full.
+TRADE_MODE_FULL = 4
+
 
 def _load_overrides() -> Dict[str, List[str]]:
     raw = os.environ.get("RAATS_MT5_SYMBOL_MAP")
@@ -131,45 +134,55 @@ def get_account_balance() -> Optional[float]:
         shutdown_mt5()
 
 
+def notify_insufficient_balance(
+    balance: float,
+    min_balance: float = 20.0,
+    final_invest: Optional[List[str]] = None,
+) -> None:
+    """Alert on Discord and write the weekly insufficient-funds log entry."""
+    shortfall = min_balance - balance
+    msg = (
+        f"RAATS: insufficient funds ${balance:.2f}, please deposit "
+        f"${shortfall:.2f}. A minimum of ${min_balance:.2f} is needed."
+    )
+
+    try:
+        from src.notifications.discord_notifier import DiscordNotifier
+        DiscordNotifier().send_alert(msg)
+    except Exception as exc:          # alerting must never block the log below
+        print(f"  Discord alert not sent: {exc}")
+
+    log_path = _get_insufficient_funds_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "timestamp": datetime.now().isoformat(),
+            "balance": balance,
+            "min_required": min_balance,
+            "shortfall": shortfall,
+            "action": "trades_blocked",
+            "final_invest": list(final_invest or []),
+        }) + "\n")
+
+    print(msg)
+
+
 def check_balance_and_notify(min_balance: float = 20.0) -> bool:
     """
-    Check MT5 balance and send alert if below threshold.
-    Returns True if balance >= min_balance, False otherwise.
+    Check MT5 balance; alert + log if below threshold.
+    Returns True if balance >= min_balance, False otherwise (including when
+    the balance cannot be read).
     """
     balance = get_account_balance()
-    
+
     if balance is None:
         print("Could not fetch MT5 balance")
         return False
-    
+
     if balance < min_balance:
-        shortfall = min_balance - balance
-        msg = f"⚠️ RAATS: insufficient funds ${balance:.2f}, please deposit ${shortfall:.2f}. a minimum of ${min_balance:.2f} is needed"
-        
-        # Send WhatsApp if configured
-        webhook = os.environ.get("WHATSAPP_WEBHOOK_URL")
-        if webhook:
-            try:
-                import requests
-                requests.post(webhook, json={"text": msg}, timeout=5)
-            except:
-                pass
-        
-        # Write to weekly JSONL log
-        log_path = _get_insufficient_funds_log_path()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a") as f:
-            f.write(json.dumps({
-                "timestamp": datetime.now().isoformat(),
-                "balance": balance,
-                "min_required": min_balance,
-                "shortfall": shortfall,
-                "action": "trades_blocked",
-            }) + "\n")
-        
-        print(msg)
+        notify_insufficient_balance(balance, min_balance)
         return False
-    
+
     return True
 
 
@@ -238,8 +251,11 @@ def enrich_final_invest(final_invest: List[str]) -> Dict[str, Dict[str, Any]]:
             info = get_symbol_info(symbol) or {}
             tick = get_latest_tick(symbol) or {}
 
-            # SYMBOL_TRADE_MODE_DISABLED == 0
-            trade_enabled = info.get("trade_mode", 0) != 0
+            # RAATS opens both LONG and SHORT, so only FULL trading counts.
+            # The old test "!= 0" also accepted close-only symbols.
+            trade_enabled = info.get("trade_mode", 0) == getattr(
+                mt5, "SYMBOL_TRADE_MODE_FULL", TRADE_MODE_FULL
+            )
             bid, ask = tick.get("bid"), tick.get("ask")
             point = info.get("point") or 0
 
@@ -260,6 +276,7 @@ def enrich_final_invest(final_invest: List[str]) -> Dict[str, Dict[str, Any]]:
                 "volume_min": info.get("volume_min"),
                 "volume_step": info.get("volume_step"),
                 "digits": info.get("digits"),
+                "trade_mode": info.get("trade_mode"),
             }
     finally:
         shutdown_mt5()

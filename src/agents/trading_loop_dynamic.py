@@ -47,6 +47,7 @@ or:
     waiting_list is exhausted.
 """
 
+import os
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
@@ -65,10 +66,13 @@ from src.data.discovery import (
 
 from src.risk.risk_manager import RiskManager
 from src.data.rgr_screen import screen_candidate
-from src.data.mt5_bridge import enrich_final_invest, get_account_balance, check_balance_and_notify
+from src.data.mt5_bridge import enrich_final_invest, get_account_balance, notify_insufficient_balance
 from src.data.macro_events import is_trade_blocked_by_macro, MacroEventChecker
-from src.notifications.whatsapp import WhatsAppNotifier
+from src.notifications.discord_notifier import DiscordNotifier
 from src.agents.middleware.summarization_middleware import SummarizationMiddleware
+
+# Trades are blocked below this MT5 balance (env RAATS_MIN_BALANCE overrides).
+MIN_ACCOUNT_BALANCE = float(os.environ.get("RAATS_MIN_BALANCE", "20"))
 from src.simulation.orchestrator import compute_performance_metrics
 from src.utils.logger import (
     log_daily_watchlist,
@@ -1348,7 +1352,7 @@ class DynamicTradingManager:
         """
         Run the dynamic trading session with:
         - Macro event blocking (FOMC, CPI, NFP windows)
-        - WhatsApp approval for final INVEST list
+        - Discord approval for final INVEST list
         - MT5 balance check (blocks if < $20)
         - End-of-day summarization middleware
         """
@@ -1395,6 +1399,12 @@ class DynamicTradingManager:
             print(msg)
             self._send_alert(msg)
             return self.daily_results
+
+        # Balance at the START of the session, for the end-of-day summary
+        # (the middleware is built at session END, where it was always ~equal to closing).
+        self.starting_balance = (
+            get_account_balance() if self.enable_mt5 else None
+        )
 
         # ==================================
         # 2. PRE-MARKET SCAN & RGR SCREEN
@@ -1588,59 +1598,58 @@ class DynamicTradingManager:
                 break
 
         # ==================================
-        # 3. WHATSAPP APPROVAL INTERRUPT (if enabled)
-        # ==================================
-        
-        require_approval = os.environ.get("RAATS_REQUIRE_APPROVAL", "").lower() in ("1", "true", "yes")
-        
-        if self.final_invest and require_approval:
-            
-            # Get MT5 balance first
-            balance = get_account_balance()
-            
-            # Send WhatsApp approval request
-            notifier = WhatsAppNotifier()
-            approval = notifier.send_approval_request(
-                final_invest=self.final_invest,
-                mt5_data={},  # Will enrich after approval
-                account_balance=balance,
-            )
-            
-            # Wait for human response
-            print(f"\n⏳ Waiting for WhatsApp approval (Request: {approval.request_id})")
-            print(f"   Check your WhatsApp for the approval message")
-            
-            response = self._wait_for_approval_file(approval.request_id)
-            
-            if response != "APPROVE":
-                print(f"❌ Trade rejected by user: {response}")
-                return self.daily_results
-            
-            # Re-check balance after approval
-            if balance is not None and balance < 20:
-                shortfall = 20.0 - balance
-                msg = f"insufficient funds ${balance:.2f}, please deposit ${shortfall:.2f}. a minimum of $20.00 is needed"
-                notifier.send_alert(msg)
-                self._write_insufficient_balance_jsonl(balance)
-                return self.daily_results
-
-        # ==================================
-        # 4. MT5 DATA FOR FINAL INVEST LIST
+        # 3. MT5 DATA FOR FINAL INVEST LIST
+        #    (before approval, so the approver sees real symbols and spreads;
+        #    it used to be sent as {} and every ticker showed as N/A)
         # ==================================
 
         if self.enable_mt5 and self.final_invest:
             self.mt5_data = enrich_final_invest(self.final_invest)
 
         # ==================================
-        # 5. FINAL SUMMARY + SUMMARIZATION MIDDLEWARE
+        # 4. MINIMUM-BALANCE GUARD
+        #    (runs whether or not approval is required)
+        # ==================================
+
+        if self.final_invest and not self._balance_ok():
+            self._discard_unapproved_positions("insufficient balance")
+            return self.daily_results
+
+        # ==================================
+        # 5. DISCORD APPROVAL (if enabled)
+        # ==================================
+
+        require_approval = os.environ.get(
+            "RAATS_REQUIRE_APPROVAL", ""
+        ).lower() in ("1", "true", "yes")
+
+        if self.final_invest and require_approval:
+            response = self._request_human_approval()
+
+            if response != "APPROVE":
+                print(f"\u274c Session not approved ({response}).")
+                self._discard_unapproved_positions(response)
+                return self.daily_results
+
+            # Approval can take minutes: look at the balance again.
+            if not self._balance_ok():
+                self._discard_unapproved_positions(
+                    "insufficient balance after approval"
+                )
+                return self.daily_results
+
+        # ==================================
+        # 6. FINAL SUMMARY + SUMMARIZATION MIDDLEWARE
         # ==================================
 
         self._print_session_summary()
 
-        # Run summarization middleware
-        enable_whatsapp_summary = os.environ.get("RAATS_WHATSAPP_SUMMARY", "").lower() in ("1", "true")
+        enable_discord_summary = os.environ.get(
+            "RAATS_DISCORD_SUMMARY", ""
+        ).lower() in ("1", "true", "yes")
         middleware = SummarizationMiddleware(
-            enable_whatsapp=enable_whatsapp_summary,
+            enable_discord=enable_discord_summary,
+            starting_balance=getattr(self, "starting_balance", None),
         )
         session_results = {
             "manager": self,
@@ -1650,46 +1659,73 @@ class DynamicTradingManager:
 
         return self.daily_results
 
-    def _wait_for_approval_file(self, request_id: str, timeout: int = 600) -> str:
-        """Wait for approval response file (polling)."""
-        path = Path("~/.hermes/trading/approvals").expanduser() / f"{request_id}.json"
-        start = time.time()
-        
-        import time
-        while time.time() - start < timeout:
-            if path.exists():
-                with open(path) as f:
-                    data = json.load(f)
-                if data.get("status") != "PENDING":
-                    return data.get("user_response", "TIMEOUT")
-            time.sleep(5)
-        
-        return "TIMEOUT"
-
-    def _write_insufficient_balance_jsonl(self, balance: float) -> None:
-        """Write insufficient balance to JSONL log."""
-        shortfall = 20.0 - balance
-        log_path = Path("~/.hermes/trading/insufficient_balance.jsonl").expanduser()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a") as f:
-            f.write(json.dumps({
-                "timestamp": datetime.now().isoformat(),
-                "balance": balance,
-                "min_required": 20.0,
-                "shortfall": shortfall,
-                "action": "trades_blocked",
-                "final_invest": self.final_invest,
-            }) + "\n")
+    def _get_notifier(self) -> DiscordNotifier:
+        """One Discord notifier per manager, created on first use."""
+        if getattr(self, "_notifier_obj", None) is None:
+            self._notifier_obj = DiscordNotifier()
+        return self._notifier_obj
 
     def _send_alert(self, message: str) -> None:
-        """Send alert via WhatsApp if configured."""
-        webhook = os.environ.get("WHATSAPP_WEBHOOK_URL")
-        if webhook:
-            try:
-                import requests
-                requests.post(webhook, json={"text": message}, timeout=5)
-            except:
-                pass
+        """Post an alert to Discord (it is printed if Discord is not configured)."""
+        try:
+            self._get_notifier().send_alert(message)
+        except Exception as exc:
+            print(f"  WARNING: alert not sent ({exc})")
+
+    def _balance_ok(self) -> bool:
+        """False only when MT5 reports a balance below the minimum.
+
+        An unreadable balance does NOT block (the guard is skipped, loudly).
+        """
+        if not (self.enable_mt5 and self.final_invest):
+            return True
+        balance = get_account_balance()
+        if balance is None:
+            print("\u26a0\ufe0f  MT5 balance unavailable - minimum-balance guard NOT applied.")
+            return True
+        if balance < MIN_ACCOUNT_BALANCE:
+            notify_insufficient_balance(balance, MIN_ACCOUNT_BALANCE, self.final_invest)
+            return False
+        return True
+
+    def _request_human_approval(self) -> str:
+        """Ask on Discord and wait. Returns APPROVE | REJECT | MODIFY | TIMEOUT.
+
+        Replaces _wait_for_approval_file, which crashed immediately
+        (UnboundLocalError: it used `time` before its own `import time`) and
+        watched ~/.hermes/trading/approvals while requests were saved to
+        ./data/approvals, so an approval could never have been seen.
+        """
+        notifier = self._get_notifier()
+        balance = get_account_balance() if self.enable_mt5 else None
+        request = notifier.send_approval_request(
+            final_invest=list(self.final_invest),
+            mt5_data=getattr(self, "mt5_data", None) or {},
+            account_balance=balance,
+        )
+        return notifier.wait_for_approval(request.request_id)
+
+    def _discard_unapproved_positions(self, reason: str) -> None:
+        """Drop this session's paper positions when the session is not approved.
+
+        The positions are opened inside the analysis rounds, BEFORE the human is
+        asked, so a REJECT used to leave them open. Nothing has been sent to the
+        broker (there is no order placement yet); when real orders are added they
+        must be placed only after approval.
+        """
+        positions = getattr(self.risk_manager, "positions", {})
+        removed = [t for t in list(self.final_invest) if positions.pop(t, None) is not None]
+        print(f"  Discarded {len(removed)} unapproved paper position(s): {removed} ({reason})")
+        try:
+            log_error(
+                ticker=",".join(removed) or "-",
+                date=datetime.now().strftime("%Y-%m-%d"),
+                error=f"session not approved: {reason}",
+                stage="approval",
+                context={"final_invest": list(self.final_invest), "discarded": removed},
+            )
+        except Exception as exc:
+            print(f"  WARNING: approval log failed ({exc})")
 
     # ======================================
     # SESSION SUMMARY
@@ -2308,6 +2344,11 @@ if __name__ == "__main__":
 
                 portfolio_value=
                     10_000,
+                # RAATS_USE_MT5 used to switch only the discovery filter, so the MT5 symbol
+                # lookup and the balance guard never ran from this entry point.
+                enable_mt5=os.environ.get(
+                    "RAATS_USE_MT5", ""
+                ).strip().lower() in ("1", "true", "yes"),
             )
         )
 
