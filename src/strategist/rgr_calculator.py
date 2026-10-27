@@ -14,7 +14,7 @@ class RGRCalculator:
           - Volatility_Scaling_Factor = k / (ATR_current / ATR_avg)
         """
 
-        def init(
+        def __init__(
             self,
             benchmark_ticker: str = "SPY",  # Default benchmark for equities
             volatility_lookback: int = 50,   # Periods for ATR average
@@ -65,14 +65,14 @@ class RGRCalculator:
             if self.benchmark_returns is not None:
                 # Convert to list for efficient appending (avoid DataFrame recreation)
                 if not hasattr(self, '_benchmark_closes'):
-                    self._benchmark_closes = list(benchmark_close)
+                    self._benchmark_closes = [float(benchmark_close)]
                 else:
                     self._benchmark_closes.append(float(benchmark_close))
                     # Keep only lookback window
                     if len(self._benchmark_closes) > self.volatility_lookback:
                         self._benchmark_closes.pop(0)
 
-        def _get_benchmark_returns(self) -> pd.Series:
+        def get_benchmark_returns(self) -> pd.Series:
             """Efficiently compute returns from stored close prices"""
             if not hasattr(self, '_benchmark_closes') or len(self._benchmark_closes) < 2:
                 return pd.Series([0.0])
@@ -102,8 +102,9 @@ class RGRCalculator:
             # RPR = Benchmark return over lookback + volatility-adjusted risk penalty
             if self.benchmark_returns is not None and len(self.benchmark_returns) > 0:
                 # Use stored benchmark returns for efficiency
-                benchmark_return = float(self._get_benchmark_returns().tail(
-                    min(20, len(self._benchmark_returns))
+                benchmark_returns = self.get_benchmark_returns()
+                benchmark_return = float(benchmark_returns.tail(
+                    min(20, len(benchmark_returns))
                 ).mean())
             else:
                 benchmark_return = 0.0
@@ -113,6 +114,8 @@ class RGRCalculator:
             rpr = benchmark_return + volatility_penalty
 
             # 3. Calculate Volatility_Scaling_Factor
+            volatility_ratio = None
+            atr_avg = None
             if len(self.atr_history) >= 10:  # Need minimum for stable average
                 atr_avg = np.mean(self.atr_history[-10:])  # Recent 10-period ATR avg
                 volatility_ratio = float(current_atr) / (atr_avg + 1e-9)  # Avoid division by zero
@@ -129,8 +132,8 @@ class RGRCalculator:
                 "rpr": float(rpr),
                 "volatility_scaling_factor": float(volatility_scaling_factor),
                 "atr_current": float(current_atr),
-                "atr_avg": float(atr_avg) if len(self.atr_history) >= 10 else None,
-                "volatility_ratio": float(volatility_ratio) if len(self.atr_history) >= 10 else None,
+                "atr_avg": float(atr_avg) if atr_avg is not None else None,
+                "volatility_ratio": float(volatility_ratio) if volatility_ratio is not None else None,
                 "benchmark_return": float(benchmark_return),
                 "volatility_penalty": float(volatility_penalty)
             }

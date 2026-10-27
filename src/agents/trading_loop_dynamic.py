@@ -47,6 +47,7 @@ or:
     waiting_list is exhausted.
 """
 
+import os
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
@@ -64,13 +65,25 @@ from src.data.discovery import (
 )
 
 from src.risk.risk_manager import RiskManager
+from src.data.rgr_screen import screen_candidate
+from src.data.mt5_bridge import enrich_final_invest, get_account_balance, notify_insufficient_balance
+from src.data.macro_events import is_trade_blocked_by_macro, MacroEventChecker
+from src.notifications.discord_notifier import DiscordNotifier
+from src.agents.middleware.summarization_middleware import SummarizationMiddleware
+
+# Trades are blocked below this MT5 balance (env RAATS_MIN_BALANCE overrides).
+MIN_ACCOUNT_BALANCE = float(os.environ.get("RAATS_MIN_BALANCE", "20"))
 from src.simulation.orchestrator import compute_performance_metrics
-from src.utils.logger import log_session_summary
 from src.utils.logger import (
-    log_cycle,
-    log_error,
-    log_sentiment_analysis,
+    log_daily_watchlist,
+    log_session_summary,
 )
+from src.utils.logger import (
+    log_error,
+)
+
+import json
+from pathlib import Path
 
 
 # ==========================================
@@ -419,7 +432,24 @@ class DynamicTradingManager:
         waiting_list: Any,
         portfolio_value: float = 10_000,
         analyst_model: Optional[str] = None,
+        enable_rgr_gate: bool = True,
+        rgr_threshold: float = 0.0,
+        rgr_hold_days: int = 5,
+        enable_mt5: bool = False,
     ):
+
+        # ----------------------------------
+        # RGR gate / MT5 configuration
+        # ----------------------------------
+
+        self.enable_rgr_gate = enable_rgr_gate
+        self.rgr_threshold = rgr_threshold
+        self.rgr_hold_days = rgr_hold_days
+        self.enable_mt5 = enable_mt5
+
+        self.rgr_results = {}      # ticker -> diagnostics
+        self.rgr_rejected = []     # tickers refused entry to active list
+        self.mt5_data = {}         # ticker -> MT5 info for final INVEST
 
         # ----------------------------------
         # Original discovery arrays
@@ -1087,6 +1117,80 @@ class DynamicTradingManager:
         return replacements_needed
 
     # ======================================
+    # RGR GATE
+    # ======================================
+
+    def _passes_rgr_gate(self, ticker: str) -> bool:
+        """
+        One of the tests for joining the active list.
+
+        Fails OPEN on data errors (insufficient history, download failure):
+        a data outage must not empty the whole list, and the analyst and
+        stability checks still apply afterwards.
+        """
+
+        if not self.enable_rgr_gate:
+            return True
+
+        try:
+            diag = screen_candidate(
+                ticker,
+                as_of=self.simulate_date,
+                hold_days=self.rgr_hold_days,
+                threshold=self.rgr_threshold,
+            )
+        except Exception as exc:
+            print(f"  RGR gate: {ticker} data error ({exc}) - allowed.")
+            return True
+
+        self.rgr_results[ticker] = diag
+
+        if diag.get("passed") is None:
+            print(
+                f"  RGR gate: {ticker} skipped "
+                f"({diag.get('error')}) - allowed."
+            )
+            return True
+
+        verdict = "PASS" if diag["passed"] else "REJECT"
+        print(
+            f"  RGR gate: {ticker} {verdict} | "
+            f"RGR={diag['rgr']:+.5f} "
+            f"(RoR={diag['ror']:+.4f}, RPR={diag['rpr']:.4f}, "
+            f"{diag['direction']}, threshold={self.rgr_threshold})"
+        )
+
+        if not diag["passed"]:
+            self.rgr_rejected.append(ticker)
+
+        return bool(diag["passed"])
+
+    def _screen_initial_active_list(self) -> None:
+        """
+        Apply the RGR gate to the initial top-10. Failures are removed and
+        backfilled from the waiting list (replacements are gated too).
+        """
+
+        if not self.enable_rgr_gate:
+            return
+
+        print("\n" + "=" * 60)
+        print("RGR SCREEN: INITIAL ACTIVE LIST")
+        print("=" * 60)
+
+        failed = [
+            t for t in list(self.active_list)
+            if not self._passes_rgr_gate(t)
+        ]
+
+        for t in failed:
+            self.active_list.remove(t)
+
+        if failed:
+            print(f"\nRGR removed {len(failed)}: {failed}")
+            self._get_replacements(len(failed))
+
+    # ======================================
     # GET REPLACEMENTS
     # ======================================
 
@@ -1149,6 +1253,13 @@ class DynamicTradingManager:
             if ticker in (
                 self.closed_positions_today
             ):
+                continue
+
+            # ----------------------------------
+            # RGR gate (before paying for news)
+            # ----------------------------------
+
+            if not self._passes_rgr_gate(ticker):
                 continue
 
             # ----------------------------------
@@ -1239,23 +1350,11 @@ class DynamicTradingManager:
         simulate_date: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Run the dynamic trading session.
-
-        Round 1:
-
-            Analyse initial Top-10.
-
-        Subsequent rounds:
-
-            HOLD/unresolved candidates are removed.
-
-            Waiting-list replacements receive fresh
-            news discovery and sentiment scoring.
-
-            Only the replacements are analysed.
-
-        Final INVEST candidates are never
-        analysed again.
+        Run the dynamic trading session with:
+        - Macro event blocking (FOMC, CPI, NFP windows)
+        - Discord approval for final INVEST list
+        - MT5 balance check (blocks if < $20)
+        - End-of-day summarization middleware
         """
 
         self.simulate_date = (
@@ -1282,7 +1381,39 @@ class DynamicTradingManager:
             "=" * 60
         )
 
+        # ==================================
+        # 1. MACRO EVENT CHECK - Block if high-impact event window
+        # ==================================
+        
+        check_time = None
+        if simulate_date:
+            import pandas as pd
+            check_time = pd.Timestamp(simulate_date)
+        
+        blocking_event = MacroEventChecker().is_event_window_active(
+            check_time=check_time,
+            min_impact="MEDIUM",
+        )
+        if blocking_event:
+            msg = f"🚫 TRADING BLOCKED: {blocking_event.name} ({blocking_event.event_type}) window active"
+            print(msg)
+            self._send_alert(msg)
+            return self.daily_results
+
+        # Balance at the START of the session, for the end-of-day summary
+        # (the middleware is built at session END, where it was always ~equal to closing).
+        self.starting_balance = (
+            get_account_balance() if self.enable_mt5 else None
+        )
+
+        # ==================================
+        # 2. PRE-MARKET SCAN & RGR SCREEN
+        # ==================================
+
         self.pre_market_scan()
+        self._log_watchlist_snapshot(include_open_trades=False)
+
+        self._screen_initial_active_list()
 
         replacement_round = 0
 
@@ -1467,12 +1598,134 @@ class DynamicTradingManager:
                 break
 
         # ==================================
-        # FINAL SUMMARY
+        # 3. MT5 DATA FOR FINAL INVEST LIST
+        #    (before approval, so the approver sees real symbols and spreads;
+        #    it used to be sent as {} and every ticker showed as N/A)
+        # ==================================
+
+        if self.enable_mt5 and self.final_invest:
+            self.mt5_data = enrich_final_invest(self.final_invest)
+
+        # ==================================
+        # 4. MINIMUM-BALANCE GUARD
+        #    (runs whether or not approval is required)
+        # ==================================
+
+        if self.final_invest and not self._balance_ok():
+            self._discard_unapproved_positions("insufficient balance")
+            return self.daily_results
+
+        # ==================================
+        # 5. DISCORD APPROVAL (if enabled)
+        # ==================================
+
+        require_approval = os.environ.get(
+            "RAATS_REQUIRE_APPROVAL", ""
+        ).lower() in ("1", "true", "yes")
+
+        if self.final_invest and require_approval:
+            response = self._request_human_approval()
+
+            if response != "APPROVE":
+                print(f"\u274c Session not approved ({response}).")
+                self._discard_unapproved_positions(response)
+                return self.daily_results
+
+            # Approval can take minutes: look at the balance again.
+            if not self._balance_ok():
+                self._discard_unapproved_positions(
+                    "insufficient balance after approval"
+                )
+                return self.daily_results
+
+        # ==================================
+        # 6. FINAL SUMMARY + SUMMARIZATION MIDDLEWARE
         # ==================================
 
         self._print_session_summary()
 
+        enable_discord_summary = os.environ.get(
+            "RAATS_DISCORD_SUMMARY", ""
+        ).lower() in ("1", "true", "yes")
+        middleware = SummarizationMiddleware(
+            enable_discord=enable_discord_summary,
+            starting_balance=getattr(self, "starting_balance", None),
+        )
+        session_results = {
+            "manager": self,
+            "results": self.daily_results,
+        }
+        middleware.process_session_end(session_results)
+
         return self.daily_results
+
+    def _get_notifier(self) -> DiscordNotifier:
+        """One Discord notifier per manager, created on first use."""
+        if getattr(self, "_notifier_obj", None) is None:
+            self._notifier_obj = DiscordNotifier()
+        return self._notifier_obj
+
+    def _send_alert(self, message: str) -> None:
+        """Post an alert to Discord (it is printed if Discord is not configured)."""
+        try:
+            self._get_notifier().send_alert(message)
+        except Exception as exc:
+            print(f"  WARNING: alert not sent ({exc})")
+
+    def _balance_ok(self) -> bool:
+        """False only when MT5 reports a balance below the minimum.
+
+        An unreadable balance does NOT block (the guard is skipped, loudly).
+        """
+        if not (self.enable_mt5 and self.final_invest):
+            return True
+        balance = get_account_balance()
+        if balance is None:
+            print("\u26a0\ufe0f  MT5 balance unavailable - minimum-balance guard NOT applied.")
+            return True
+        if balance < MIN_ACCOUNT_BALANCE:
+            notify_insufficient_balance(balance, MIN_ACCOUNT_BALANCE, self.final_invest)
+            return False
+        return True
+
+    def _request_human_approval(self) -> str:
+        """Ask on Discord and wait. Returns APPROVE | REJECT | MODIFY | TIMEOUT.
+
+        Replaces _wait_for_approval_file, which crashed immediately
+        (UnboundLocalError: it used `time` before its own `import time`) and
+        watched ~/.hermes/trading/approvals while requests were saved to
+        ./data/approvals, so an approval could never have been seen.
+        """
+        notifier = self._get_notifier()
+        balance = get_account_balance() if self.enable_mt5 else None
+        request = notifier.send_approval_request(
+            final_invest=list(self.final_invest),
+            mt5_data=getattr(self, "mt5_data", None) or {},
+            account_balance=balance,
+        )
+        return notifier.wait_for_approval(request.request_id)
+
+    def _discard_unapproved_positions(self, reason: str) -> None:
+        """Drop this session's paper positions when the session is not approved.
+
+        The positions are opened inside the analysis rounds, BEFORE the human is
+        asked, so a REJECT used to leave them open. Nothing has been sent to the
+        broker (there is no order placement yet); when real orders are added they
+        must be placed only after approval.
+        """
+        positions = getattr(self.risk_manager, "positions", {})
+        removed = [t for t in list(self.final_invest) if positions.pop(t, None) is not None]
+        print(f"  Discarded {len(removed)} unapproved paper position(s): {removed} ({reason})")
+        try:
+            log_error(
+                ticker=",".join(removed) or "-",
+                date=datetime.now().strftime("%Y-%m-%d"),
+                error=f"session not approved: {reason}",
+                stage="approval",
+                context={"final_invest": list(self.final_invest), "discarded": removed},
+            )
+        except Exception as exc:
+            print(f"  WARNING: approval log failed ({exc})")
 
     # ======================================
     # SESSION SUMMARY
@@ -1515,6 +1768,38 @@ class DynamicTradingManager:
             )
 
         return categories
+
+    def _open_trades_snapshot(self):
+        """Open positions from the session's one shared RiskManager."""
+        trades = []
+        for ticker, p in getattr(self.risk_manager, "positions", {}).items():
+            trades.append({
+                "ticker": ticker,
+                "direction": "LONG" if getattr(p, "direction", 1) == 1 else "SHORT",
+                "entry_price": getattr(p, "entry_price", None),
+                "size": getattr(p, "size", None),
+                "stop_loss": getattr(p, "stop_loss", None),
+                "take_profit": getattr(p, "take_profit", None),
+            })
+        return trades
+
+    def _log_watchlist_snapshot(self, include_open_trades: bool = False) -> None:
+        """Write the day's candidate arrays to the weekly JSONL log.
+
+        Called at start of day (arrays only) and end of day (arrays plus open
+        trades). random_list stays empty: discovery.py has no random-exploration
+        step, so there is nothing real to record there yet.
+        """
+        try:
+            log_daily_watchlist(
+                date=datetime.now().strftime("%Y-%m-%d"),
+                top50=list(self.ticker_universe),
+                random_list=[],
+                top10_active=list(self._initial_active),
+                open_trades=self._open_trades_snapshot() if include_open_trades else [],
+            )
+        except Exception as exc:  # logging must never break trading
+            print(f"  WARNING: daily watchlist log failed: {exc}")
 
     def _print_session_summary(
         self,
@@ -1583,6 +1868,27 @@ class DynamicTradingManager:
         print(
             self.replacement_history
         )
+
+        print(
+            f"\nRGR gate rejections "
+            f"({len(self.rgr_rejected)}):"
+        )
+
+        print(
+            self.rgr_rejected
+        )
+
+        if self.mt5_data:
+
+            print("\nMT5 DATA (final INVEST):")
+
+            for t, d in self.mt5_data.items():
+                print(
+                    f"  {t:<10} -> {str(d.get('mt5_symbol')):<10} "
+                    f"tradable={d.get('tradable')} "
+                    f"bid={d.get('bid')} ask={d.get('ask')} "
+                    f"spread_pts={d.get('spread_points')}"
+                )
 
         print(
             f"\nClosed positions today "
@@ -1825,6 +2131,7 @@ class DynamicTradingManager:
             ],
             metrics=metrics,
         )
+        self._log_watchlist_snapshot(include_open_trades=True)
 
     # ======================================
     # WAITLIST OPPORTUNITIES
@@ -1884,6 +2191,9 @@ def run_dynamic_trading_session(
     simulate_date: Optional[str] = None,
     portfolio_value: float = 10_000,
     analyst_model: Optional[str] = None,
+    enable_rgr_gate: bool = True,
+    rgr_threshold: float = 0.0,
+    enable_mt5: bool = False,
 ) -> Dict[str, Any]:
     """
     Run the dynamic trading session using
@@ -1900,6 +2210,9 @@ def run_dynamic_trading_session(
         waiting_list=waiting_list,
         portfolio_value=portfolio_value,
         analyst_model=analyst_model,
+        enable_rgr_gate=enable_rgr_gate,
+        rgr_threshold=rgr_threshold,
+        enable_mt5=enable_mt5,
     )
 
     results = (
@@ -1949,6 +2262,15 @@ def run_dynamic_trading_session(
             len(
                 manager.risk_manager.positions
             ),
+
+        "rgr_results":
+            manager.rgr_results,
+
+        "rgr_rejected":
+            manager.rgr_rejected,
+
+        "mt5_data":
+            manager.mt5_data,
 
         "performance_scores":
             manager.all_sentiment_scores,
@@ -2022,6 +2344,11 @@ if __name__ == "__main__":
 
                 portfolio_value=
                     10_000,
+                # RAATS_USE_MT5 used to switch only the discovery filter, so the MT5 symbol
+                # lookup and the balance guard never ran from this entry point.
+                enable_mt5=os.environ.get(
+                    "RAATS_USE_MT5", ""
+                ).strip().lower() in ("1", "true", "yes"),
             )
         )
 

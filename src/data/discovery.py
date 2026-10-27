@@ -11,6 +11,7 @@ from src.data.score_sentiment import (
     summarize_ticker_sentiment,
     save_scored_news,
 )
+from src.data.macro_events import is_trade_blocked_by_macro, MacroEventChecker
 
 
 # ==========================================
@@ -1082,6 +1083,8 @@ def render_top_50_and_news(
             ),
             "yfinance_news": yf_articles,
             "google_news": google_articles,
+            "mt5_symbol": getattr(row, "MT5_Symbol", None),
+            "mt5_spread_pct": getattr(row, "MT5_Spread_Pct", None),
         })
 
     # ------------------------------------------
@@ -1134,6 +1137,94 @@ def render_waiting_list(
         )
 
 
+def apply_mt5_filter(df_top_50):
+    """
+    Optional broker filter (env RAATS_USE_MT5=1).
+
+    Drops instruments the MT5 broker does not offer (or cannot trade right
+    now) BEFORE the top-10 / waiting-list arrays are cut and BEFORE any news
+    is fetched, so no LLM time is spent on untradable tickers. Survivors get
+    two extra columns: MT5_Symbol and MT5_Spread_Pct.
+
+    Fails OPEN: if MT5 is switched off, unavailable, or matches nothing, the
+    DataFrame is returned unchanged (with a loud warning when MT5 was asked
+    for but could not be used).
+    """
+
+    flag = os.environ.get("RAATS_USE_MT5", "").strip().lower()
+
+    if flag not in ("1", "true", "yes", "on"):
+        return df_top_50
+
+    print("\n=== MT5 BROKER FILTER ===")
+
+    try:
+        from src.data.mt5_bridge import enrich_final_invest
+
+        info = enrich_final_invest(
+            df_top_50["Ticker"].tolist()
+        )
+
+    except Exception as exc:
+
+        print(
+            f"  WARNING: MT5 filter failed ({exc}). "
+            f"NO broker filter applied."
+        )
+
+        return df_top_50
+
+    if not info:
+
+        print(
+            "  WARNING: MT5 unavailable (not installed, terminal "
+            "not running, or not logged in). NO broker filter applied."
+        )
+
+        return df_top_50
+
+    tradable = {
+        t for t, d in info.items() if d.get("tradable")
+    }
+
+    if not tradable:
+
+        print(
+            "  WARNING: MT5 reported ZERO tradable instruments "
+            "(symbol mapping wrong, or market closed with no ticks?). "
+            "NO broker filter applied."
+        )
+
+        return df_top_50
+
+    dropped = [
+        t for t in df_top_50["Ticker"] if t not in tradable
+    ]
+
+    print(
+        f"  Tradable on broker: {len(tradable)} / {len(df_top_50)}"
+    )
+
+    if dropped:
+        print(f"  Dropped (not tradable): {dropped}")
+
+    kept = (
+        df_top_50[df_top_50["Ticker"].isin(tradable)]
+        .reset_index(drop=True)
+        .copy()
+    )
+
+    kept["MT5_Symbol"] = kept["Ticker"].map(
+        lambda t: info[t].get("mt5_symbol")
+    )
+
+    kept["MT5_Spread_Pct"] = kept["Ticker"].map(
+        lambda t: info[t].get("spread_pct")
+    )
+
+    return kept
+
+
 # ==========================================
 # MAIN
 # ==========================================
@@ -1180,6 +1271,23 @@ def main():
             market_universe
         )
     )
+
+    # ------------------------------------------
+    # 3b. Optional MT5 broker filter (RAATS_USE_MT5=1)
+    # ------------------------------------------
+
+    df_top_50 = apply_mt5_filter(
+        df_top_50
+    )
+
+    # ------------------------------------------
+    # 3c. Macro event check - block if high-impact event window
+    # ------------------------------------------
+    
+    if is_trade_blocked_by_macro(min_impact="MEDIUM"):
+        print("🚫 MACRO EVENT WINDOW ACTIVE - Discovery blocked")
+        print("   Set RAATS_MACRO_API_KEY for live calendar or update macro_calendar.json")
+        return pd.DataFrame(), [], pd.DataFrame()
 
     # ------------------------------------------
     # 4. Build THREE arrays

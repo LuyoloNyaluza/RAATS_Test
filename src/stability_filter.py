@@ -1,9 +1,9 @@
- import numpy as np
-    import pandas as pd
-    from typing import Tuple
+import numpy as np
+import pandas as pd
+from typing import Tuple
 
-    class MarketStabilityFilter:
-        def init(
+class MarketStabilityFilter:
+        def __init__(
             self,
             adx_threshold: float = 25.0,
             spread_z_threshold: float = 1.5,

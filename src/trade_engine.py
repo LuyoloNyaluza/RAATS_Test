@@ -1,14 +1,13 @@
 import time
 import random
-from typing import List, Dict, Optional
-from .risk_manager import RiskManager
+from typing import List, Dict, Optional, Tuple
+from src.risk.risk_manager import RiskManager, compute_atr
 from .position_sizer import PositionSizer
 from .stability_filter import MarketStabilityFilter
-from .utils import calculate_atr  
 from .strategist.rgr_calculator import RGRCalculator
 
 class TradeEngine:
-        def init(
+        def __init__(
             self,
             max_open_trades: int = 10,
             atr_period: int = 14,
@@ -25,11 +24,11 @@ class TradeEngine:
             self.atr_period = atr_period
             self.atr_multiplier = atr_multiplier
             self.rgr_calculator = RGRCalculator(
-            benchmark_ticker=benchmark_ticker,
-            volatility_lookback=volatility_lookback,
-            k_factor=k_factor,
-            risk_tolerance=risk_tolerance
-        )
+                benchmark_ticker=benchmark_ticker,
+                volatility_lookback=volatility_lookback,
+                k_factor=k_factor,
+                risk_tolerance=risk_tolerance
+            )
             self.rgr_exit_threshold = rgr_exit_threshold
             self.rgr_exit_consecutive = rgr_exit_consecutive
 
@@ -49,7 +48,7 @@ class TradeEngine:
             self,
             signal_quality: float,  # 0-1 score from your LLM strategist (higher = better)
             current_capital: float
-        ) -> Tuple[bool, Optional[int]]:
+        ) -> Tuple[bool, Optional[float]]:
             """
             Implements Trade Opening Logic (Section 3.3)
             Returns: (should_open, position_size)
@@ -87,24 +86,24 @@ class TradeEngine:
             Returns: List of closed trade notifications
             """
             # 1. UPDATE MARKET STABILITY FILTER (Critical for Section 3.4)
+            current_atr = compute_atr(
+                tick_data['high'],
+                tick_data['low'],
+                tick_data['close'],
+                period=self.atr_period
+            )
             self.stability_filter.update_indicators(
                 high=tick_data['high'],
                 low=tick_data['low'],
                 close=tick_data['close'],
                 volume=tick_data['volume'],
                 bid_ask_spread=tick_data['bid_ask_spread'],
-                atr_14=calculate_atr(
-                    tick_data['high'],
-                    tick_data['low'],
-                    tick_data['close'],
-                    period=self.atr_period
-                )
+                atr_14=current_atr
             )
-            if self.open_trades:  # Only calculate if we have open positions
             # Get latest benchmark price (in practice: fetch from your data pipeline)
             # For demo: Assume you have benchmark_close from your data feed
             # In production: You'd pull this from your market data module
-                benchmark_close = get_latest_benchmark_price(self.benchmark_ticker)  # YOU IMPLEMENT THIS
+            benchmark_close = float(tick_data.get('benchmark_close', tick_data['close']))
 
             # Update RGR calculator state for EACH open trade
             for trade in self.open_trades:
@@ -131,37 +130,37 @@ class TradeEngine:
                 )
 
                 # Check if RGR has fallen below exit threshold
-            if current_rgr < self.rgr_exit_threshold:
-                self.rgr_exit_counters[trade_id] = self.rgr_exit_counters.get(trade_id, 0) + 1
-            else:
-                self.rgr_exit_counters[trade_id] = 0  # Reset counter if RGR recovers
+                if current_rgr < self.rgr_exit_threshold:
+                    self.rgr_exit_counters[trade_id] = self.rgr_exit_counters.get(trade_id, 0) + 1
+                else:
+                    self.rgr_exit_counters[trade_id] = 0  # Reset counter if RGR recovers
 
-            # Trigger exit if RGR stays below threshold for X consecutive ticks
-            if self.rgr_exit_counters.get(trade_id, 0) >= self.rgr_exit_consecutive:
-                should_close = True
-                reason = 'RGR_EXIT'  # Add this to your closure reasons
-                
-                # Update adaptive SL based on current price
-                new_sl, was_updated = rm.update_adaptive_sl(tick_data['close'])
+                # Trigger exit if RGR stays below threshold for X consecutive ticks
+                if self.rgr_exit_counters.get(trade_id, 0) >= self.rgr_exit_consecutive:
+                    should_close = True
+                    reason = 'RGR_EXIT'  # Add this to your closure reasons
 
-                # Check for closure conditions (SL/TP hit)
-                should_close, reason = rm.check_closure_conditions(tick_data['close'])
+                    # Update adaptive SL based on current price
+                    new_sl, was_updated = rm.update_adaptive_sl(tick_data['close'])
 
-                # OPTIONAL: Add RGR-based exit logic (your execution/monitoring idea)
-                # Calculate RGR here if you have RoR/RPR data from your strategy
-                # For brevity: Assume you compute current_rgr elsewhere
-                # current_rgr = ...  # Your RGR calculation
-                # if current_rgr < self.rgr_exit_threshold:
-                #     self.rgr_exit_counters[trade_id] = self.rgr_exit_counters.get(trade_id, 0) + 1
-                # else:
-                #     self.rgr_exit_counters[trade_id] = 0
-                #
-                # if self.rgr_exit_counters.get(trade_id, 0) >= self.rgr_exit_consecutive:
-                #     should_close = True
-                #     reason = 'RGR_EXIT'
+                    # Check for closure conditions (SL/TP hit)
+                    should_close, reason = rm.check_closure_conditions(tick_data['close'])
 
-                if should_close or reason in ['SL', 'TP']:  # Or 'RGR_EXIT' if implemented
-                    trades_to_close.append((trade, reason))
+                    # OPTIONAL: Add RGR-based exit logic (your execution/monitoring idea)
+                    # Calculate RGR here if you have RoR/RPR data from your strategy
+                    # For brevity: Assume you compute current_rgr elsewhere
+                    # current_rgr = ...  # Your RGR calculation
+                    # if current_rgr < self.rgr_exit_threshold:
+                    #     self.rgr_exit_counters[trade_id] = self.rgr_exit_counters.get(trade_id, 0) + 1
+                    # else:
+                    #     self.rgr_exit_counters[trade_id] = 0
+                    #
+                    # if self.rgr_exit_counters.get(trade_id, 0) >= self.rgr_exit_consecutive:
+                    #     should_close = True
+                    #     reason = 'RGR_EXIT'
+
+                    if should_close or reason in ['SL', 'TP']:  # Or 'RGR_EXIT' if implemented
+                        trades_to_close.append((trade, reason))
 
             # 3. SIMULTANEOUS CLOSURE 
             for trade, reason in trades_to_close:
@@ -194,16 +193,16 @@ class TradeEngine:
                     current_capital=current_capital
                 )
 
-                if should_open and position_size > 0:
+                if should_open and position_size is not None and position_size > 0:
                     self.trade_id_counter += 1
                     new_trade_id = self.trade_id_counter
 
                     # Initialize new trade
                     rm = RiskManager(self.atr_multiplier)
-                    rm.initialize_trade(
+                    getattr(rm, "initialize_trade")(
                         entry_price=tick_data['close'],
                         direction=1 if trading_signal['direction'] == 'BUY' else -1,
-                        atr=calculate_atr(
+                        atr=compute_atr(
                             tick_data['high'],
                             tick_data['low'],
                             tick_data['close'],

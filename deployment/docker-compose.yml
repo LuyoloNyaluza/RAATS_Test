@@ -76,8 +76,17 @@ services:
     depends_on:
       - prometheus
     restart: unless-stopped
+  
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+
 volumes:
   ollama_data: {}
   postgres_data: {}
   chroma_data: {}
   grafana_data: {}
+  node_exporter_data: {}
