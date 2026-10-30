@@ -19,6 +19,7 @@ while Unstable-and-flat tickers still correctly defer to observation
 with no new entry considered.
 """
 
+import inspect
 import os
 import time
 from datetime import datetime
@@ -316,9 +317,17 @@ def build_daily_cycle_terminal_output(
         "executed",
         False,
     )
-
+    stop_loss = result.get(
+        "stop_loss",
+        None
+    )
+    take_profit = result.get(
+        "take_profit",
+        None
+    )
     executed_price = result.get(
-        "executed_price"
+        "executed_price",
+        None
     )
 
     risk_note = result.get(
@@ -341,6 +350,9 @@ def build_daily_cycle_terminal_output(
         f"Executed:    {executed} @ {executed_price}\n"
         "\n"
         f"Risk note:   {risk_note}\n"
+        "\n"
+        f"Stop loss:   {stop_loss}\n"
+        f"Take profit: {take_profit}\n"
         "\n"
         f"Latencies:   {latencies}"
     )
@@ -394,13 +406,30 @@ def run_daily_cycle(
         print(terminal_output)
     signal = str(final_state.get("llm_signal") or final_state.get("signal") or "")
     try:
-        log_cycle(
+        _cycle_kwargs = dict(
             ticker=ticker,
             signal=signal,
             executed_price=final_state.get("executed_price"),
             latencies=final_state.get("latencies", {}),
             pnl=final_state.get("closed_trade", {}).get("pnl", 0.0),
         )
+        # Extra fields are passed only if src.utils.logger.log_cycle accepts them,
+        # so this works before and after logger.py is updated.
+        _extras = {
+            "stop_loss": final_state.get("stop_loss"),
+            "take_profit": final_state.get("take_profit"),
+            "direction": final_state.get("direction"),
+            "position_size": final_state.get("position_size"),
+        }
+        try:
+            _params = inspect.signature(log_cycle).parameters
+            if any(p.kind is p.VAR_KEYWORD for p in _params.values()):
+                _cycle_kwargs.update(_extras)
+            else:
+                _cycle_kwargs.update({k: v for k, v in _extras.items() if k in _params})
+        except (TypeError, ValueError):
+            pass
+        log_cycle(**_cycle_kwargs)
     except Exception as exc:  # logging must never break the trading cycle
         print(f"  WARNING: cycle log failed for {ticker}: {exc}")
     try:

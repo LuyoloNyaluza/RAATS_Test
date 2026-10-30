@@ -153,6 +153,10 @@ def log_cycle(
     latencies: dict,
     pnl: float = 0.0,
     log_dir: str = LOG_DIR,
+    direction: Optional[str] = None,
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+    position_size: Optional[float] = None,
 ) -> dict:
     """
     Append one trading-cycle entry to:
@@ -176,6 +180,14 @@ def log_cycle(
         "latencies_ms": latencies,
 
         "pnl": pnl,
+
+        "direction": direction,
+
+        "stop_loss": stop_loss,
+
+        "take_profit": take_profit,
+
+        "position_size": position_size,
     }
 
     return _write_jsonl_entry(
@@ -366,6 +378,7 @@ def log_session_summary(
     hold_list: list,
     metrics: dict,
     log_dir: str = LOG_DIR,
+    open_positions: Optional[dict] = None,
 ) -> dict:
     """
     Append one end-of-session summary to:
@@ -387,6 +400,8 @@ def log_session_summary(
         "hold_list": hold_list,
 
         "metrics": metrics,
+
+        "open_positions": open_positions or {},
     }
 
     return _write_jsonl_entry(

@@ -66,6 +66,7 @@ class SummarizationMiddleware:
             waitlist=manager.waitlist,
             hold_list=[h["ticker"] for h in manager.hold_history],
             metrics=summary["metrics"],
+            open_positions=summary.get("open_positions"),
         )
 
         # 4. Post to Discord if enabled
@@ -132,6 +133,21 @@ class SummarizationMiddleware:
             else None
         )
 
+        # Every open position with its levels, so the day's SL/TP are on record.
+        open_positions = {
+            t: {
+                "direction": "LONG" if p.direction == 1 else "SHORT",
+                "entry_price": p.entry_price,
+                "size": p.size,
+                "stop_loss": p.stop_loss,
+                "take_profit": p.take_profit,
+                "risk_unit": p.risk_unit,
+                "locked_rr": p.locked_rr,
+                "max_rr_seen": p.max_rr_seen,
+            }
+            for t, p in manager.risk_manager.positions.items()
+        }
+
         now = datetime.now()
         week_num = now.isocalendar()[1]
         day_name = now.strftime("%A")
@@ -159,6 +175,8 @@ class SummarizationMiddleware:
             "categories": {k: v for k, v in categories.items() if v},
             "metrics": metrics,
             "portfolio_summary": manager.risk_manager.portfolio_summary(),
+            "open_positions": open_positions,
+            "mt5_order_plan": getattr(manager, "mt5_order_plan", {}),
             "closed_positions": manager.closed_positions_today,
         }
 
@@ -273,6 +291,12 @@ class SummarizationMiddleware:
                                 ("max_drawdown_pct", "Max drawdown", "{:.2f}%")):
             if m.get(key) is not None:
                 lines.append(f"**{label}:** " + fmt.format(m[key]))
+
+        for t, p in (summary.get("open_positions") or {}).items():
+            lines.append(
+                f"  {t} {p['direction']} @ {p['entry_price']:.4f} | "
+                f"SL {p['stop_loss']:.4f} | TP {p['take_profit']:.4f}"
+            )
 
         if summary.get("rgr_rejected"):
             lines.append(f"**RGR rejected:** {', '.join(summary['rgr_rejected'])}")
