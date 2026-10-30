@@ -465,6 +465,8 @@ def run_watchlist(
                 "signal": "ERROR",
                 "confidence": 0.0,
                 "executed": False,
+                "stop_loss": None,
+                "take_profit": None,
                 "executed_price": None,
                 "risk_reason": str(exc),
                 "stability_status": "n/a",
@@ -474,6 +476,8 @@ def run_watchlist(
     for r in results:
         print(f"{r.get('ticker', '?'):6s} | {str(r.get('stability_status')):9s} | "
               f"signal: {str(r.get('llm_signal') or r.get('signal')):5s} | "
+              f"stop_loss: {str(r.get('stop_loss')):5s} | " 
+              f"take_profit: {str(r.get('take_profit')):5s} | "
               f"executed: {str(r.get('executed')):5s} | {r.get('risk_reason')}")
 
     print("\nPortfolio:", risk_manager.portfolio_summary())

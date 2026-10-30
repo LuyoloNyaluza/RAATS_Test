@@ -66,13 +66,80 @@ from src.data.discovery import (
 
 from src.risk.risk_manager import RiskManager
 from src.data.rgr_screen import screen_candidate
-from src.data.mt5_bridge import enrich_final_invest, get_account_balance, notify_insufficient_balance
+from src.data.mt5_sizing import build_order_plan, format_order_plan
+from src.data.reserve_tickers import build_reserve, normalize as _norm_ticker
+from src.data.mt5_bridge import (
+    enrich_final_invest, get_account_balance, notify_insufficient_balance,
+    initialize_mt5, shutdown_mt5, is_mt5_tradable,
+)
 from src.data.macro_events import is_trade_blocked_by_macro, MacroEventChecker
 from src.notifications.discord_notifier import DiscordNotifier
 from src.agents.middleware.summarization_middleware import SummarizationMiddleware
 
 # Trades are blocked below this MT5 balance (env RAATS_MIN_BALANCE overrides).
 MIN_ACCOUNT_BALANCE = float(os.environ.get("RAATS_MIN_BALANCE", "20"))
+
+
+# One-time reserve: used only when the top 50 and the waiting list are exhausted AND
+# fewer than this many tickers reached the final INVEST list.
+MIN_FINAL_INVEST_BEFORE_RESERVE = 5
+
+
+def balance_status(balance: Optional[float]) -> Optional[Dict[str, Any]]:
+    """None when the balance is fine (or unknown); otherwise the shortfall details."""
+    if balance is None or balance >= MIN_ACCOUNT_BALANCE:
+        return None
+    return {
+        "balance": float(balance),
+        "min_balance": MIN_ACCOUNT_BALANCE,
+        "shortfall": MIN_ACCOUNT_BALANCE - float(balance),
+    }
+
+
+def check_minimum_balance() -> Optional[Dict[str, Any]]:
+    """Read the MT5 balance and return balance_status() of it.
+
+    Independent of enable_mt5: the guard used to run only when enable_mt5 was True, so
+    a $0.74 account was still allowed to trade. An unreadable balance does not block.
+    """
+    balance = get_account_balance()
+    if balance is None:
+        print("\u26a0\ufe0f  MT5 balance unavailable - minimum-balance guard NOT applied.")
+        return None
+    return balance_status(balance)
+
+
+def report_blocked_session(
+    balance_check: Dict[str, Any], tickers: Optional[List[str]] = None
+) -> None:
+    """Print the blocked-session summary, alert on Discord, and record the session."""
+    shortfall = balance_check["shortfall"]
+    print("\n" + "=" * 60)
+    print("TRADING SESSION SUMMARY - BLOCKED")
+    print("=" * 60)
+    print(f"Account balance:   ${balance_check['balance']:,.2f}")
+    print(f"Minimum required:  ${balance_check['min_balance']:,.2f}")
+    print(f"Short by:          ${shortfall:,.2f}")
+    print("Open trades:       0 (no trades were opened)")
+    if tickers:
+        print(f"Blocked tickers:   {', '.join(tickers)}")
+    print(f"\nPlease deposit at least ${shortfall:,.2f} to resume trading.")
+
+    # Discord alert + data/approvals/insufficient_funds_<week>.jsonl
+    notify_insufficient_balance(
+        balance_check["balance"], balance_check["min_balance"], tickers
+    )
+    try:
+        SummarizationMiddleware(
+            starting_balance=balance_check["balance"]
+        ).record_blocked_session(
+            balance=balance_check["balance"],
+            min_balance=balance_check["min_balance"],
+            shortfall=shortfall,
+            tickers=tickers,
+        )
+    except Exception as exc:
+        print(f"  WARNING: blocked-session record failed ({exc})")
 from src.simulation.orchestrator import compute_performance_metrics
 from src.utils.logger import (
     log_daily_watchlist,
@@ -549,6 +616,11 @@ class DynamicTradingManager:
         self.hold_history = []
 
         self.replacement_history = []
+
+        # One-time reserve (30 extra tickers) state
+        self.reserve_loaded = False
+        self.mt5_order_plan = {}
+        self.reserve_info = {}
 
         # Store simulation date
         self.simulate_date = None
@@ -1215,6 +1287,98 @@ class DynamicTradingManager:
                 self.waitlist.append(ticker)
                 added += 1
 
+    # ----------------------------------
+    # One-time reserve of 30 extra tickers
+    # ----------------------------------
+    def _known_tickers(self) -> set:
+        """Every ticker this session has already seen, in any state."""
+        known = set()
+
+        def add(item: Any) -> None:
+            if isinstance(item, dict):
+                item = item.get("ticker")
+            if item:
+                known.add(_norm_ticker(item))
+
+        for coll in (
+            self.ticker_universe, self._initial_active, self._initial_waitlist,
+            self.active_list, self.waitlist, self.final_invest,
+            self.replacement_history, self.rgr_rejected, self.rgr_results.keys(),
+            self.closed_positions_today, self.hold_history, self.daily_results,
+        ):
+            for item in coll:
+                add(item)
+        return known
+
+    def _load_reserve(self) -> bool:
+        """Add up to 30 reserve tickers (10 trending, 10 world indices, 10 most active).
+
+        Runs once, only when the top 50 and the waiting list are exhausted and fewer
+        than MIN_FINAL_INVEST_BEFORE_RESERVE tickers reached the final INVEST list.
+        The new tickers join the top-50 universe and the waiting list; the caller
+        then draws the next top-10 from the waiting list as usual (RGR gate and
+        fresh news discovery included). Skipped in historical simulation, where
+        today's Yahoo pages would be look-ahead.
+
+        Returns True if at least one new ticker was added.
+        """
+        if self.reserve_loaded or self.simulate_date:
+            return False
+        if len(self.final_invest) >= MIN_FINAL_INVEST_BEFORE_RESERVE:
+            return False
+
+        self.reserve_loaded = True   # one attempt per session, success or not
+
+        print("\n" + "=" * 60)
+        print(
+            f"RESERVE: top 50 and waiting list exhausted with only "
+            f"{len(self.final_invest)} final INVEST (< {MIN_FINAL_INVEST_BEFORE_RESERVE})"
+        )
+        print("=" * 60)
+
+        # With MT5 on, only keep tickers the broker can trade (indices especially),
+        # so reserve slots are not spent on symbols that can never reach an order.
+        accept = None
+        mt5_open = False
+        if self.enable_mt5:
+            mt5_open = initialize_mt5()
+            if mt5_open:
+                accept = is_mt5_tradable
+            else:
+                print("  MT5 unavailable - reserve NOT filtered by tradability.")
+
+        try:
+            reserve = build_reserve(exclude=self._known_tickers(), accept=accept)
+        except Exception as exc:
+            print(f"  Reserve fetch failed: {exc}")
+            return False
+        finally:
+            if mt5_open:
+                shutdown_mt5()
+
+        self.reserve_info = reserve
+        new = reserve["tickers"]
+        for name, tickers in reserve["by_source"].items():
+            print(f"  {name:<14} via {reserve['methods'][name]:<14} {len(tickers):>2}: {tickers}")
+            dup = reserve["duplicates_dropped"][name]
+            if dup:
+                print(f"  {'':<14} duplicates skipped: {dup}")
+            nt = reserve["untradable_dropped"][name]
+            if nt:
+                print(f"  {'':<14} not tradable on MT5, skipped: {nt}")
+
+        if not new:
+            print("  No new reserve tickers available.")
+            return False
+
+        # top 50 -> 80; point past the end so the reserve is not added twice
+        self.ticker_universe.extend(new)
+        self._next_universe_index = len(self.ticker_universe)
+        self.waitlist.extend(t for t in new if t not in self.waitlist)
+
+        print(f"  Added {len(new)} reserve tickers to the universe and waiting list.")
+        return True
+
     def _get_replacements(
         self,
         number_needed: int,
@@ -1400,11 +1564,16 @@ class DynamicTradingManager:
             self._send_alert(msg)
             return self.daily_results
 
-        # Balance at the START of the session, for the end-of-day summary
-        # (the middleware is built at session END, where it was always ~equal to closing).
-        self.starting_balance = (
-            get_account_balance() if self.enable_mt5 else None
-        )
+        # Balance at the START of the session, for the end-of-day summary only.
+        # (Not a guard any more.) Also the balance at the START of the session for the end-of-day summary.
+        # Skipped for historical simulations: the live account says nothing about them.
+        self.starting_balance = None
+        if not simulate_date:
+            self.starting_balance = get_account_balance()
+            if self.starting_balance is None:
+                print("\u26a0\ufe0f  MT5 balance unavailable - minimum-balance guard NOT applied.")
+            # Read only: discovery and analysis are never stopped by the balance.
+            # The guard runs once, after every ticker has been tested (step 4).
 
         # ==================================
         # 2. PRE-MARKET SCAN & RGR SCREEN
@@ -1443,7 +1612,8 @@ class DynamicTradingManager:
                         "Waiting list exhausted."
                     )
 
-                    break
+                    if not self._load_reserve():
+                        break
 
                 # Need enough candidates to
                 # reach the target.
@@ -1566,6 +1736,13 @@ class DynamicTradingManager:
                     )
                 )
 
+                if not replacements and not self.waitlist:
+                    # waiting list used up: one-time reserve, then draw again
+                    if self._load_reserve():
+                        replacements = self._get_replacements(
+                            vacancies
+                        )
+
                 if not replacements:
 
                     print(
@@ -1590,12 +1767,9 @@ class DynamicTradingManager:
                 and not self.waitlist
             ):
 
-                print(
-                    "\nActive and waiting lists "
-                    "are exhausted."
-                )
-
-                break
+                # The top of the loop tries the one-time reserve, and
+                # breaks if there is nothing left.
+                continue
 
         # ==================================
         # 3. MT5 DATA FOR FINAL INVEST LIST
@@ -1605,15 +1779,19 @@ class DynamicTradingManager:
 
         if self.enable_mt5 and self.final_invest:
             self.mt5_data = enrich_final_invest(self.final_invest)
+            # Adapter only: converts RAATS positions to MT5 lots/levels, changes no risk logic.
+            self.mt5_order_plan = build_order_plan(self.risk_manager, self.mt5_data)
+            print("\n" + format_order_plan(self.mt5_order_plan))
 
         # ==================================
         # 4. MINIMUM-BALANCE GUARD
         #    (runs whether or not approval is required)
         # ==================================
 
-        if self.final_invest and not self._balance_ok():
-            self._discard_unapproved_positions("insufficient balance")
-            return self.daily_results
+        if self.final_invest and not simulate_date:
+            balance_check = check_minimum_balance()
+            if balance_check:
+                return self._block_for_balance(balance_check)
 
         # ==================================
         # 5. DISCORD APPROVAL (if enabled)
@@ -1632,11 +1810,11 @@ class DynamicTradingManager:
                 return self.daily_results
 
             # Approval can take minutes: look at the balance again.
-            if not self._balance_ok():
-                self._discard_unapproved_positions(
-                    "insufficient balance after approval"
+            balance_check = None if simulate_date else check_minimum_balance()
+            if balance_check:
+                return self._block_for_balance(
+                    balance_check, "insufficient balance after approval"
                 )
-                return self.daily_results
 
         # ==================================
         # 6. FINAL SUMMARY + SUMMARIZATION MIDDLEWARE
@@ -1672,32 +1850,46 @@ class DynamicTradingManager:
         except Exception as exc:
             print(f"  WARNING: alert not sent ({exc})")
 
-    def _balance_ok(self) -> bool:
-        """False only when MT5 reports a balance below the minimum.
+    def _block_for_balance(
+        self, balance_check: Dict[str, Any], reason: str = "insufficient balance"
+    ) -> List[Dict[str, Any]]:
+        """Stop the session because the account is below the minimum.
 
-        An unreadable balance does NOT block (the guard is skipped, loudly).
+        Drops this session's paper positions (if any were opened), prints the blocked
+        summary, alerts on Discord with the amount to deposit, and records the session.
         """
-        if not (self.enable_mt5 and self.final_invest):
-            return True
-        balance = get_account_balance()
+        tickers = list(self.final_invest)
+        if tickers:
+            self._discard_unapproved_positions(reason)
+        report_blocked_session(balance_check, tickers)
+        return self.daily_results
+
+    def _print_account_balance(self) -> None:
+        """Account-balance section of the session summary."""
+        print("\n" + "=" * 60)
+        print("ACCOUNT BALANCE")
+        print("=" * 60)
+        if getattr(self, "simulate_date", None):
+            print("Balance check:     skipped (historical simulation)")
+            return
+        balance = getattr(self, "starting_balance", None)
         if balance is None:
-            print("\u26a0\ufe0f  MT5 balance unavailable - minimum-balance guard NOT applied.")
-            return True
+            print("Account balance:   unavailable (MT5 not connected) - guard not applied")
+            return
+        print(f"Account balance:   ${balance:,.2f}")
+        print(f"Minimum required:  ${MIN_ACCOUNT_BALANCE:,.2f}")
         if balance < MIN_ACCOUNT_BALANCE:
-            notify_insufficient_balance(balance, MIN_ACCOUNT_BALANCE, self.final_invest)
-            return False
-        return True
+            print(f"Status:            BELOW MINIMUM - short by ${MIN_ACCOUNT_BALANCE - balance:,.2f}")
+        else:
+            print("Status:            OK")
 
     def _request_human_approval(self) -> str:
         """Ask on Discord and wait. Returns APPROVE | REJECT | MODIFY | TIMEOUT.
 
-        Replaces _wait_for_approval_file, which crashed immediately
-        (UnboundLocalError: it used `time` before its own `import time`) and
-        watched ~/.hermes/trading/approvals while requests were saved to
-        ./data/approvals, so an approval could never have been seen.
+      
         """
         notifier = self._get_notifier()
-        balance = get_account_balance() if self.enable_mt5 else None
+        balance = get_account_balance()
         request = notifier.send_approval_request(
             final_invest=list(self.final_invest),
             mt5_data=getattr(self, "mt5_data", None) or {},
@@ -2123,6 +2315,8 @@ class DynamicTradingManager:
         # Logger
         # ==================================
 
+        self._print_account_balance()
+
         log_session_summary(
             active_list=self.active_list,
             waitlist=self.waitlist,
@@ -2272,6 +2466,12 @@ def run_dynamic_trading_session(
         "mt5_data":
             manager.mt5_data,
 
+        "mt5_order_plan":
+            manager.mt5_order_plan,
+
+        "reserve_tickers":
+            manager.reserve_info.get("tickers", []),
+
         "performance_scores":
             manager.all_sentiment_scores,
 
@@ -2287,6 +2487,18 @@ def run_dynamic_trading_session(
 # ==========================================
 # MAIN
 # ==========================================
+
+def _live_portfolio_value(default: float = 10_000) -> float:
+    """MT5 balance when MT5 is enabled and readable; otherwise the old 10,000 default.
+
+    Read only - it never blocks. Without this, a $20 account was sized as if it had
+    $10,000 (50% = $5,000 per trade) the moment real orders are placed.
+    """
+    if os.environ.get("RAATS_USE_MT5", "").strip().lower() not in ("1", "true", "yes"):
+        return default
+    balance = get_account_balance()
+    return float(balance) if balance else default
+
 
 if __name__ == "__main__":
 
@@ -2343,7 +2555,7 @@ if __name__ == "__main__":
                     waiting_list,
 
                 portfolio_value=
-                    10_000,
+                    _live_portfolio_value(),
                 # RAATS_USE_MT5 used to switch only the discovery filter, so the MT5 symbol
                 # lookup and the balance guard never ran from this entry point.
                 enable_mt5=os.environ.get(
