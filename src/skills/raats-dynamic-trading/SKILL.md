@@ -10,16 +10,17 @@ version: "1.1.0"
 
 Runs the full RAATS pipeline, in this order:
 
+0. **Balance guard** (entry point, before anything else) - reads the MT5 balance; below `RAATS_MIN_BALANCE` (default $20) the run stops here: no discovery, no LLM time, no trades. See "Minimum-balance guard".
 1. **Discovery** (`discovery.main()`) - day-gainers screener, previous-session returns, optional MT5 broker filter, macro check, then the three arrays: top 50, top 10 (with news), waiting list.
 2. **Macro event check** - blocks the session inside a high-impact event window.
-3. **Starting balance** - read once from MT5 (only when MT5 is enabled) for the end-of-day summary.
+3. **Session-start balance guard** - the same check again inside the trading loop (for programmatic callers); also records the starting balance for the summary. Skipped for historical simulations.
 4. **RGR gate** - every ticker must pass `rgr_screen.screen_candidate()` to join the active list (initial top 10 and every waiting-list replacement).
 5. **Analysis rounds** - collector, stability, analyst, executor; HOLD tickers are replaced from the waiting list until every active ticker is INVEST or the waiting list is empty. Paper positions are opened during these rounds.
-6. **MT5 data for the final INVEST list** - broker symbol, tradable flag, spread (so the approver sees them).
-7. **Minimum-balance guard** - blocks the session if the MT5 balance is below `RAATS_MIN_BALANCE` (default $20). Runs whether or not approval is required.
+6. **MT5 data for the final INVEST list** (`RAATS_USE_MT5` / `enable_mt5`) - broker symbol, tradable flag, spread, so the approver sees them.
+7. **Balance guard again** - last check before anything is approved.
 8. **Discord approval** (optional) - you react on the message. Anything other than APPROVE discards this session's paper positions.
 9. **Balance re-check** after approval.
-10. **Summary** - JSONL summary, standard logger, optional Discord post.
+10. **Summary** - terminal summary (with an ACCOUNT BALANCE section), JSONL record, standard logger, optional Discord post.
 
 ## Quick start (Windows PowerShell)
 
@@ -30,7 +31,7 @@ $env:DISCORD_CHANNEL_ID  = "..."        # channel the bot posts in
 $env:DISCORD_APPROVER_ID = "..."        # YOUR Discord user id - the only person who can approve
 
 # Behaviour
-$env:RAATS_USE_MT5           = "1"      # MT5 filter in discovery AND symbol lookup + balance guard in the loop
+$env:RAATS_USE_MT5           = "1"      # MT5 broker filter in discovery + symbol/spread lookup (the balance guard does NOT need this)
 $env:RAATS_REQUIRE_APPROVAL  = "1"      # ask on Discord before finishing the session
 $env:RAATS_DISCORD_SUMMARY   = "1"      # post the end-of-day summary to Discord
 
@@ -55,9 +56,9 @@ If any of the three is missing, nothing is posted and approvals can still be giv
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `RAATS_USE_MT5` | Enable the MT5 broker filter in discovery, and `enable_mt5` in the trading loop's entry point | off |
+| `RAATS_USE_MT5` | Enable the MT5 broker filter in discovery and the MT5 symbol / spread lookup for the final list. Not needed for the balance guard | off |
 | `RAATS_MT5_SYMBOL_MAP` | JSON overrides for symbol names, e.g. `{"CL=F": "USOIL"}` | `{}` |
-| `RAATS_MIN_BALANCE` | Minimum MT5 balance in dollars | `20` |
+| `RAATS_MIN_BALANCE` | Minimum MT5 balance in dollars. Set to `0` to keep paper-trading while the account is unfunded | `20` |
 | `RAATS_REQUIRE_APPROVAL` | Ask for approval on Discord | off |
 | `RAATS_DISCORD_SUMMARY` | Post the end-of-day summary to Discord | off |
 | `RAATS_MACRO_API_KEY` | TradingEconomics key; without it the static calendar is used | unset |
@@ -78,6 +79,38 @@ The bot only makes outbound calls to Discord, so there is no webhook, public URL
    ```powershell
    python -c "from src.notifications.discord_notifier import DiscordNotifier as D; print(D().request_approval(['AAPL','MSFT'], None, 10000))"
    ```
+
+## Minimum-balance guard
+
+It reads the MT5 balance whenever MT5 can report one - no `RAATS_USE_MT5` or `enable_mt5` needed - and runs **first**, before discovery, so no news scoring or LLM time is spent on a day the account cannot trade.
+
+If the balance is below the minimum:
+
+1. The run stops and no trades are opened (positions opened earlier in the session are discarded).
+2. The terminal shows a blocked summary:
+   ```
+   ============================================================
+   TRADING SESSION SUMMARY - BLOCKED
+   ============================================================
+   Account balance:   $0.74
+   Minimum required:  $20.00
+   Short by:          $19.26
+   Open trades:       0 (no trades were opened)
+
+   Please deposit at least $19.26 to resume trading.
+   ```
+3. Discord gets one alert:
+   ```
+   ACCOUNT BALANCE INSUFFICIENT - no trades were opened.
+   Balance: $0.74 | Minimum required: $20.00 | Short by: $19.26
+   Please deposit at least $19.26.
+   ```
+4. A record with `"status": "BLOCKED"`, the balance, the minimum and the shortfall is appended to `data/summaries/sessions_YYYY-MM.jsonl`, and a line to `data/approvals/insufficient_funds_<Monday>_to_<Sunday>.jsonl`.
+
+Also:
+- A balance that cannot be read does not block; a warning says the guard was not applied.
+- Historical simulations (`simulate_date`) skip the guard: the live account says nothing about them.
+- A normal session's summary has an ACCOUNT BALANCE section (balance, minimum, OK / BELOW MINIMUM), and the end-of-day Discord summary adds a "deposit at least" line when the closing balance is below the minimum.
 
 ## Approval flow
 
@@ -138,8 +171,7 @@ Requirements: Windows, MT5 terminal installed and logged in, `pip install MetaTr
 - Symbols are resolved from Yahoo names (`GC=F` -> `XAUUSD`, equities with suffixes such as `.US`). Override with `RAATS_MT5_SYMBOL_MAP`.
 - A symbol is **tradable** only when its trade mode is FULL (RAATS opens longs and shorts). Close-only, long-only and disabled symbols are not.
 - Broker coverage of small-cap day-gainers is likely to be low; the discovery filter can drop most of the list.
-- If the balance cannot be read, the guard is skipped with a warning and the session continues.
-- A low balance sends a Discord alert and appends to `data/approvals/insufficient_funds_<Monday>_to_<Sunday>.jsonl`.
+- The balance guard is described in its own section above; it does not depend on the symbol lookup being enabled.
 - Do not call MT5 from threaded runs (`run_watchlist_concurrent`).
 
 ## Summarization middleware
@@ -150,7 +182,7 @@ At the end of an approved session:
 2. Calls the standard `log_session_summary()`.
 3. Posts to Discord if `RAATS_DISCORD_SUMMARY` is set.
 
-The summary holds the final INVEST list, open and closed trades, return / Sharpe / drawdown, realized and daily PnL, win rate (from the portfolio summary), RGR rejections, MT5 data, and starting / closing balance. The cross-session memory hook is a placeholder: nothing reads these files back into the agents yet.
+The summary holds the final INVEST list, open and closed trades, return / Sharpe / drawdown, realized and daily PnL, win rate (from the portfolio summary), RGR rejections, MT5 data, and starting / closing balance. Blocked sessions are recorded here too, with `status: BLOCKED`. The cross-session memory hook is a placeholder: nothing reads these files back into the agents yet.
 
 ## Files created
 
@@ -185,7 +217,7 @@ session = run_dynamic_trading_session(
     portfolio_value=10_000,
     enable_rgr_gate=True,     # default True
     rgr_threshold=0.0,        # default 0.0
-    enable_mt5=True,          # default False; the entry point sets it from RAATS_USE_MT5
+    enable_mt5=True,          # MT5 symbol/spread lookup for the final list (default False; the entry point sets it from RAATS_USE_MT5). The balance guard runs regardless
 )
 
 print(session["final_invest"])
@@ -218,15 +250,17 @@ python -m src.notifications.discord_notifier pending
 | Reactions are ignored | `DISCORD_APPROVER_ID` must be your own user id (Developer Mode -> Copy User ID), not the bot's |
 | "Approval timeout" | You have 10 minutes; see the approval flow section to change it |
 | "MT5 package not installed" | `pip install MetaTrader5` (Windows only) |
-| MT5 step does nothing | Set `RAATS_USE_MT5=1`; the loop's MT5 lookup and balance guard need it as well as the discovery filter |
-| "MT5 balance unavailable - guard NOT applied" | Terminal not open / not logged in; the session continues without the guard |
+| No MT5 symbols / spreads in the approval message | Set `RAATS_USE_MT5=1` (the balance guard does not need it) |
+| Session shows `BLOCKED` and nothing runs | The balance is below `RAATS_MIN_BALANCE`; deposit the amount shown, or set `RAATS_MIN_BALANCE=0` to keep paper-trading |
+| "MT5 balance unavailable - minimum-balance guard NOT applied" | Terminal not open / not logged in; the session continues without the guard |
 | "macro calendar has N event(s) on a weekend" | Fix those dates in `macro_calendar.json` |
 | No macro blocking at all | Calendar missing or has no event near now; check the file and its dates |
-| Insufficient balance | Fund the account above `RAATS_MIN_BALANCE`; see `insufficient_funds_*.jsonl` |
 
 ## Architecture
 
 ```
+entry point: check_minimum_balance()  -> BLOCKED summary + Discord alert, or continue
+    |
 discovery.py (main)
     |-- get_tickers_from_gainers_feed() -> get_previous_session_returns()
     |-- apply_mt5_filter()            (RAATS_USE_MT5)      -> mt5_bridge.py
@@ -235,12 +269,12 @@ discovery.py (main)
             |
             v
 trading_loop_dynamic.py (run_dynamic_trading_session)
-    |-- macro check, starting balance
+    |-- macro check, then the session-start balance guard (skipped for simulations)
     |-- DynamicTradingManager
     |     |-- RGR gate on the initial list and every replacement   -> rgr_screen.py
     |     |-- analysis rounds + HOLD replacement (LangGraph: collector -> stability -> analyst -> executor)
     |     |-- MT5 data for the final INVEST list                   -> mt5_bridge.py
-    |     |-- minimum-balance guard                                -> mt5_bridge.py -> Discord alert
+    |     |-- balance guard again                                  -> BLOCKED summary + Discord alert
     |     |-- Discord approval (APPROVE continues, otherwise positions are discarded)
     |     |                                                        -> discord_notifier.py -> approval_requests_*.jsonl
     |     |-- balance re-check

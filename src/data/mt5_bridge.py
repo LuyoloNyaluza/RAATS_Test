@@ -55,6 +55,25 @@ STATIC_MAP: Dict[str, List[str]] = {
     "CL=F": ["XTIUSD", "USOIL", "WTI", "UKOIL"],
     "NG=F": ["XNGUSD", "NATGAS"],
     "HG=F": ["COPPER", "XCUUSD"],
+    # indices (CFD names vary a lot by broker; first one the broker has wins).
+    # Put YOUR broker's names first, or use RAATS_MT5_SYMBOL_MAP.
+    "^GSPC": ["US500", "SPX500", "SP500", "USA500"],
+    "^DJI": ["US30", "DJ30", "WS30", "USA30"],
+    "^IXIC": ["USTEC", "NAS100", "US100", "NDX100"],
+    "^RUT": ["US2000", "RUSSELL2000"],
+    "^FTSE": ["UK100", "FTSE100"],
+    "^GDAXI": ["GER40", "DE40", "DAX40", "GER30"],
+    "^FCHI": ["FRA40", "FR40", "CAC40"],
+    "^STOXX50E": ["EU50", "STOXX50", "ESTX50"],
+    "^IBEX": ["ESP35", "SPA35", "ES35"],
+    "^AEX": ["NETH25", "NL25"],
+    "^N225": ["JP225", "JPN225", "NIKKEI225"],
+    "^HSI": ["HK50", "HSI50", "HKG50"],
+    "^AXJO": ["AUS200", "AU200"],
+    "^BSESN": ["INDIA50"],
+    "^NSEI": ["INDIA50", "NIFTY50"],
+    "^KS11": ["KOR200"],
+    "^TWII": ["TW50"],
 }
 
 # Equity suffixes brokers commonly use for US stocks.
@@ -87,6 +106,8 @@ def candidates_for(ticker: str) -> List[str]:
         return overrides[ticker]
     if ticker in STATIC_MAP:
         return STATIC_MAP[ticker]
+    if ticker.startswith("^"):
+        return []          # an index with no mapping: never guess a stock name like "^FOO.US"
     return [ticker + s for s in EQUITY_SUFFIXES]   # plain equity
 
 
@@ -141,10 +162,15 @@ def notify_insufficient_balance(
 ) -> None:
     """Alert on Discord and write the weekly insufficient-funds log entry."""
     shortfall = min_balance - balance
+    tickers = list(final_invest or [])
     msg = (
-        f"RAATS: insufficient funds ${balance:.2f}, please deposit "
-        f"${shortfall:.2f}. A minimum of ${min_balance:.2f} is needed."
+        "ACCOUNT BALANCE INSUFFICIENT - no trades were opened.\n"
+        f"Balance: ${balance:,.2f} | Minimum required: ${min_balance:,.2f} | "
+        f"Short by: ${shortfall:,.2f}\n"
+        f"Please deposit at least ${shortfall:,.2f}."
     )
+    if tickers:
+        msg += f"\nBlocked tickers: {', '.join(tickers)}"
 
     try:
         from src.notifications.discord_notifier import DiscordNotifier
@@ -217,6 +243,21 @@ def resolve_mt5_symbol(ticker: str) -> Optional[str]:
 
     _cache[ticker] = found
     return found
+
+
+def is_mt5_tradable(ticker: str) -> bool:
+    """True if the broker offers `ticker` with full (long + short) trading enabled.
+
+    Needs an initialised MT5 session (initialize_mt5()). Used to drop reserve
+    tickers the broker cannot trade, before they take a slot in the top 10.
+    """
+    symbol = resolve_mt5_symbol(ticker)
+    if symbol is None:
+        return False
+    info = get_symbol_info(symbol) or {}
+    return info.get("trade_mode", 0) == getattr(
+        mt5, "SYMBOL_TRADE_MODE_FULL", TRADE_MODE_FULL
+    )
 
 
 # ------------------------------------------------------------------

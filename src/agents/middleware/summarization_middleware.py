@@ -6,10 +6,13 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from src.utils.logger import log_session_summary
 from src.data.mt5_bridge import get_account_balance
+
+# Same minimum the trading loop enforces (env RAATS_MIN_BALANCE overrides).
+MIN_ACCOUNT_BALANCE = float(os.environ.get("RAATS_MIN_BALANCE", "20"))
 
 
 class SummarizationMiddleware:
@@ -63,6 +66,7 @@ class SummarizationMiddleware:
             waitlist=manager.waitlist,
             hold_list=[h["ticker"] for h in manager.hold_history],
             metrics=summary["metrics"],
+            open_positions=summary.get("open_positions"),
         )
 
         # 4. Post to Discord if enabled
@@ -120,6 +124,30 @@ class SummarizationMiddleware:
                 "direction": d.get("direction"),
             }
 
+        reference_balance = (
+            closing_balance if closing_balance is not None else self.starting_balance
+        )
+        balance_shortfall = (
+            MIN_ACCOUNT_BALANCE - reference_balance
+            if reference_balance is not None and reference_balance < MIN_ACCOUNT_BALANCE
+            else None
+        )
+
+        # Every open position with its levels, so the day's SL/TP are on record.
+        open_positions = {
+            t: {
+                "direction": "LONG" if p.direction == 1 else "SHORT",
+                "entry_price": p.entry_price,
+                "size": p.size,
+                "stop_loss": p.stop_loss,
+                "take_profit": p.take_profit,
+                "risk_unit": p.risk_unit,
+                "locked_rr": p.locked_rr,
+                "max_rr_seen": p.max_rr_seen,
+            }
+            for t, p in manager.risk_manager.positions.items()
+        }
+
         now = datetime.now()
         week_num = now.isocalendar()[1]
         day_name = now.strftime("%A")
@@ -134,6 +162,8 @@ class SummarizationMiddleware:
             "starting_balance": self.starting_balance,
             "closing_balance": closing_balance,
             "balance_change": (closing_balance - self.starting_balance) if (closing_balance is not None and self.starting_balance is not None) else None,
+            "min_balance": MIN_ACCOUNT_BALANCE,
+            "balance_shortfall": balance_shortfall,
             "final_invest": manager.final_invest,
             "active_list": manager.active_list,
             "waitlist": manager.waitlist,
@@ -145,8 +175,55 @@ class SummarizationMiddleware:
             "categories": {k: v for k, v in categories.items() if v},
             "metrics": metrics,
             "portfolio_summary": manager.risk_manager.portfolio_summary(),
+            "open_positions": open_positions,
+            "mt5_order_plan": getattr(manager, "mt5_order_plan", {}),
             "closed_positions": manager.closed_positions_today,
         }
+
+    def record_blocked_session(
+        self,
+        balance: float,
+        min_balance: float,
+        shortfall: float,
+        tickers: Optional[list] = None,
+        reason: str = "insufficient_balance",
+    ) -> Dict[str, Any]:
+        """Write the end-of-day record for a session stopped by the balance guard.
+
+        The Discord alert is sent separately (mt5_bridge.notify_insufficient_balance),
+        so this does not post again.
+        """
+        now = datetime.now()
+        record = {
+            "week": now.isocalendar()[1],
+            "day": now.strftime("%A"),
+            "date": now.strftime("%Y-%m-%d"),
+            "session_date": now.strftime("%Y-%m-%d"),
+            "session_time": now.isoformat(),
+            "status": "BLOCKED",
+            "blocked_reason": reason,
+            "starting_balance": balance,
+            "closing_balance": balance,
+            "balance_change": 0.0,
+            "min_balance": min_balance,
+            "balance_shortfall": shortfall,
+            "final_invest": [],
+            "blocked_tickers": list(tickers or []),
+            "open_trades": 0,
+            "message": (
+                f"No trades were opened: balance ${balance:,.2f} is below the "
+                f"${min_balance:,.2f} minimum. Deposit at least ${shortfall:,.2f}."
+            ),
+        }
+        self._save_jsonl(record)
+        log_session_summary(
+            active_list=[],
+            waitlist=[],
+            hold_list=[],
+            metrics={"blocked": True, "reason": reason, "balance": balance,
+                     "min_balance": min_balance, "shortfall": shortfall},
+        )
+        return record
 
     def _save_jsonl(self, summary: Dict[str, Any]) -> None:
         """Append to JSONL file for durable storage."""
@@ -203,11 +280,23 @@ class SummarizationMiddleware:
             f"**Daily PnL:** {money(ps.get('daily_pnl', m.get('daily_pnl', 0.0)))}",
             f"**Win rate:** {ps.get('win_rate', m.get('win_rate_pct', 0.0)):.1f}%",
         ]
+        if summary.get("balance_shortfall"):
+            lines.insert(
+                1,
+                f"\u26a0\ufe0f Balance is below the ${summary.get('min_balance', MIN_ACCOUNT_BALANCE):,.2f} minimum - "
+                f"deposit at least ${summary['balance_shortfall']:,.2f}",
+            )
         for key, label, fmt in (("total_return_pct", "Return", "{:+.2f}%"),
                                 ("sharpe", "Sharpe", "{:.2f}"),
                                 ("max_drawdown_pct", "Max drawdown", "{:.2f}%")):
             if m.get(key) is not None:
                 lines.append(f"**{label}:** " + fmt.format(m[key]))
+
+        for t, p in (summary.get("open_positions") or {}).items():
+            lines.append(
+                f"  {t} {p['direction']} @ {p['entry_price']:.4f} | "
+                f"SL {p['stop_loss']:.4f} | TP {p['take_profit']:.4f}"
+            )
 
         if summary.get("rgr_rejected"):
             lines.append(f"**RGR rejected:** {', '.join(summary['rgr_rejected'])}")

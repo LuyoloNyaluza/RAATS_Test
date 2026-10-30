@@ -1,0 +1,2 @@
+{"timestamp":"2026-10-28T19:39:33.435833+02:00","type":"error","ticker":"TEM","date":"2026-10-28","stage":"approval","error":"session not approved: insufficient balance","context":{"final_invest":["TEM"],"discarded":["TEM"]}}
+{"timestamp":"2026-10-30T12:37:07.977441+02:00","type":"error","ticker":"MESO,EURUSD=X,RIVN,COIN","date":"2026-10-30","stage":"approval","error":"session not approved: insufficient balance","context":{"final_invest":["MESO","EURUSD=X","RIVN","COIN"],"discarded":["MESO","EURUSD=X","RIVN","COIN"]}}
