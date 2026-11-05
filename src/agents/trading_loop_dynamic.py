@@ -39,12 +39,19 @@ Trading process:
                                       v
                               INVEST / HOLD / other
 
-The loop continues until:
-    final_invest == max_active_positions
+Batch 1 is complete when EITHER:
 
-or:
+    A. final_invest == max_active_positions   (10 approved candidates), OR
+    B. ALL THREE sources are exhausted at the same time:
+         - the top 50 (including the one-time reserve added to it),
+         - the waiting list, and
+         - the top-10 active candidates.
 
-    waiting_list is exhausted.
+When the top 50 and the waiting list run out with fewer than 5 tickers in
+final_invest, the one-time reserve (10 trending + 10 world indices + 10 most active)
+is added to the top 50; it feeds the waiting list and the top 10 the same way.
+With fewer than 10 approved candidates (even 0) the hand-over to the main agent
+goes ahead with what is available - it never waits for 10.
 """
 
 import os
@@ -67,6 +74,7 @@ from src.data.discovery import (
 from src.risk.risk_manager import RiskManager
 from src.data.rgr_screen import screen_candidate
 from src.data.mt5_sizing import build_order_plan, format_order_plan
+from src.utils.trade_text import trade_rows, format_rows
 from src.data.reserve_tickers import build_reserve, normalize as _norm_ticker
 from src.data.mt5_bridge import (
     enrich_final_invest, get_account_balance, notify_insufficient_balance,
@@ -87,12 +95,12 @@ MIN_FINAL_INVEST_BEFORE_RESERVE = 5
 
 def balance_status(balance: Optional[float]) -> Optional[Dict[str, Any]]:
     """None when the balance is fine (or unknown); otherwise the shortfall details."""
-    if balance is None or balance >= MIN_ACCOUNT_BALANCE:
-        return None
+    if balance is None or balance > MIN_ACCOUNT_BALANCE:
+        return None                     # strictly greater than the minimum (e.g. > $20)
     return {
         "balance": float(balance),
         "min_balance": MIN_ACCOUNT_BALANCE,
-        "shortfall": MIN_ACCOUNT_BALANCE - float(balance),
+        "shortfall": max(MIN_ACCOUNT_BALANCE - float(balance), 0.01),
     }
 
 
@@ -617,8 +625,13 @@ class DynamicTradingManager:
 
         self.replacement_history = []
 
+        # Batch metadata is populated by the batch coordinator.
+        self.batch_no: Optional[int] = None
+        self.batch_id: Optional[str] = None
+
         # One-time reserve (30 extra tickers) state
         self.reserve_loaded = False
+        self.session_blocked = False      # set when balance / approval stops the first session
         self.mt5_order_plan = {}
         self.reserve_info = {}
 
@@ -1116,6 +1129,18 @@ class DynamicTradingManager:
                     f"{self.max_active_positions})"
                 )
 
+                # INVEST is a trade, not just a name: show BUY/SELL, entry, SL and TP.
+                print(
+                    format_rows(
+                        trade_rows(
+                            self.risk_manager,
+                            [ticker],
+                            getattr(self, "mt5_order_plan", None),
+                        ),
+                        indent="  ",
+                    )
+                )
+
                 continue
 
             # ----------------------------------
@@ -1379,6 +1404,35 @@ class DynamicTradingManager:
         print(f"  Added {len(new)} reserve tickers to the universe and waiting list.")
         return True
 
+    # ----------------------------------
+    # Exhaustion: ALL THREE must be used up
+    # ----------------------------------
+    def _top50_exhausted(self) -> bool:
+        """Every ticker of the top 50 (plus any reserve added to it) has been drawn."""
+        return self._next_universe_index >= len(self.ticker_universe)
+
+    def sources_exhausted(self) -> bool:
+        """True only when the top 50, the waiting list AND the top-10 active list are all empty."""
+        return (
+            self._top50_exhausted()
+            and not self.waitlist
+            and not self.active_list
+        )
+
+    def _refill_active(self, vacancies: int) -> List[str]:
+        """Draw candidates for the top 10 from the waiting list (itself fed by the top 50).
+
+        When the top 50 and the waiting list are exhausted and fewer than 5 tickers are in
+        final_invest, the one-time reserve is added to the top 50 and drawn from the same
+        way. Returns [] only when every source is exhausted.
+        """
+        got = self._get_replacements(vacancies)
+        if not got and not self.active_list and self._top50_exhausted() and not self.waitlist:
+            print("Top 50 and waiting list exhausted.")
+            if self._load_reserve():
+                got = self._get_replacements(vacancies)
+        return got
+
     def _get_replacements(
         self,
         number_needed: int,
@@ -1393,16 +1447,24 @@ class DynamicTradingManager:
         """
 
         replacements = []
+        drawn = 0
 
-        while (
-            len(replacements)
-            < number_needed
-            and self.waitlist
-        ):
+        while len(replacements) < number_needed:
+
+            if not self.waitlist:
+                # The waiting list is topped up from the top 50. Tickers rejected by the
+                # gates below used to leave it short while the top 50 still had unused
+                # tickers, which ended the session early.
+                self._replenish_waitlist_from_universe(
+                    number_needed - len(replacements)
+                )
+                if not self.waitlist:
+                    break
 
             ticker = (
                 self.waitlist.pop(0)
             )
+            drawn += 1
 
             # ----------------------------------
             # Safety checks
@@ -1503,7 +1565,7 @@ class DynamicTradingManager:
         # ----------------------------------
         # Replenish waiting list from universe for each replacement used
         # ----------------------------------
-        self._replenish_waitlist_from_universe(len(replacements))
+        self._replenish_waitlist_from_universe(drawn)
         return replacements
     # ======================================
     # TRADING SESSION
@@ -1517,7 +1579,7 @@ class DynamicTradingManager:
         Run the dynamic trading session with:
         - Macro event blocking (FOMC, CPI, NFP windows)
         - Discord approval for final INVEST list
-        - MT5 balance check (blocks if < $20)
+        - MT5 balance check once, after Batch 1 is complete (blocks if balance <= $20)
         - End-of-day summarization middleware
         """
 
@@ -1562,6 +1624,7 @@ class DynamicTradingManager:
             msg = f"🚫 TRADING BLOCKED: {blocking_event.name} ({blocking_event.event_type}) window active"
             print(msg)
             self._send_alert(msg)
+            self.session_blocked = True       # Batch 1 did not run: no live hand-over
             return self.daily_results
 
         # Balance at the START of the session, for the end-of-day summary only.
@@ -1606,15 +1669,6 @@ class DynamicTradingManager:
                     "candidates remain."
                 )
 
-                if not self.waitlist:
-
-                    print(
-                        "Waiting list exhausted."
-                    )
-
-                    if not self._load_reserve():
-                        break
-
                 # Need enough candidates to
                 # reach the target.
                 vacancies = (
@@ -1622,11 +1676,16 @@ class DynamicTradingManager:
                     - len(self.final_invest)
                 )
 
-                self._get_replacements(
+                # waiting list (fed by the top 50), then the one-time reserve
+                self._refill_active(
                     vacancies
                 )
 
                 if not self.active_list:
+                    print(
+                        "\nTop 50, waiting list and top 10 "
+                        "are all exhausted."
+                    )
                     break
 
             # ----------------------------------
@@ -1731,23 +1790,16 @@ class DynamicTradingManager:
                 )
 
                 replacements = (
-                    self._get_replacements(
+                    self._refill_active(
                         vacancies
                     )
                 )
 
-                if not replacements and not self.waitlist:
-                    # waiting list used up: one-time reserve, then draw again
-                    if self._load_reserve():
-                        replacements = self._get_replacements(
-                            vacancies
-                        )
-
-                if not replacements:
+                if not replacements and self.sources_exhausted():
 
                     print(
-                        "\nNo more replacement "
-                        "candidates available."
+                        "\nTop 50, waiting list and top 10 "
+                        "are all exhausted."
                     )
 
                     break
@@ -1780,8 +1832,15 @@ class DynamicTradingManager:
         if self.enable_mt5 and self.final_invest:
             self.mt5_data = enrich_final_invest(self.final_invest)
             # Adapter only: converts RAATS positions to MT5 lots/levels, changes no risk logic.
-            self.mt5_order_plan = build_order_plan(self.risk_manager, self.mt5_data)
+            self.mt5_order_plan = build_order_plan(
+                self.risk_manager, self.mt5_data,
+            )
             print("\n" + format_order_plan(self.mt5_order_plan))
+
+        if self.final_invest:
+            print("\nFINAL INVEST - TRADES")
+            print(format_rows(trade_rows(
+                self.risk_manager, self.final_invest, self.mt5_order_plan)))
 
         # ==================================
         # 4. MINIMUM-BALANCE GUARD
@@ -1806,6 +1865,7 @@ class DynamicTradingManager:
 
             if response != "APPROVE":
                 print(f"\u274c Session not approved ({response}).")
+                self.session_blocked = True
                 self._discard_unapproved_positions(response)
                 return self.daily_results
 
@@ -1859,6 +1919,7 @@ class DynamicTradingManager:
         summary, alerts on Discord with the amount to deposit, and records the session.
         """
         tickers = list(self.final_invest)
+        self.session_blocked = True
         if tickers:
             self._discard_unapproved_positions(reason)
         report_blocked_session(balance_check, tickers)
@@ -2443,6 +2504,13 @@ def run_dynamic_trading_session(
         "final_invest":
             manager.final_invest,
 
+        "final_invest_orders":
+            trade_rows(
+                manager.risk_manager,
+                manager.final_invest,
+                getattr(manager, "mt5_order_plan", None),
+            ),
+
         "hold_history":
             manager.hold_history,
 
@@ -2482,6 +2550,617 @@ def run_dynamic_trading_session(
     }
 
     return session_results
+
+
+# ==========================================
+# THREADED BATCH PIPELINE
+# ==========================================
+#
+# Everything ABOVE this section is the original trading loop and is unchanged
+# (DynamicTradingManager, run_dynamic_trading_session, every helper, every logger).
+# This section only ADDS:
+#
+#   * the whole process as BATCHES: the first run is batch 1; batch 2 continues
+#     discovery where batch 1 stopped (top gainers 41-80), and so forth
+#   * the original flow split into three SEQUENTIAL THREAD-BASED SUBAGENTS that
+#     pass their result to the next one through queues (dataclasses):
+#
+#         Subagent 1  discovery        first half of discovery.main()
+#         Subagent 2  news + scoring   second half of discovery.main()
+#         Subagent 3  analysis         DynamicTradingManager.run_trading_session()
+#                                      (RGR, run_daily_cycle / LangGraph, replacements,
+#                                       reserve, order plan, balance guard, DISCORD APPROVAL
+#                                       of the batch, summary)
+#
+#   * BatchRunner: runs batch after batch in the background and hands every approved
+#     batch to a "sink" (live_agents.py), which owns the MT5 position engine
+#
+# GOVERNING RULE
+#   Discovery -> Scoring -> Analysis -> DISCORD BATCH APPROVAL -> FinalInvestPool -> Main Agent
+#   -> balance gate -> margin / lot size / SL / TP proposal -> DISCORD TRADE APPROVAL ->
+#   async timer -> revalidation -> MT5 order
+#   * EVERY batch goes through Discord, whatever RAATS_REQUIRE_APPROVAL says: suitable
+#     candidates are never approved automatically, and only approved ones are handed over
+#   * the minimum-balance gate is NOT decided here: the Main Agent does it on the first approved
+#     batch and, when it fails, sets GLOBAL_STATE (BLOCKED_INSUFFICIENT_BALANCE); this module
+#     then stops at once
+#   * a batch needs no minimum size: even one approved candidate enters the pool
+#
+# The functions of discovery.py and of this file are called in the same order with the
+# same arguments; the only addition to the manager is its batch number (`batch_no`).
+#
+# BEGIN THREADED BATCH PIPELINE
+import contextlib
+import inspect
+import queue
+import threading
+import time
+from dataclasses import dataclass, field
+
+# ---- batch statuses (the values live_agents.py records; a test keeps both in step) ----
+BATCH_PROCESSING = "BATCH_PROCESSING"          # the batch is being processed
+READY = "READY"                                # eligible candidates are ready for handover
+WAITING_FOR_APPROVAL = "WAITING_FOR_APPROVAL"  # Discord approval is required
+INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS"      # MT5 balance below the minimum: batch blocked
+BALANCE_UNAVAILABLE = "BALANCE_UNAVAILABLE"    # MT5 balance could not be verified
+REJECTED = "REJECTED"                          # the Discord approval was not given
+HANDED_OVER = "HANDED_OVER"                    # approved candidates were handed to the main agent
+BATCH_COMPLETED = "BATCH_COMPLETED"            # the batch finished its lifecycle
+ABANDONED = "ABANDONED"                        # blocked by a macro event or failed
+
+BLOCKED_INSUFFICIENT_BALANCE = "BLOCKED_INSUFFICIENT_BALANCE"   # the Main Agent's balance gate failed
+
+
+class GlobalState:
+    """ONE state shared by both modules. When the Main Agent's initial balance gate fails it calls
+    block(); the batch runner (and any approval still to be sent) then stops immediately."""
+
+    def __init__(self) -> None:
+        self.blocked = threading.Event()
+        self.reason: Optional[str] = None
+        self.detail: Dict[str, Any] = {}
+
+    def block(self, reason: str, **detail: Any) -> None:
+        self.reason, self.detail = reason, dict(detail)
+        self.blocked.set()
+
+    def is_blocked(self) -> bool:
+        return self.blocked.is_set()
+
+    def reset(self) -> None:
+        self.blocked.clear()
+        self.reason, self.detail = None, {}
+
+
+GLOBAL_STATE = GlobalState()
+
+
+def _batch_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# After a FAILED batch wait this long before the next one.
+PAUSE_AFTER_BLOCK_SEC = _batch_env_float("RAATS_BLOCKED_BATCH_PAUSE_SEC", 900.0)
+# After a REJECTED batch the loop simply continues with the next batch (0 = at once).
+REJECTED_BATCH_PAUSE_SEC = _batch_env_float("RAATS_REJECTED_BATCH_PAUSE_SEC", 0.0)
+# Macro event window: try a fresh batch again after this long.
+BATCH_MACRO_RETRY_SEC = _batch_env_float("RAATS_MACRO_RETRY_SEC", 600.0)
+RUNNER_POLL_SEC = _batch_env_float("RAATS_RUNNER_POLL_SEC", 2.0)
+# Retry interval when balance is unreadable
+BATCH_BALANCE_RETRY_SEC = _batch_env_float("RAATS_BATCH_BALANCE_RETRY_SEC", 5.0)
+
+# Commodity / currency ranks 6-10, used by batch 2 (batch 1 uses the lists of discovery.py).
+EXTRA_COMMODITY_TICKERS = ["PL=F", "PA=F", "BZ=F", "ZC=F", "ZW=F"]
+EXTRA_CURRENCY_TICKERS = ["NZDUSD=X", "USDCHF=X", "EURGBP=X", "EURJPY=X", "GBPJPY=X"]
+
+
+# ---- what travels through the queues ----
+@dataclass
+class DiscoveryBatch:
+    """Subagent 1 -> Subagent 2."""
+    batch_no: int
+    blocked: bool = False            # macro event window: discovery.main() returns empty arrays
+    exhausted: bool = False          # no unused gainers left for this batch
+    universe: List[str] = field(default_factory=list)   # every ticker this batch discovered
+    top_50: Any = None
+    top_10: Any = None
+    waiting: Any = None
+    target_date: Any = None
+
+
+@dataclass
+class ScoredBatch:
+    """Subagent 2 -> Subagent 3."""
+    discovery: DiscoveryBatch
+    scored_top_10: Any = None
+
+
+@dataclass
+class BatchResult:
+    """Subagent 3 -> the coordinator."""
+    batch_no: int
+    manager: Any = None
+    session: Dict[str, Any] = field(default_factory=dict)
+    exhausted: bool = False
+
+
+@dataclass
+class StageFailure:
+    """An exception travelling down the queues so the coordinator can report it."""
+    stage: str
+    error: BaseException
+
+
+# ---- batch 2 continues where batch 1 stopped ----
+def _usable_symbol(symbol: Any) -> bool:
+    """The test get_tickers_from_gainers_feed() applies to a gainer."""
+    sym = str(symbol or "").upper().strip()
+    return sym.isalpha() and len(sym) <= 5
+
+
+class GainersWindow:
+    """Stands in for discovery's `yf` while a later batch discovers: day_gainers WITHOUT the
+    tickers earlier batches used, so the original get_tickers_from_gainers_feed() simply takes
+    the next ones. Everything else on `yf` is passed through unchanged."""
+
+    def __init__(self, real_yf: Any, used: List[str], need: int):
+        self._real = real_yf
+        self.used = {str(u).upper().strip() for u in used}
+        self.need = need
+        self._quotes: Optional[List[Dict[str, Any]]] = None
+        self.usable = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    def screen(self, query: str, **_ignored: Any) -> Dict[str, Any]:
+        if self._quotes is None:                       # one request per batch (Yahoo allows 250)
+            result = self._real.screen(query, count=250)
+            quotes = [q for q in (result.get("quotes") or [])
+                      if str(q.get("symbol", "")).upper().strip() not in self.used]
+            self._quotes = quotes
+            self.usable = sum(1 for q in quotes if _usable_symbol(q.get("symbol")))
+        return {"quotes": self._quotes}
+
+
+@contextlib.contextmanager
+def discovery_window(d: Any, day_index: int, used: List[str]):
+    """Point discovery.py at the next slice of the market for the duration of one discovery.
+
+        first batch of the day   nothing is touched: discovery runs exactly as written
+        second batch             next 40 gainers + commodities / currencies ranks 6-10
+        later batches            next 50 gainers (the commodity / currency lists are used up)
+
+    Only module attributes of discovery are swapped, and restored afterwards; no function of
+    discovery.py is changed.
+    """
+    if day_index == 0 and not used:
+        yield None
+        return
+    keys = ("yf", "COMMODITY_TICKERS", "CURRENCY_TICKERS", "TOP_40_EQUITIES_COUNT")
+    saved = {k: getattr(d, k) for k in keys}
+    window = GainersWindow(saved["yf"], used, 40 if day_index == 1 else 50)
+    d.yf = window
+    d.TOP_40_EQUITIES_COUNT = window.need
+    d.COMMODITY_TICKERS = list(EXTRA_COMMODITY_TICKERS) if day_index == 1 else []
+    d.CURRENCY_TICKERS = list(EXTRA_CURRENCY_TICKERS) if day_index == 1 else []
+    try:
+        yield window
+    finally:
+        for k, v in saved.items():
+            setattr(d, k, v)
+
+
+@contextlib.contextmanager
+def _batch_flow_rules():
+    """The corrected workflow, applied to the batch pipeline only (restored afterwards):
+
+    * RAATS_REQUIRE_APPROVAL is forced on: every batch goes to Discord, never automatically
+    * check_minimum_balance is switched off inside the batch: the balance gate belongs to the
+      Main Agent (it runs after the approval, on the first approved batch)
+
+    Neither function of this file is edited; a module setting and an environment variable are
+    set for the duration of one batch.
+    """
+    global check_minimum_balance
+    saved_check = check_minimum_balance
+    saved_env = os.environ.get("RAATS_REQUIRE_APPROVAL")
+    check_minimum_balance = lambda: None
+    os.environ["RAATS_REQUIRE_APPROVAL"] = "1"
+    try:
+        yield
+    finally:
+        check_minimum_balance = saved_check
+        if saved_env is None:
+            os.environ.pop("RAATS_REQUIRE_APPROVAL", None)
+        else:
+            os.environ["RAATS_REQUIRE_APPROVAL"] = saved_env
+
+
+# ---- the three sequential thread-based subagents ----
+class BatchPipeline:
+    """One batch = the original flow on three SEQUENTIAL THREADS.
+
+        python -m src.agents.trading_loop_dynamic   =   discovery.main()  ->  run_dynamic_trading_session()
+
+    Nothing in discovery.py or in the code above is changed or re-implemented: the same
+    functions are called in the same order with the same arguments, on three threads that pass
+    their result to the next one through a queue (q12, q23, q_out).
+    """
+
+    NAMES = ("raats-subagent-1-discovery", "raats-subagent-2-news", "raats-subagent-3-analysis")
+
+    def __init__(self, batch_no: int, status_cb: Any = None,
+                 used: Optional[List[str]] = None, day_index: int = 0):
+        self.batch_no = int(batch_no)
+        self.status_cb = status_cb or (lambda batch_no, status, **info: None)
+        self.used = list(used or [])
+        self.day_index = int(day_index)
+        self.q12: "queue.Queue[Any]" = queue.Queue(maxsize=1)     # subagent 1 -> 2
+        self.q23: "queue.Queue[Any]" = queue.Queue(maxsize=1)     # subagent 2 -> 3
+        self.q_out: "queue.Queue[Any]" = queue.Queue(maxsize=1)   # subagent 3 -> coordinator
+        self.threads: List[threading.Thread] = []
+
+    def run(self) -> BatchResult:
+        """Start the three threads, wait for the result, join them."""
+        for name, target in zip(self.NAMES, (self._subagent1, self._subagent2, self._subagent3)):
+            thread = threading.Thread(target=target, name=name, daemon=True)
+            thread.start()
+            self.threads.append(thread)
+        while True:
+            try:
+                result = self.q_out.get(timeout=1.0)
+                break
+            except queue.Empty:
+                if not any(t.is_alive() for t in self.threads):
+                    try:                                   # the last result may have arrived just now
+                        result = self.q_out.get_nowait()
+                        break
+                    except queue.Empty:
+                        raise RuntimeError("the batch pipeline threads ended without a result")
+        for thread in self.threads:
+            thread.join(timeout=5)
+        if isinstance(result, StageFailure):
+            try:
+                log_error(
+                    ticker="-", date=datetime.now().strftime("%Y-%m-%d"),
+                    error=str(result.error), stage=f"batch_pipeline_{result.stage}",
+                    context={"batch_no": self.batch_no},
+                )
+            except Exception:
+                pass
+            raise result.error
+        return result
+
+    # ------------------------------------------------------------------ Subagent 1
+    def _subagent1(self) -> None:
+        """First half of discovery.main()."""
+        try:
+            from src.data import discovery as d
+            with discovery_window(d, self.day_index, self.used) as window:
+                if window is not None:
+                    window.screen("day_gainers")             # one request, kept for the call below
+                    if window.usable < window.need:
+                        print(f"Yahoo has only {window.usable} unused gainers left "
+                              f"(batch needs {window.need}): discovery sources exhausted.")
+                        self.q12.put(DiscoveryBatch(self.batch_no, exhausted=True))
+                        return
+                equity_tickers = d.get_tickers_from_gainers_feed()
+                if not equity_tickers:
+                    raise ValueError("No equity gainers discovered.")
+                market_universe = d.build_market_universe(equity_tickers)
+                if len(market_universe) != d.TOP_50_COUNT:
+                    raise ValueError(f"Expected {d.TOP_50_COUNT} instruments, "
+                                     f"but built {len(market_universe)}.")
+            universe = [str(u["Ticker"]).upper() for u in market_universe]
+            df_top_50, target_date = d.get_previous_session_returns(market_universe)
+            df_top_50 = d.apply_mt5_filter(df_top_50)
+            if d.is_trade_blocked_by_macro(min_impact="MEDIUM"):
+                print("\U0001F6AB MACRO EVENT WINDOW ACTIVE - Discovery blocked")
+                print("   Set RAATS_MACRO_API_KEY for live calendar or update macro_calendar.json")
+                self.q12.put(DiscoveryBatch(
+                    self.batch_no, blocked=True, top_50=pd.DataFrame(), top_10=[],
+                    waiting=pd.DataFrame(), target_date=target_date))
+                return
+            top_50_performing, top_10_to_fetch_articles, waiting_list = d.build_ticker_arrays(df_top_50)
+            print(f"\nDiscovered performance universe: {len(df_top_50)} instruments")
+            print(f"Top 50 array: {len(top_50_performing)} instruments")
+            print(f"Top 10 article array: {len(top_10_to_fetch_articles)} instruments")
+            print(f"Waiting list array: {len(waiting_list)} instruments")
+            # the cursor: the next batch starts after these tickers
+            self.status_cb(self.batch_no, BATCH_PROCESSING, initial=True, universe=universe)
+            self.q12.put(DiscoveryBatch(
+                self.batch_no, universe=universe, top_50=top_50_performing,
+                top_10=top_10_to_fetch_articles, waiting=waiting_list, target_date=target_date))
+        except BaseException as exc:                       # noqa: BLE001 - relayed to the coordinator
+            self.q12.put(StageFailure("discovery", exc))
+
+    # ------------------------------------------------------------------ Subagent 2
+    def _subagent2(self) -> None:
+        """Second half of discovery.main(): the news and the sentiment scoring."""
+        item = self.q12.get()
+        if isinstance(item, StageFailure):
+            self.q23.put(item)
+            return
+        if item.exhausted:                                 # nothing to score: pass the news step
+            self.q23.put(ScoredBatch(item))
+            return
+        try:
+            if item.blocked:                               # discovery.main() returned before the news
+                self.q23.put(ScoredBatch(item, scored_top_10=item.top_10))
+                return
+            from src.data import discovery as d
+            scored_top_10 = d.render_top_50_and_news(item.top_50, item.top_10, item.target_date)
+            d.render_waiting_list(item.waiting)
+            self.q23.put(ScoredBatch(item, scored_top_10=scored_top_10))
+        except BaseException as exc:                       # noqa: BLE001
+            self.q23.put(StageFailure("news", exc))
+
+    # ------------------------------------------------------------------ Subagent 3
+    def _subagent3(self) -> None:
+        """run_dynamic_trading_session(), step by step: same arguments, same defaults. The Discord
+        approval of the batch happens inside run_trading_session(), as always."""
+        item = self.q23.get()
+        try:
+            if isinstance(item, StageFailure):
+                self.q_out.put(item)
+                return
+            if item.discovery.exhausted:
+                self.q_out.put(BatchResult(self.batch_no, exhausted=True))
+                return
+            found = item.discovery
+            print("\nDiscovery completed.")
+            print(f"Top-50 array: {len(found.top_50)}")
+            print(f"Top-10 array: {len(item.scored_top_10)}")
+            print(f"Waiting-list array: {len(found.waiting)}")
+
+            defaults = {n: p.default for n, p in
+                        inspect.signature(run_dynamic_trading_session).parameters.items()
+                        if p.default is not inspect.Parameter.empty}
+            print("Initializing Dynamic Trading Manager...")
+            manager = DynamicTradingManager(
+                top_50_performing=found.top_50,
+                top_10=item.scored_top_10,
+                waiting_list=found.waiting,
+                portfolio_value=_live_portfolio_value(),
+                analyst_model=defaults.get("analyst_model"),
+                enable_rgr_gate=defaults.get("enable_rgr_gate", True),
+                rgr_threshold=defaults.get("rgr_threshold", 0.0),
+                enable_mt5=os.environ.get("RAATS_USE_MT5", "").lower() in ("1", "true", "yes"),
+            )
+            manager.batch_no = self.batch_no                              # the only addition
+            manager.batch_id = f"{datetime.now():%Y-%m}-B{self.batch_no:03d}"
+
+            original_request = manager._request_human_approval            # report the wait, change nothing
+            def request_with_status() -> str:
+                if GLOBAL_STATE.is_blocked():              # the Main Agent has stopped everything
+                    return "CANCELLED"
+                self.status_cb(self.batch_no, WAITING_FOR_APPROVAL, tickers=list(manager.final_invest))
+                return original_request()
+            manager._request_human_approval = request_with_status
+
+            with _batch_flow_rules():
+                results = manager.run_trading_session(simulate_date=defaults.get("simulate_date"))
+            self.q_out.put(BatchResult(self.batch_no, manager=manager,
+                                       session=_batch_session_results(manager, results, self.batch_no)))
+        except BaseException as exc:                       # noqa: BLE001
+            self.q_out.put(StageFailure("analysis", exc))
+
+
+def _batch_session_results(manager: Any, results: Any, batch_no: int) -> Dict[str, Any]:
+    """The same dictionary run_dynamic_trading_session() returns, plus the batch number."""
+    return {
+        "manager": manager,
+        "results": results,
+        "top_50_performing": manager.top_50_performing,
+        "top_10": manager.top_10,
+        "initial_waiting_list": manager.initial_waiting_list,
+        "active_list": manager.active_list,
+        "waitlist": manager.waitlist,
+        "final_invest": manager.final_invest,
+        "final_invest_orders": trade_rows(
+            manager.risk_manager, manager.final_invest, getattr(manager, "mt5_order_plan", None)),
+        "hold_history": manager.hold_history,
+        "replacement_history": manager.replacement_history,
+        "closed_positions": manager.closed_positions_today,
+        "open_trades": len(manager.risk_manager.positions),
+        "rgr_results": manager.rgr_results,
+        "rgr_rejected": manager.rgr_rejected,
+        "mt5_data": manager.mt5_data,
+        "mt5_order_plan": manager.mt5_order_plan,
+        "reserve_tickers": manager.reserve_info.get("tickers", []),
+        "performance_scores": manager.all_sentiment_scores,
+        "waitlist_opportunities": manager.get_waitlist_opportunities(10),
+        "batch_no": batch_no,
+    }
+
+
+def classify_blocked_batch(manager: Any) -> Tuple[str, Dict[str, Any]]:
+    """Why did the batch not pass? (run_trading_session() only sets `session_blocked`)."""
+    response = getattr(manager, "approval_response", None)
+    if response is not None and response != "APPROVE":
+        return REJECTED, {"response": response}
+    # Check if blocked - differentiate between macro event and insufficient funds
+    # Check both session_blocked (from Manager) and blocked (from GlobalState)
+    if getattr(manager, "session_blocked", False) or getattr(manager, "blocked", False):
+        # Check starting balance to determine the reason
+        balance = getattr(manager, "starting_balance", None)
+        if balance is not None and balance <= 20:
+            return INSUFFICIENT_FUNDS, {"reason": "insufficient_balance"}
+        # If no balance info but session_blocked is True, check if it's a macro event
+        # (macro events block without balance issues)
+        return ABANDONED, {"reason": "macro_event_window"}
+    return ABANDONED, {"reason": "macro_event_window"}
+
+
+def print_batch_complete(session: Dict[str, Any]) -> None:
+    """STEP 3 of the original main block, with the batch number."""
+    print("\n" + "=" * 60)
+    print("SESSION COMPLETE")
+    print("=" * 60)
+    print(f"Batch: {session.get('batch_no')}")
+    print(f"Final INVEST ({len(session['final_invest'])}): {session['final_invest']}")
+    if session.get("final_invest_orders"):
+        print(format_rows(session["final_invest_orders"]))
+    print(f"Active list: {session['active_list']}")
+    print(f"Waiting list: {session['waitlist']}")
+    print(f"Closed positions: {session['closed_positions']}")
+    print(f"Open trades: {session['open_trades']}")
+
+
+# ---- the background runner ----
+class BatchSink:
+    """What the BatchRunner needs from whoever consumes the batches (live_agents.py provides it:
+    FinalInvestPool and the Main Agent, the persisted batch history and the Discord alerts)."""
+
+    def should_stop(self) -> bool: raise NotImplementedError
+    def has_room(self) -> bool: raise NotImplementedError          # FinalInvestPool has capacity
+    def open_count(self) -> int: raise NotImplementedError
+    def next_batch_no(self) -> int: raise NotImplementedError
+    def used_today(self) -> List[str]: raise NotImplementedError   # the discovery cursor
+    def day_index(self) -> int: raise NotImplementedError
+    def status(self, batch_no: int, status: str, **info: Any) -> None: raise NotImplementedError
+    def alert(self, message: str, key: Optional[str] = None, cooldown: float = 1800.0) -> None:
+        raise NotImplementedError
+    def handover(self, manager: Any, batch_no: int, tickers: List[str],
+                 first_batch: bool) -> List[str]: raise NotImplementedError   # only APPROVED tickers
+    def first_batch_pending(self) -> bool: raise NotImplementedError
+    def final_outcome(self, outcomes: List[Tuple[int, str]]) -> None: raise NotImplementedError
+
+
+class BatchRunner(threading.Thread):
+    """Runs batch after batch (each one = the three subagents) beside the position engine.
+
+    * every batch is sent to Discord inside Subagent 3; only the APPROVED tickers are handed over
+      (to FinalInvestPool), and a rejected batch adds nothing and the loop goes on
+    * a batch starts while FinalInvestPool has capacity; it pauses when the pool is full
+    * it stops at once when GLOBAL_STATE is blocked (the Main Agent's balance gate failed)
+    * when the discovery sources are exhausted the final outcome is reported and it ends
+    * it never trades and never checks the balance
+    """
+
+    def __init__(self, sink: Any, use_mt5: bool = True, first_batch: bool = True,
+                 pipeline_cls: Any = None):
+        super().__init__(name="raats-batch-runner", daemon=True)
+        self.sink, self.use_mt5, self.first_batch = sink, use_mt5, first_batch
+        self.pipeline_cls = pipeline_cls or BatchPipeline
+        self.outcomes: List[Tuple[int, str]] = []
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _halted(self) -> bool:
+        return (self._stop_event.is_set() or GLOBAL_STATE.is_blocked()
+                or self.sink.should_stop())
+
+    def _wait(self, seconds: float) -> None:
+        end = time.time() + seconds
+        while time.time() < end and not self._halted():
+            time.sleep(min(RUNNER_POLL_SEC, max(0.0, end - time.time())))
+
+    def _balance_ok(self, batch_no: int) -> bool:
+        """Check if MT5 balance is sufficient for a batch (before running discovery)."""
+        balance_unavailable_logged = False
+        while True:
+            balance = self.sink.read_balance()
+            if balance is None:
+                if not balance_unavailable_logged:
+                    self.sink.status(batch_no, BALANCE_UNAVAILABLE)
+                    balance_unavailable_logged = True
+                self._wait(BATCH_BALANCE_RETRY_SEC)
+                if self._halted():
+                    return False
+                continue
+            if balance < self.sink.min_balance:
+                tickers = []  # no tickers yet, just the balance check
+                self.sink.report_insufficient(balance, tickers)
+                self.sink.live_cannot_run()
+                self.sink.status(batch_no, INSUFFICIENT_FUNDS, tickers=tickers, balance=balance)
+                return False
+            return True
+
+    def run_batch(self, batch_no: int) -> str:
+        """One batch, from discovery to the hand-over of its approved candidates."""
+        
+        sink = self.sink
+        sink.status(batch_no, BATCH_PROCESSING, initial=True)
+        pipeline = self.pipeline_cls(batch_no, sink.status, used=sink.used_today(),
+                                     day_index=sink.day_index())
+        try:
+            result = pipeline.run()
+        except Exception as exc:
+            sink.status(batch_no, ABANDONED, reason=f"error: {type(exc).__name__}: {exc}")
+            sink.alert(f"Batch {batch_no} failed: {type(exc).__name__}: {exc}")
+            return "error"
+
+        if GLOBAL_STATE.is_blocked():                 # the Main Agent stopped everything meanwhile
+            sink.status(batch_no, ABANDONED, reason=GLOBAL_STATE.reason or "blocked")
+            return "stopped"
+
+        if result.exhausted:
+            sink.status(batch_no, BATCH_COMPLETED, tickers=[], note="discovery sources exhausted")
+            return "exhausted"
+
+        manager = result.manager
+        print_batch_complete(result.session)
+        tickers = list(manager.final_invest)
+
+        if getattr(manager, "session_blocked", False):
+            status, info = classify_blocked_batch(manager)
+            sink.status(batch_no, status, tickers=tickers, **info)
+            if status == REJECTED:
+                sink.alert(f"Batch {batch_no} not approved ({info.get('response')}): "
+                           "no candidate was added to final INVEST.")
+                return "rejected"
+            if status == INSUFFICIENT_FUNDS:
+                return "insufficient_funds"
+            return "macro"
+
+        if not tickers:
+            sink.status(batch_no, BATCH_COMPLETED, tickers=[], note="no tickers approved")
+            sink.alert(f"Batch {batch_no} complete: No tickers approved for final INVEST.")
+            return "empty"
+
+        sink.status(batch_no, READY, tickers=tickers)
+        accepted = sink.handover(manager, batch_no, tickers, self.first_batch)
+        sink.status(batch_no, HANDED_OVER, tickers=accepted, approved=tickers,
+                    not_fitted=[t for t in tickers if t not in accepted])
+        sink.status(batch_no, BATCH_COMPLETED, tickers=accepted)
+        print(f"[batches] batch {batch_no} approved and sent to FinalInvestPool: {accepted}")
+        return "handed"
+
+    def run(self) -> None:
+        sink = self.sink
+        while not self._halted():
+            if not sink.has_room():
+                self._wait(RUNNER_POLL_SEC)
+                continue
+            batch_no = sink.next_batch_no()
+            outcome = self.run_batch(batch_no)
+            self.outcomes.append((batch_no, outcome))
+            if outcome == "stopped":
+                break
+            if outcome == "exhausted":
+                sink.final_outcome(self.outcomes)        # sources exhausted: report and finish
+                break
+            if outcome == "handed" and self.first_batch:
+                # the Main Agent works on the first batch before the next one starts
+                while sink.first_batch_pending() and not self._halted():
+                    self._wait(RUNNER_POLL_SEC)
+                self.first_batch = False
+            elif outcome == "rejected":
+                self._wait(REJECTED_BATCH_PAUSE_SEC)     # rejected: add nothing, continue
+            elif outcome == "macro":
+                self._wait(BATCH_MACRO_RETRY_SEC)
+            elif outcome == "error":
+                self._wait(PAUSE_AFTER_BLOCK_SEC)
+        if GLOBAL_STATE.is_blocked():
+            print(f"[batches] trading loop stopped: {GLOBAL_STATE.reason}")
+# END THREADED BATCH PIPELINE
 
 
 # ==========================================
@@ -2587,6 +3266,9 @@ if __name__ == "__main__":
             f"{session['final_invest']}"
         )
 
+        if session.get("final_invest_orders"):
+            print(format_rows(session["final_invest_orders"]))
+
         print(
             f"Active list: "
             f"{session['active_list']}"
@@ -2606,6 +3288,18 @@ if __name__ == "__main__":
             f"Open trades: "
             f"{session['open_trades']}"
         )
+
+        # ----------------------------------
+        # STEP 4: LIVE PHASE (optional)
+        # Background discovery/scoring/analysis subagents + the main agent that
+        # opens positions on MT5, moves SL/TP and reports. Orders are only sent
+        # when RAATS_LIVE_TRADING=1; otherwise it is a dry run.
+        # ----------------------------------
+        if os.environ.get(
+            "RAATS_LIVE_AGENTS", ""
+        ).strip().lower() in ("1", "true", "yes"):
+            from src.agents.live_agents import run_live_phase
+            run_live_phase(session["manager"])
 
     except Exception as e:
 

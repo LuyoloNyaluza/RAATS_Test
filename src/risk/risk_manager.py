@@ -108,10 +108,10 @@ class RiskManager:
     def __init__(
         self,
         atr_multiplier: float = 1.5,
-        rrr: float = 2.0,
-        step_trigger_rr: float = 2.0,
-        step_size_rr: float = 0.5,
-        base_locked_rr: float = 1.5,
+        rrr: float = 3.0,               # TP_R: initial TP at 3R (matches test)
+        step_trigger_rr: float = 2.0,   # LADDER_START_R
+        step_size_rr: float = 0.5,      # LADDER_STEP_R
+        base_locked_rr: float = 1.5,    # LOCK_GAP_R
         max_daily_loss_pct: float = 0.05,
         gradient_lookback: int = 10,
         gradient_deadband: float = 0.3,
@@ -346,3 +346,12 @@ class RiskManager:
             "daily_pnl": self.daily_pnl,
             "win_rate": (len(wins) / len(self.closed_trades) * 100) if self.closed_trades else 0.0,
         }
+    def ceiling_rr(self, max_rr: float) -> float:
+        """Return the take-profit ceiling RR for a given max_rr.
+        
+        The ceiling is max_rr + TP_HEADROOM_RR (from MainAgent).
+        This is called from MainAgent._tp_rr(max_rr).
+        """
+        # TP_HEADROOM_RR is 1.0 by default in live_agents.py
+        # We use the same value that MainAgent uses
+        return max_rr + 1.0

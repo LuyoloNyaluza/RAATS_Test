@@ -157,6 +157,13 @@ def log_cycle(
     stop_loss: Optional[float] = None,
     take_profit: Optional[float] = None,
     position_size: Optional[float] = None,
+    event: str = "opened",
+    risk_reason: Optional[str] = None,
+    ticket: Optional[str] = None,
+    lots: Optional[float] = None,
+    mt5_symbol: Optional[str] = None,
+    executed: bool = True,
+    side: Optional[str] = None,
 ) -> dict:
     """
     Append one trading-cycle entry to:
@@ -188,6 +195,18 @@ def log_cycle(
         "take_profit": take_profit,
 
         "position_size": position_size,
+
+        "event": event,
+
+        "risk_reason": risk_reason,
+
+        "ticket": ticket,
+
+        "lots": lots,
+
+        "mt5_symbol": mt5_symbol,
+        "executed": executed,
+        "side": side,
     }
 
     return _write_jsonl_entry(
