@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-02T18:17:08.450801+02:00","type":"error","ticker":"RIVN,KNF,GC=F","date":"2026-11-02","stage":"approval","error":"session not approved: insufficient balance","context":{"final_invest":["RIVN","KNF","GC=F"],"discarded":["RIVN","KNF","GC=F"]}}
+{"timestamp":"2026-11-04T17:22:24.751743+02:00","type":"error","ticker":"TREX,EXPE,NVO","date":"2026-11-04","stage":"approval","error":"session not approved: insufficient balance","context":{"final_invest":["TREX","EXPE","NVO"],"discarded":["TREX","EXPE","NVO"]}}
