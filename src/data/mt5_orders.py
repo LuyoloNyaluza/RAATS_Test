@@ -265,14 +265,25 @@ def place_market_order(symbol: str, direction: str, lots: float, sl: Optional[fl
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": _filling(snap),
         }
+        # Pre-trade check: the broker validates volume, stops, margin and trading conditions
+        # WITHOUT placing anything. A rejected check never reaches order_send.
+        check = mt5.order_check(request)
+        if check is None:
+            return _fail(f"order_check returned None: {mt5.last_error()}")
+        if check.retcode not in (0, mt5.TRADE_RETCODE_DONE):
+            return _fail(f"order_check rejected: retcode={check.retcode} "
+                         f"{getattr(check, 'comment', '')}")
         result = mt5.order_send(request)
         if not _ok(result):
             detail = f"retcode={getattr(result, 'retcode', None)} {getattr(result, 'comment', '')}" \
                 if result is not None else f"order_send returned None: {mt5.last_error()}"
             return _fail(detail)
         ticket = _find_position_ticket(symbol, result.order) or result.order
-        return {"ok": True, "dry_run": False, "ticket": ticket,
-                "price": float(result.price or price), "message": "filled"}
+        filled = float(getattr(result, "volume", 0) or lots)
+        note = "filled" if abs(filled - float(lots)) < 1e-9 else \
+            f"filled {filled:g} of {float(lots):g} lots"          # partial fill is reported
+        return {"ok": True, "dry_run": False, "ticket": ticket, "volume": filled,
+                "price": float(result.price or price), "message": note}
 
 
 def modify_sltp(ticket: Any, symbol: str, sl: Optional[float], tp: Optional[float],

@@ -80,6 +80,8 @@ STATIC_MAP: Dict[str, List[str]] = {
 EQUITY_SUFFIXES = ["", ".US", ".NAS", ".NYSE", "#", ".O", ".N"]
 
 _cache: Dict[str, Optional[str]] = {}
+_missing: Dict[str, float] = {}          # ticker -> time it was last found NOT offered
+MISSING_RETRY_SECONDS = 600              # a "not offered" answer is remembered this long, not forever
 
 # MT5 SYMBOL_TRADE_MODE_*: 0 disabled, 1 long only, 2 short only, 3 close only, 4 full.
 TRADE_MODE_FULL = 4
@@ -156,21 +158,37 @@ def get_account_balance() -> Optional[float]:
 
 
 def notify_insufficient_balance(
-    balance: float,
+    balance: Optional[float],
     min_balance: float = 20.0,
     final_invest: Optional[List[str]] = None,
 ) -> None:
-    """Alert on Discord and write the weekly insufficient-funds log entry."""
-    shortfall = min_balance - balance
-    tickers = list(final_invest or [])
-    msg = (
-        "ACCOUNT BALANCE INSUFFICIENT - no trades were opened.\n"
-        f"Balance: ${balance:,.2f} | Minimum required: ${min_balance:,.2f} | "
-        f"Short by: ${shortfall:,.2f}\n"
-        f"Please deposit at least ${shortfall:,.2f}."
-    )
+    """Alert on Discord and write the weekly insufficient-funds log entry.
+
+    balance None = MetaTrader 5 could not be read (terminal not running / not logged in): the
+    alert is still sent, with the balance shown as unavailable."""
+    tickers = list(dict.fromkeys(final_invest or []))          # no duplicates, order kept
+    if balance is None:
+        shortfall = None
+        msg = (
+            "ACCOUNT BALANCE INSUFFICIENT\n\n"
+            "No trades were opened.\n\n"
+            "Balance: unavailable (MetaTrader 5 is not accessible)\n\n"
+            f"Minimum required: ${min_balance:,.2f}\n\n"
+            "Please make sure MetaTrader 5 is running and logged in, and that the balance is "
+            f"at least ${min_balance:,.2f}."
+        )
+    else:
+        shortfall = round(max(min_balance - balance, 0.01), 2)
+        msg = (
+            "ACCOUNT BALANCE INSUFFICIENT\n\n"
+            "No trades were opened.\n\n"
+            f"Balance: ${balance:,.2f}\n\n"
+            f"Minimum required: ${min_balance:,.2f}\n\n"
+            f"Short by: ${shortfall:,.2f}\n\n"
+            f"Please deposit at least ${shortfall:,.2f}."
+        )
     if tickers:
-        msg += f"\nBlocked tickers: {', '.join(tickers)}"
+        msg += f"\n\nBlocked tickers: {', '.join(tickers)}."
 
     try:
         from src.notifications.discord_notifier import DiscordNotifier
@@ -187,6 +205,7 @@ def notify_insufficient_balance(
             "min_required": min_balance,
             "shortfall": shortfall,
             "action": "trades_blocked",
+            "balance_readable": balance is not None,
             "final_invest": list(final_invest or []),
         }) + "\n")
 
@@ -231,8 +250,11 @@ def _get_insufficient_funds_log_path() -> Path:
 
 def resolve_mt5_symbol(ticker: str) -> Optional[str]:
     """Return the broker's name for `ticker`, or None if it is not offered."""
-    if ticker in _cache:
+    if _cache.get(ticker):
         return _cache[ticker]
+    import time as _time
+    if _time.time() - _missing.get(ticker, 0.0) < MISSING_RETRY_SECONDS:
+        return None                      # asked a moment ago and it was not offered
 
     found = None
     for name in candidates_for(ticker):
@@ -241,7 +263,22 @@ def resolve_mt5_symbol(ticker: str) -> Optional[str]:
             found = name
             break
 
-    _cache[ticker] = found
+    if found is None:
+        # The broker's own symbol list knows naming styles the suffix guesses do not ("#GFS").
+        try:
+            from src.data.broker_symbols import get_catalog
+            cat = get_catalog()
+            name = cat.resolve(ticker) if cat is not None else None
+            if name and mt5.symbol_select(name, True) and mt5.symbol_info(name) is not None:
+                found = name
+        except Exception:
+            pass
+
+    if found is not None:
+        _cache[ticker] = found
+        _missing.pop(ticker, None)
+    else:
+        _missing[ticker] = _time.time()  # never cached forever: a terminal hiccup must not stick
     return found
 
 

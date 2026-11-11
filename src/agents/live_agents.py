@@ -47,6 +47,8 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from src.data import mt5_orders
 from src.data.mt5_sizing import to_mt5_lots
+from src.data.ticker_memory import (TickerMemory, TRADE_REJECTED, BATCH_REJECTED, CLOSED, SEEN,
+                                    NOT_TRADABLE)
 from src.utils.async_timer import wait_for_entry
 
 
@@ -89,12 +91,18 @@ MAX_SPREAD_FRAC = _env_float("RAATS_MAX_SPREAD_FRAC_OF_RISK", 0.5)
 # the minimum lot (if the margin fits). The minimum lot can risk more than RAATS sized, so this
 # is an explicit choice; set to 0 to restore "never round up".
 SMALL_ACCOUNT_BALANCE = _env_float("RAATS_SMALL_ACCOUNT_BALANCE", 200.0)
+# Small-account exception: when RAATS sized below the broker's minimum lot, trade the minimum lot
+# anyway. This caps how many times larger than RAATS's own size that minimum lot may be
+# (= how far past the 1% risk budget it goes). 0 = no cap (the previous behaviour).
+MAX_MIN_LOT_OVERSIZE = _env_float("RAATS_MAX_MIN_LOT_OVERSIZE", 0.0)
 # Share of the free margin that is never used (0 = use all of it; a stop-out needs headroom).
 MARGIN_RESERVE_PCT = min(max(_env_float("RAATS_MARGIN_RESERVE_PCT", 0.0), 0.0), 0.9)
 # A candidate that cannot be paid for yet is retried after this many seconds.
 DEFER_RETRY_SEC = _env_float("RAATS_DEFER_RETRY_SEC", 60.0)
 # Live does not run below this MT5 balance (this amount or more passes).
 MIN_ACCOUNT_BALANCE = _env_float("RAATS_MIN_BALANCE", 20.0)
+BALANCE_READ_RETRIES = int(_env_float("RAATS_BALANCE_READ_RETRIES", 3))      # MT5 balance reads
+BALANCE_RETRY_SEC = _env_float("RAATS_BALANCE_RETRY_SEC", 2.0)
 # After a restart, final INVEST candidates analysed longer ago than this are discarded, not
 # restored: market conditions and the balance change, so old analysis is not reused.
 # (0 = never restore a final INVEST list.) Blocked candidates are never restored at all.
@@ -315,7 +323,7 @@ class BatchLedger:
     @staticmethod
     def batch_id(batch_no: int, when: Optional[datetime] = None) -> str:
         when = when or datetime.now()
-        return f"{when.year:04d}-{when.month:02d}-B{int(batch_no):03d}"
+        return f"batch{int(batch_no)}_{when.year:04d}_{when.month:02d}_{when.day:02d}"
 
     def append(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Add one event line (batch statuses, approvals, positions opened / closed, ...)."""
@@ -336,8 +344,10 @@ class BatchLedger:
                             "batch_id": self.batch_id(batch_no), "status": status, **info})
 
     def batches(self) -> Dict[int, Dict[str, Any]]:
-        """{batch_no: {batch_no, batch_id, status, history}} from this month's records."""
+        """{batch_no: {batch_no, batch_id, status, history}} from TODAY's records: the batch
+        counter restarts at 1 every day (ids look like batch1_2026_11_08)."""
         out: Dict[int, Dict[str, Any]] = {}
+        today = datetime.now().strftime("%Y-%m-%d")
         path = self.path()
         if not path.exists():
             return out
@@ -349,7 +359,8 @@ class BatchLedger:
                         rec = json.loads(line)
                     except ValueError:
                         continue
-                    if isinstance(rec, dict) and rec.get("type") == "batch_status" and "batch_no" in rec:
+                    if (isinstance(rec, dict) and rec.get("type") == "batch_status"
+                            and "batch_no" in rec and str(rec.get("time", "")).startswith(today)):
                         rows.append((str(rec.get("time", "")), i, rec))
         except OSError:
             return out
@@ -425,19 +436,24 @@ def decide_startup(ledger: BatchLedger) -> Dict[str, Any]:
             "abandon": None}
 
 
-def report_insufficient_funds(balance: float, tickers: List[str],
+def report_insufficient_funds(balance: Optional[float], tickers: List[str],
                               alert: Callable[[str], Any] = print) -> None:
-    """The insufficient-funds report: console, Discord (blocked tickers named) + weekly log,
-    the end-of-day blocked record, and a short 'live cannot run' message."""
-    shortfall = max(MIN_ACCOUNT_BALANCE - balance, 0.01)
+    """The insufficient-funds report: console, ONE Discord message ("ACCOUNT BALANCE
+    INSUFFICIENT", blocked tickers named) + the weekly log, and the end-of-day blocked record.
+
+    balance None = the MT5 balance could not be read (terminal not accessible): the same message
+    is sent, with the balance shown as unavailable. Nothing else goes to Discord."""
+    known = balance is not None
+    shortfall = max(MIN_ACCOUNT_BALANCE - balance, 0.01) if known else MIN_ACCOUNT_BALANCE
     print("\n" + "=" * 60)
     print("LIVE NOT STARTED - INSUFFICIENT FUNDS")
     print("=" * 60)
-    print(f"Account balance:   ${balance:,.2f}")
+    print(f"Account balance:   {f'${balance:,.2f}' if known else 'unavailable (MT5 not accessible)'}")
     print(f"Minimum required:  ${MIN_ACCOUNT_BALANCE:,.2f}")
-    print(f"Short by:          ${shortfall:,.2f}")
+    if known:
+        print(f"Short by:          ${shortfall:,.2f}")
     print(f"Blocked tickers:   {', '.join(tickers) if tickers else 'none'}")
-    try:        # Discord alert (blocked tickers named) + data/approvals/insufficient_funds_<week>.jsonl
+    try:        # the Discord message (blocked tickers named) + data/approvals/insufficient_funds_<week>.jsonl
         from src.data.mt5_bridge import notify_insufficient_balance
         notify_insufficient_balance(balance, MIN_ACCOUNT_BALANCE, list(tickers))
     except Exception as exc:
@@ -445,13 +461,10 @@ def report_insufficient_funds(balance: float, tickers: List[str],
     try:        # end-of-day record, as the first session did
         from src.agents.middleware.summarization_middleware import SummarizationMiddleware
         SummarizationMiddleware(starting_balance=balance).record_blocked_session(
-            balance=balance, min_balance=MIN_ACCOUNT_BALANCE, shortfall=shortfall,
-            tickers=list(tickers))
+            balance=balance, min_balance=MIN_ACCOUNT_BALANCE,
+            shortfall=shortfall if known else None, tickers=list(tickers))
     except Exception as exc:
         print(f"  WARNING: blocked-session record failed ({exc})")
-    alert(f"Live cannot be run: insufficient funds (balance ${balance:,.2f}, minimum "
-          f"${MIN_ACCOUNT_BALANCE:,.2f}). Blocked: {', '.join(tickers) or 'none'}. "
-          f"Deposit at least ${shortfall:,.2f}.")
 
 
 class MainAgent:
@@ -473,8 +486,11 @@ class MainAgent:
         max_positions: int = MAX_POSITIONS,
         monitor_sec: float = MONITOR_SEC,
         use_mt5: Optional[bool] = None,
+        memory: Optional[TickerMemory] = None,
     ):
         self.manager = manager
+        # short-term ticker memory (advisory): what you rejected / what just lost money
+        self.memory = memory if memory is not None else TickerMemory()
         self.rm = manager.risk_manager
         self.pool = pool
         self.notifier = notifier
@@ -583,20 +599,40 @@ class MainAgent:
         from src.agents.collector import collect_market_data
         return collect_market_data(ticker)
 
-    def _macro_block(self) -> Optional[Any]:
+    def _macro_checker(self) -> Any:
+        """The calendar checker, created once. On first use the calendar is verified and a
+        missing / expired calendar is reported (it would otherwise switch the block OFF silently)."""
+        if self._macro is None:
+            from src.data.macro_events import MacroEventChecker
+            self._macro = MacroEventChecker()
+            st = self._macro.status()
+            print(f"[macro] calendar: {st['count']} events, {st['upcoming']} upcoming, "
+                  f"next: {st.get('next')}; {st['unconfirmed_upcoming']} upcoming date(s) unconfirmed")
+            if not st["ok"]:
+                self._alert(f"Macro calendar problem: {st['reason']}. Entries are NOT protected "
+                            f"from macro events until it is fixed.", key="macro_calendar",
+                            cooldown=6 * 3600)
+        return self._macro
+
+    def _macro_block(self, ticker: Optional[str] = None) -> Optional[Any]:
+        """The active macro-event window that applies to `ticker`, else None.
+
+        Windows run `window_minutes` BEFORE and AFTER each event. Global events (Fed, ECB, US CPI
+        / NFP) block every ticker; the rest (BoE, BoC, China data) block only assets that trade
+        in the currencies they move. A failing check is reported, never silent."""
         try:
-            if self._macro is None:
-                from src.data.macro_events import MacroEventChecker
-                self._macro = MacroEventChecker()
-            return self._macro.is_event_window_active(min_impact="MEDIUM")
-        except Exception:
+            from src.data.macro_events import asset_currencies
+            cur = asset_currencies(ticker) if ticker else None
+            return self._macro_checker().is_event_window_active(min_impact="MEDIUM", currencies=cur)
+        except Exception as exc:
+            self._alert(f"Macro-event check FAILED ({exc}). Entries are NOT protected from macro "
+                        f"events until it works.", key="macro_error", cooldown=3600)
             return None
 
     def _portfolio_value(self) -> float:
         if self.use_mt5:
-            balance = mt5_orders.account_balance()
-            if balance:
-                return balance
+            # the REAL MT5 balance, never the simulated 10,000 (a balance of 0 is 0)
+            return float(mt5_orders.account_balance() or 0.0)
         return float(getattr(self.manager, "portfolio_value", 10_000))
 
     def _price_for_exit(self, rec: Dict[str, Any]) -> Optional[float]:
@@ -635,7 +671,7 @@ class MainAgent:
                 source=f"batch{batch}", batch=batch, ready=True, approved=True,
             ), front=True)
             if kept:
-                accepted.append(ticker)
+                accepted.append(ticker)    # NOT recorded in the memory yet: it has not run
         return accepted
 
     def sync_summary(self, batch_manager: Any) -> None:
@@ -743,6 +779,14 @@ class MainAgent:
         self._alert(f"Not opened: {ticker} - {reason}")
         return "drop"
 
+    def _skip_by_memory(self, cand: Candidate, reason: str) -> str:
+        """The ticker memory objects (you rejected it / it just lost): not proposed now."""
+        t = cand.ticker
+        self._forget(t)
+        self._event({"type": "candidate_skipped_memory", "ticker": t, "reason": reason})
+        self._alert(f"Skipped by ticker memory: {t} - {reason}", key=f"memory:{t}", cooldown=6 * 3600)
+        return "drop"
+
     def _defer(self, cand: Candidate, reason: str) -> str:
         """Cannot be paid for right now: it STAYS in final INVEST, the next candidate is tried, and
         this one is proposed again (new numbers, new approval) later."""
@@ -782,26 +826,30 @@ class MainAgent:
         approved = [c for c in (self.pool.get(t) for t in self.pool.tickers()) if c and c.approved]
         if not approved:
             return False                      # nothing has arrived yet
-        balance = mt5_orders.account_balance()
-        if balance is None:                   # unverified is never sufficient
-            if not self._gate_unavailable:
-                self._gate_unavailable = True
-                self._event({"type": "balance_unavailable"})
-                self._alert("The MT5 balance cannot be read: nothing is traded until it can be "
-                            "verified (asking again).", key="balance_unavailable", cooldown=3600)
-            return False
-        if balance >= MIN_ACCOUNT_BALANCE:
+        balance = None
+        for attempt in range(max(1, BALANCE_READ_RETRIES)):      # a short MT5 hiccup is not a block
+            balance = mt5_orders.account_balance()
+            if balance is not None:
+                break
+            if attempt + 1 < BALANCE_READ_RETRIES:
+                time.sleep(BALANCE_RETRY_SEC)
+        if balance is not None and balance >= MIN_ACCOUNT_BALANCE:
             self.balance_gate_passed = True
             self._gate_unavailable = False
             print(f"[main] balance ${balance:,.2f} >= ${MIN_ACCOUNT_BALANCE:,.2f}: trading may start")
             return True
+        # below the minimum, OR the balance cannot be read (MT5 not accessible): an unverified
+        # balance is never sufficient. Same message either way; on the first run it stops BOTH
+        # this agent and the trading loop (batch discovery).
+        if balance is None:
+            self._event({"type": "balance_unavailable"})
         by_batch: Dict[int, List[str]] = {}
         for c in approved:
             by_batch.setdefault(c.batch, []).append(c.ticker)
         tickers = [c.ticker for c in approved]
         self.blocked = True
         self.pool.drop(tickers)               # blocked, never recovered or recycled
-        report_insufficient_funds(balance, tickers, alert=self._alert)
+        report_insufficient_funds(balance, tickers, alert=self._alert)    # ONE Discord message
         info = {"reason": "BLOCKED_INSUFFICIENT_BALANCE", "balance": balance,
                 "min_balance": MIN_ACCOUNT_BALANCE, "tickers": tickers, "by_batch": by_batch}
         self._event({"type": "live_blocked", **info})
@@ -825,15 +873,30 @@ class MainAgent:
         if self.use_mt5:
             symbol = mt5_orders.resolve(t)
             if not symbol:
-                return self._drop(t, "not available on MT5 (or no price)"), None
+                # Guardrail: a ticker the broker does not offer goes into the ticker memory, so it
+                # is not discovered, analysed or proposed again. Only when the terminal ANSWERED:
+                # an MT5 outage must never be remembered as "not offered".
+                if mt5_orders.available():
+                    self.memory.record(NOT_TRADABLE, t, reason="symbol not found on MT5",
+                                       server=self.memory.current_server())
+                    return self._drop(t, "not offered by the broker (noted in the ticker memory)"), None
+                return self._drop(t, "not available on MT5 (terminal not reachable)"), None
             snap = mt5_orders.snapshot(symbol)
             if snap is None:
                 return self._drop(t, "not available on MT5 (or no price)"), None
             if snap["trade_mode"] != 4:
+                self.memory.record(NOT_TRADABLE, t, reason="MT5 trading not fully enabled", days=7,
+                                   server=self.memory.current_server())
                 return self._drop(t, "MT5 trading is not fully enabled for this symbol"), None
 
         price = (snap["bid"] + snap["ask"]) / 2 if snap else md["close"]
-        balance = self._portfolio_value()
+        # MT5 mode: the real balance, never a made-up number. `_portfolio_value()` turns an unreadable
+        # balance into 0.0 (typed float), which the risk manager would REJECT and so drop a good
+        # candidate on a momentary MT5 hiccup; here an unreadable balance defers instead.
+        balance: Optional[float] = (mt5_orders.account_balance() if self.use_mt5
+                                    else self._portfolio_value())
+        if balance is None:                    # MT5 mode and the balance cannot be read
+            return self._defer(cand, "the MT5 balance cannot be read; no proposal made"), None
         approved, units, d, reason = self.rm.validate_trade(
             ticker=t, signal="INVEST", current_price=price,
             portfolio_value=balance, atr=atr, m_norm=m_norm, is_top_five=False,
@@ -842,7 +905,7 @@ class MainAgent:
             return self._drop(t, f"risk manager: {reason}"), None
         direction = "LONG" if d == 1 else "SHORT"
 
-        lots, traded_units = None, units
+        lots, traded_units, oversize = None, units, None
         if snap:
             sized = to_mt5_lots(units, snap["contract_size"], snap["volume_min"], snap["volume_step"])
             if sized["feasible"]:
@@ -850,6 +913,11 @@ class MainAgent:
             elif "min_lot_units" in sized:
                 # RAATS sized it below the broker's minimum lot
                 if balance is not None and balance < SMALL_ACCOUNT_BALANCE:
+                    oversize = sized.get("oversize_factor")
+                    if MAX_MIN_LOT_OVERSIZE > 0 and oversize and oversize > MAX_MIN_LOT_OVERSIZE:
+                        return self._drop(
+                            t, f"the minimum lot is {oversize:.1f}x the size RAATS wanted "
+                               f"(cap {MAX_MIN_LOT_OVERSIZE:g}x); skipped"), None
                     lots = snap["volume_min"]          # small account: the smallest trade there is
                 else:
                     return self._defer(cand, sized["reason"]), None   # wait for the balance to grow
@@ -885,6 +953,8 @@ class MainAgent:
             "ticker": t, "mt5_symbol": symbol, "side": "BUY" if d == 1 else "SELL",
             "direction": direction, "batch": cand.batch, "confidence": cand.confidence,
             "balance": balance, "free_margin": free_margin, "required_margin": required_margin,
+            "oversize": oversize,
+            "paper": not self.use_mt5, "dry_run": bool(self.use_mt5 and not self.live),
             "lots": lots, "units": traded_units, "entry": ref, "stop_loss": sl, "take_profit": tp,
             "risk_amount": risk_amount, "reward_amount": reward_amount,
             "risk_reward": f"1:{rr:.1f}" if rr else "n/a", "time": _now(),
@@ -910,6 +980,8 @@ class MainAgent:
         cand.proposal = ctx["proposal"]
         cand.approval = "PENDING"
         cand.approval_rounds += 1
+        if cand.approval_rounds == 1:      # it ran: it passed the balance gate and is proposed to you.
+            self.memory.record(SEEN, t, batch=cand.batch)   # (tickers blocked for funds never get here)
         self._active = t
         self._event({"type": "trade_approval_requested", "ticker": t, "round": cand.approval_rounds,
                      "proposal": cand.proposal})
@@ -927,6 +999,11 @@ class MainAgent:
         self._event({"type": "trade_rejected", "ticker": t, "decision": decision,
                      "proposal": cand.proposal})
         self._alert(f"Trade not approved ({decision}): {t} will not be opened.")
+        if decision == "REJECT" and TRADE_REJECT_POLICY != "retry":
+            # a human decision; TIMEOUT / ERROR never count. With the "retry" policy you have
+            # asked to be asked again later, so the memory must not veto that.
+            self.memory.record(TRADE_REJECTED, t, batch=cand.batch,
+                               entry=(cand.proposal or {}).get("entry"))
         if TRADE_REJECT_POLICY == "retry":
             cand.approval, cand.proposal = "", {}
             cand.retry_at = time.time() + TRADE_REJECT_RETRY_SEC
@@ -958,7 +1035,25 @@ class MainAgent:
         delay = wait_for_entry(simulate=not self.live)
         print(f"  {t}: approved; entry delay {delay.seconds:.1f}s "
               f"({'simulated' if delay.simulated else 'waited'})")
-        # 5. revalidate balance, free margin, price and trading conditions
+        # 5. revalidate trading conditions, balance, free margin and price. The wait can be long:
+        #    a stop request, a macro window or a balance below the minimum must not be carried
+        #    through on the strength of an approval given earlier.
+        if self._stop.is_set() or self.should_stop():
+            return "halt"
+        event = self._macro_block(t)
+        if event:
+            self._alert(f"{t}: approved, but the {event.name} [{event.region}] window opened "
+                        f"during the entry delay; waiting.", key=f"macro:{event.event_type}",
+                        cooldown=900)
+            return "halt"
+        if self.use_mt5:
+            balance_now = mt5_orders.account_balance()
+            if balance_now is None:
+                return self._defer(cand, "the MT5 balance cannot be verified; not executed")
+            if balance_now < MIN_ACCOUNT_BALANCE:
+                return self._defer(
+                    cand, f"balance ${balance_now:,.2f} is below the ${MIN_ACCOUNT_BALANCE:,.2f} "
+                          f"minimum; not executed")
         status, ctx = self._prepare(cand)
         if status != "ok" or ctx is None:
             return status                          # dropped / deferred / halted: nothing is sent
@@ -976,6 +1071,11 @@ class MainAgent:
     def _submit(self, cand: Candidate, ctx: Dict[str, Any]) -> str:
         """6. submit the approved order to MT5 (or record the paper trade), confirm, record."""
         t = cand.ticker
+        # Hard guard: the ONLY way to an MT5 order is an individual APPROVE. Batch approval
+        # (entry to FinalInvestPool) never authorises execution.
+        if cand.approval != "APPROVE":
+            self._event({"type": "execution_refused", "ticker": t, "approval": cand.approval})
+            return self._drop(t, f"no trade approval ({cand.approval or 'none'}); not executed")
         symbol, snap, lots = ctx["symbol"], ctx["snap"], ctx["lots"]
         direction, d, ref = ctx["direction"], ctx["d"], ctx["ref"]
         sl, tp, traded_units = ctx["sl"], ctx["tp"], ctx["units"]
@@ -1035,11 +1135,15 @@ class MainAgent:
             return "drop"
         if len(self.open) >= self.max_positions:
             return "halt"
-        event = self._macro_block()
+        event = self._macro_block(t)
         if event:
-            self._alert(f"Opening paused: {event.name} ({event.event_type}) window active.",
-                        key="macro", cooldown=900)
-            return "halt"
+            self._alert(f"Opening paused: {event.name} [{event.region}] window active "
+                        f"(entries blocked {event.window_minutes} min before and after).",
+                        key=f"macro:{event.event_type}", cooldown=900)
+            if getattr(event, "global_risk", True):
+                return "halt"                       # moves every market: nothing opens
+            cand.retry_at = time.time() + 60        # moves only its currencies: try the next ticker
+            return "defer"
         if cand.approval == "PENDING":
             thread = cand.approval_thread
             if thread is not None and thread.is_alive():
@@ -1047,6 +1151,9 @@ class MainAgent:
             if cand.approval == "PENDING":         # the worker ended without an answer
                 cand.approval = "ERROR: no answer"
         if cand.approval == "":
+            why = self.memory.check(t)             # advisory: only decides whether to PROPOSE
+            if why:
+                return self._skip_by_memory(cand, why)
             status, ctx = self._prepare(cand)      # steps 2 + 3
             if status != "ok" or ctx is None:
                 return status
@@ -1236,6 +1343,7 @@ class MainAgent:
         if t not in self.manager.closed_positions_today:
             self.manager.closed_positions_today.append(t)
         pnl = 0.0 if pnl is None else pnl
+        self.memory.record(CLOSED, t, pnl=round(pnl, 2), reason=reason)
         icon = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
         self._alert(f"[{icon}] CLOSED {rec['direction']} {t} @ {exit_px} ({reason}) | "
                     f"entry {rec['entry']} | PnL {pnl:+.2f} | open {len(self.open)}/{self.max_positions}")
@@ -1408,9 +1516,35 @@ class LiveSink:
     def status(self, batch_no: int, status: str, **info: Any) -> None:
         print(f"[batches] batch {batch_no}: {status}")
         self.ledger.status(batch_no, status, **info)
+        if status == REJECTED and str(info.get("response", "")).upper() in ("REJECT", "MODIFY"):
+            for t in info.get("tickers") or []:          # information only: a batch is all-or-nothing
+                self.main.memory.record(BATCH_REJECTED, t, batch=batch_no)
 
     def alert(self, message: str, key: Optional[str] = None, cooldown: float = 1800.0) -> None:
         self.main._alert(message, key=key, cooldown=cooldown)
+
+    def memory_check(self, ticker: str) -> Optional[str]:
+        """Ticker memory for the batch pipeline: asked BEFORE a ticker is scored or analysed."""
+        return self.main.memory.check(ticker)
+
+    def final_outcome(self, outcomes: List[Tuple[int, str]]) -> None:
+        """The batch runner calls this when a batch found no (or too few) tickers; it then waits and
+        starts the next batch. Reports what every batch of this run did so far."""
+        lines = [f"batch {n}: {outcome}" for n, outcome in outcomes]
+        handed = sum(1 for _, o in outcomes if o == "handed")
+        message = (
+            "NO NEW TICKERS FOUND\n\n"
+            "Discovery found no (or too few) new broker-supported tickers. The next batch starts "
+            "automatically after the retry wait. Open positions keep being monitored.\n\n"
+            f"Batches this run: {len(outcomes)} ({handed} approved and handed over)\n"
+            + "\n".join(lines)
+        )
+        print(f"\n[batches] {message}")
+        try:
+            self.main._event({"type": "batches_finished", "outcomes": [list(o) for o in outcomes]})
+        except Exception:
+            pass
+        self.alert(message, key="final_outcome", cooldown=3600.0)
 
     # -- the hand-over to the main agent
     def handover(self, manager: Any, batch_no: int, tickers: List[str], first_batch: bool) -> List[str]:
@@ -1436,6 +1570,23 @@ def _keep_mt5_connected() -> None:
         pass
 
 
+def _apply_global_block(ledger: BatchLedger, main: "MainAgent", info: Dict[str, Any]) -> None:
+    """The initial balance gate failed: ONE global block for both modules. The trading loop's
+    GLOBAL_STATE is set (its batch runner stops discovering and any approval still to be sent is
+    cancelled), every batch involved is recorded INSUFFICIENT_FUNDS and no candidate is kept for
+    a later run."""
+    try:
+        from src.agents.trading_loop_dynamic import GLOBAL_STATE, BLOCKED_INSUFFICIENT_BALANCE
+        GLOBAL_STATE.block(BLOCKED_INSUFFICIENT_BALANCE,
+                           **{k: v for k, v in info.items() if k != "reason"})
+    except Exception as exc:
+        _log_error("-", exc, "global_block")
+    for batch_no, tickers in (info.get("by_batch") or {}).items():
+        ledger.status(batch_no, INSUFFICIENT_FUNDS, tickers=tickers, balance=info.get("balance"))
+    discard_pool_state()
+    main.stop()
+
+
 def _prepare_live(manager: Any, notifier: Any, ledger: BatchLedger, use_mt5: bool,
                   handed: bool = False) -> Tuple["MainAgent", FinalInvestPool, Any]:
     """The main agent + the background batch runner around one manager (not started yet).
@@ -1451,6 +1602,7 @@ def _prepare_live(manager: Any, notifier: Any, ledger: BatchLedger, use_mt5: boo
     main = MainAgent(manager, pool, notifier=notifier, event_sink=_append_event, use_mt5=use_mt5)
     manager.starting_balance = main._start_balance()
     main.on_state_change = lambda: save_pool_state(pool)
+    main.on_blocked = lambda info: _apply_global_block(ledger, main, info)
     main.recover_open_positions()
     restored = load_pool_state(pool)
     recovered = main.open_count()
@@ -1468,9 +1620,11 @@ def _prepare_live(manager: Any, notifier: Any, ledger: BatchLedger, use_mt5: boo
         print(f"[live] batch {n} handed to the main agent: {accepted}")
     if use_mt5:
         _keep_mt5_connected()
-    from src.agents.trading_loop_dynamic import BatchRunner      # the threaded batch pipeline
+    from src.agents.trading_loop_dynamic import BatchRunner      # the batch runner
+    from src.agents.deep_batch import DeepBatchPipeline          # Deep Agents: main agent + 3 subagents
     runner = BatchRunner(LiveSink(main, ledger, use_mt5), use_mt5,
-                         first_batch=not (recovered or restored))
+                         first_batch=not (recovered or restored),
+                         pipeline_cls=DeepBatchPipeline)         # RAATS_DEEP_AGENTS=0 -> plain threads
     return main, pool, runner
 
 
@@ -1511,7 +1665,8 @@ def run_live(notifier: Any = None) -> None:
        approved on Discord, passed to the main agent and opened one by one; batches 2, 3, ...
        continue where the previous discovery stopped.
     """
-    use_mt5 = _env_flag("RAATS_USE_MT5")
+    from src.agents.trading_loop_dynamic import mt5_enabled
+    use_mt5 = mt5_enabled()                 # auto: on when the MT5 terminal answers
     ledger = BatchLedger()
     plan = decide_startup(ledger)
     print(f"[live] startup case {plan['case']}: next batch {plan['batch_no']} "
@@ -1519,7 +1674,9 @@ def run_live(notifier: Any = None) -> None:
     if plan["abandon"] is not None:
         ledger.status(plan["abandon"], ABANDONED, reason="restart: its threads did not survive")
 
-    from src.agents.trading_loop_dynamic import DynamicTradingManager, _live_portfolio_value
+    from src.agents.trading_loop_dynamic import (
+        DynamicTradingManager, _live_portfolio_value, GLOBAL_STATE)
+    GLOBAL_STATE.reset()                 # a fresh run starts unblocked; the gate decides again
     # the live manager: its RiskManager is the one the main agent trades with
     manager = DynamicTradingManager(
         top_50_performing=[], top_10=[], waiting_list=[],

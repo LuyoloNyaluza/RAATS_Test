@@ -70,6 +70,8 @@ class ApprovalRequest:
     expires_at: Optional[str] = None
     send_error: Optional[str] = None
     log_file: Optional[str] = None
+    kind: str = "batch"                          # "batch" (FinalInvestPool) | "trade" (one MT5 trade)
+    proposal: Optional[Dict[str, Any]] = None    # the trade proposal when kind == "trade"
 
 
 class DiscordAPIError(RuntimeError):
@@ -226,8 +228,55 @@ class DiscordNotifier:
         return text if text in VALID_RESPONSES else None
 
     # ------------------------------------------------------------- approvals
+    @staticmethod
+    def _num(value: Any, fmt: str = "{:,.2f}", prefix: str = "", suffix: str = "") -> str:
+        try:
+            return f"{prefix}{fmt.format(float(value))}{suffix}"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    def _format_trade_request(self, req: ApprovalRequest) -> str:
+        """RAATS - Trade Execution Approval: ONE trade, with the figures the human decides on."""
+        p = req.proposal or {}
+        rows = [
+            ("Account balance", self._num(p.get("balance"), prefix="$")),
+            ("Available margin", self._num(p.get("free_margin"), prefix="$")),
+            ("Required margin", self._num(p.get("required_margin"), prefix="$")),
+            ("Position size", self._num(p.get("lots"), "{:g}", suffix=" lots")
+             if p.get("lots") is not None else self._num(p.get("units"), "{:,.4f}", suffix=" units")),
+            ("Entry price", self._num(p.get("entry"), "{:,.4f}", prefix="$")),
+            ("Stop Loss", self._num(p.get("stop_loss"), "{:,.4f}", prefix="$")),
+            ("Take Profit", self._num(p.get("take_profit"), "{:,.4f}", prefix="$")),
+            ("Risk amount", self._num(p.get("risk_amount"), prefix="$")),
+            ("Risk-to-Reward", str(p.get("risk_reward") or "N/A")),
+        ]
+        width = max(len(k) for k, _ in rows)
+        table = "\n".join(f"{k.ljust(width)}  {v}" for k, v in rows)
+        symbol = p.get("mt5_symbol")
+        keys = " \u00b7 ".join(f"{EMOJI[o]} {o.lower()}" for o in req.options if o in EMOJI)
+        return "\n".join([
+            "\U0001F514 **RAATS \u2013 Trade Execution Approval**",
+            "Awaiting approval",
+            *(["\u26a0\ufe0f **PAPER MODE** \u2013 simulated balance, no order will be sent to MT5"]
+              if p.get("paper") else
+              ["\u2139\ufe0f **DRY RUN** \u2013 real MT5 figures, live orders are disabled"]
+              if p.get("dry_run") else []),
+            f"Request: `{req.request_id}`",
+            f"Ticker: **{p.get('ticker') or (req.final_invest or ['?'])[0]}**"
+            + (f" ({symbol})" if symbol else "")
+            + f" \u2014 {p.get('side', '')} {p.get('direction', '')}".rstrip(),
+            "```", table, "```",
+            *([f"\u26a0\ufe0f Minimum lot is {float(p['oversize']):.1f}x the size RAATS wanted "
+               f"(risk is above its normal budget)"]
+              if p.get("oversize") and float(p["oversize"]) > 1.0 else []),
+            f"React within {self.timeout_minutes:g} min: {keys}",
+            "_Approving this trade starts the entry timer; the order is sent to MT5 only after it._",
+        ])
+
     def _format_request(self, req: ApprovalRequest) -> str:
-        lines = ["\U0001F514 **RAATS trade approval required**",
+        if req.kind == "trade":
+            return self._format_trade_request(req)
+        lines = ["\U0001F514 **RAATS \u2013 Batch approval (candidates for FinalInvestPool)**",
                  f"Request: `{req.request_id}`",
                  f"Final INVEST list ({len(req.final_invest)}):"]
         for t in req.final_invest:
@@ -237,9 +286,7 @@ class DiscordNotifier:
                 lines.append(f"  {mark} {t} \u2192 {info.get('mt5_symbol') or 'N/A'} (spread: {info.get('spread_pct', 'N/A')}%)")
             else:
                 lines.append(f"  \u2022 {t}")
-        if req.account_balance is not None:
-            warn = f"  \u26a0\ufe0f below ${self.min_balance:,.0f} minimum" if req.account_balance < self.min_balance else ""
-            lines.append(f"\U0001F4B0 Balance: ${req.account_balance:,.2f}{warn}")
+        # no balance and no shortfall here: the Main Agent checks the balance after the pool
         keys = " \u00b7 ".join(f"{EMOJI[o]} {o.lower()}" for o in req.options if o in EMOJI)
         lines.append(f"React within {self.timeout_minutes:g} min: {keys}")
         return "\n".join(lines)
@@ -251,6 +298,8 @@ class DiscordNotifier:
         account_balance: Optional[float] = None,
         options: Optional[List[str]] = None,
         request_id: Optional[str] = None,
+        kind: str = "batch",
+        proposal: Optional[Mapping[str, Any]] = None,
     ) -> ApprovalRequest:
         now = datetime.now(timezone.utc)
         req = ApprovalRequest(
@@ -260,6 +309,8 @@ class DiscordNotifier:
             mt5_data=dict(mt5_data or {}),
             account_balance=account_balance,
             options=list(options or DISPLAY_ORDER),
+            kind=kind,
+            proposal=dict(proposal) if proposal else None,
             expires_at=(now + timedelta(minutes=self.timeout_minutes)).isoformat(),
         )
         req.log_file = str(self._weekly_log_path())
@@ -280,6 +331,20 @@ class DiscordNotifier:
                   f"Approve by hand: {self._manual_hint(req.request_id)}")
         self._append(asdict(req), Path(req.log_file))
         return req
+
+    def send_trade_approval_request(self, proposal: Mapping[str, Any]) -> ApprovalRequest:
+        """The SECOND approval (live_agents.py): one trade, APPROVE or REJECT only.
+
+        Approval of a batch (send_approval_request) never authorises an order; only this one does.
+        MODIFY is not offered: anything but APPROVE means the trade is not executed.
+        """
+        return self.send_approval_request(
+            final_invest=[str(proposal.get("ticker", ""))],
+            account_balance=proposal.get("balance"),
+            options=["APPROVE", "REJECT"],
+            kind="trade",
+            proposal=proposal,
+        )
 
     @staticmethod
     def _manual_hint(request_id: str) -> str:

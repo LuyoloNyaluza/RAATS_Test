@@ -15,6 +15,17 @@ from src.data.mt5_bridge import get_account_balance
 MIN_ACCOUNT_BALANCE = float(os.environ.get("RAATS_MIN_BALANCE", "20"))
 
 
+def _read_balance() -> Optional[float]:
+    """MT5 balance WITHOUT shutting the terminal down. mt5_bridge.get_account_balance() calls
+    mt5.shutdown() after each read, which would cut the live agents off mid-call; the order layer
+    reads through its own locked, reconnecting session. The bridge is only the fallback."""
+    try:
+        from src.data import mt5_orders
+        return mt5_orders.account_balance()
+    except Exception:
+        return get_account_balance()
+
+
 class SummarizationMiddleware:
     """
     Runs at end of trading day to:
@@ -42,7 +53,7 @@ class SummarizationMiddleware:
         # here, but this object is built at session END, so "starting" equalled
         # "closing" and balance_change was always ~0.
         self.starting_balance = (
-            starting_balance if starting_balance is not None else get_account_balance()
+            starting_balance if starting_balance is not None else _read_balance()
         )
 
     def process_session_end(self, session_results: Dict[str, Any]) -> Dict[str, Any]:
@@ -101,7 +112,7 @@ class SummarizationMiddleware:
         metrics["closed_trades"] = len(manager.risk_manager.closed_trades)
         metrics["final_invest_count"] = len(manager.final_invest)
 
-        closing_balance = get_account_balance()
+        closing_balance = _read_balance()
 
         mt5_summary = {}
         if manager.mt5_data:
@@ -182,18 +193,27 @@ class SummarizationMiddleware:
 
     def record_blocked_session(
         self,
-        balance: float,
+        balance: Optional[float],
         min_balance: float,
-        shortfall: float,
+        shortfall: Optional[float],
         tickers: Optional[list] = None,
         reason: str = "insufficient_balance",
     ) -> Dict[str, Any]:
         """Write the end-of-day record for a session stopped by the balance guard.
 
-        The Discord alert is sent separately (mt5_bridge.notify_insufficient_balance),
-        so this does not post again.
+        balance None = MetaTrader 5 could not be read (reason "mt5_unavailable"). The Discord
+        alert is sent separately (mt5_bridge.notify_insufficient_balance), so this does not post
+        again.
         """
         now = datetime.now()
+        known = balance is not None
+        if not known:
+            reason = "mt5_unavailable"
+            message = (f"No trades were opened: the MT5 balance could not be read (terminal not "
+                       f"accessible). The ${min_balance:,.2f} minimum could not be verified.")
+        else:
+            message = (f"No trades were opened: balance ${balance:,.2f} is below the "
+                       f"${min_balance:,.2f} minimum. Deposit at least ${shortfall:,.2f}.")
         record = {
             "week": now.isocalendar()[1],
             "day": now.strftime("%A"),
@@ -204,16 +224,13 @@ class SummarizationMiddleware:
             "blocked_reason": reason,
             "starting_balance": balance,
             "closing_balance": balance,
-            "balance_change": 0.0,
+            "balance_change": 0.0 if known else None,
             "min_balance": min_balance,
             "balance_shortfall": shortfall,
             "final_invest": [],
             "blocked_tickers": list(tickers or []),
             "open_trades": 0,
-            "message": (
-                f"No trades were opened: balance ${balance:,.2f} is below the "
-                f"${min_balance:,.2f} minimum. Deposit at least ${shortfall:,.2f}."
-            ),
+            "message": message,
         }
         self._save_jsonl(record)
         log_session_summary(

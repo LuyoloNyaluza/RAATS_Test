@@ -22,6 +22,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
+import numpy as np
 import pandas as pd
 import pandas_ta as ta  # noqa: F401
 import yfinance as yf
@@ -32,6 +33,11 @@ from src.data.score_sentiment import (
 )
 
 logger = logging.getLogger("raats.agents.collector")
+
+# How much daily history the cached indicator file holds. 90 days (~62 bars) left RSI/ATR with a
+# poorly seeded warm-up and SMA_50 / MACD unusable; ~6 months (~125 bars) fixes both.
+HISTORY_DAYS = int(os.environ.get("RAATS_HISTORY_DAYS", "180"))
+RSI_LENGTH = 14
 
 
 _ATR_COLUMN_CANDIDATES = (
@@ -126,6 +132,88 @@ def _truncate_to_as_of(
     return truncated
 
 
+def _indicator_path(ticker: str) -> str:
+    return f"data/processed/indicators/{ticker}_indicators.csv"
+
+
+def _download_history(ticker: str, data_path: str) -> None:
+    """Download HISTORY_DAYS of daily bars, add the indicators and (re)write the cache file.
+
+    The full indicator set from src/data/market_data.py is used when importable, so a refresh
+    never removes columns (SMA_20/50, EMA, MACD) that other modules read from the same file."""
+    end = datetime.now()
+    start = end - timedelta(days=HISTORY_DAYS)
+    df = yf.download(ticker, start=start, end=end, progress=False)
+    if df is None or df.empty:
+        raise RuntimeError(
+            f"No data returned for {ticker} - check ticker symbol, yfinance version, "
+            f"or possible rate limiting."
+        )
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    try:
+        from src.data.market_data import add_technical_indicators
+        df = add_technical_indicators(df)
+    except Exception:                       # fall back to the three indicators RAATS needs
+        df.ta.sma(length=10, append=True)
+        df.ta.rsi(length=RSI_LENGTH, append=True)
+        df.ta.atr(length=14, append=True)
+    os.makedirs(os.path.dirname(data_path), exist_ok=True)
+    df.to_csv(data_path)
+
+
+def _is_stale(df: pd.DataFrame) -> bool:
+    """True when the cached file is older than the previous business day (so a cache written
+    once is never served for weeks). A market holiday can trigger one harmless extra refresh."""
+    last_bar = pd.Timestamp(df.index[-1]).normalize()
+    expected = pd.Timestamp.now().normalize() - pd.offsets.BDay(1)
+    return last_bar < expected
+
+
+def _mask_rsi_warmup(df: pd.DataFrame) -> pd.DataFrame:
+    """RSI needs RSI_LENGTH bars before it means anything; earlier values (0.0, 6.5, ...) are
+    warm-up artefacts. Blank them, including in older cached files."""
+    if "RSI_14" not in df.columns or len(df) == 0:
+        return df
+    df = df.copy()
+    rsi = df["RSI_14"].astype(float)        # Series.iloc slice assignment: type-safe
+    rsi.iloc[:RSI_LENGTH] = np.nan
+    df["RSI_14"] = rsi
+    return df
+
+
+def _load_indicator_frame(ticker: str, as_of: Optional[str]):
+    """Cached indicator frame (refreshed when stale, live mode only) -> (df, atr_column)."""
+    data_path = _indicator_path(ticker)
+
+    if not os.path.exists(data_path):
+        if as_of is not None:
+            raise RuntimeError(
+                f"No cached data for {ticker} and as_of={as_of} was requested. "
+                f"Simulation requires pre-fetched historical data; "
+                f"run src/data/market_data.py first."
+            )
+        _download_history(ticker, data_path)
+
+    df = pd.read_csv(data_path, index_col=0, parse_dates=True)
+    if df.empty:
+        raise RuntimeError(f"{data_path} exists but contains no rows.")
+
+    if as_of is None and _is_stale(df):
+        try:
+            _download_history(ticker, data_path)
+            df = pd.read_csv(data_path, index_col=0, parse_dates=True)
+            logger.info("%s: indicator cache refreshed (last bar %s).", ticker, df.index[-1])
+        except Exception as exc:            # keep serving the cache, but say so
+            logger.warning("%s: cache is stale (last bar %s) and refresh failed: %s",
+                           ticker, df.index[-1], exc)
+
+    df = _mask_rsi_warmup(df)
+    df, atr_col = _ensure_atr(df)
+    df = _truncate_to_as_of(df, as_of, ticker)
+    return df, atr_col
+
+
 def collect_market_data(
     ticker: str = "AAPL",
     as_of: Optional[str] = None,
@@ -133,133 +221,28 @@ def collect_market_data(
     """
     Collect the latest available market data.
 
-    When as_of is supplied, only historical data up to that date
-    is visible.
+    When as_of is supplied, only historical data up to that date is visible.
+    In live mode a cache older than the previous business day is refreshed first.
     """
-
-    data_path = (
-        f"data/processed/indicators/"
-        f"{ticker}_indicators.csv"
-    )
-
-    if not os.path.exists(data_path):
-
-        if as_of is not None:
-            raise RuntimeError(
-                f"No cached data for {ticker} and "
-                f"as_of={as_of} was requested. "
-                f"Simulation requires pre-fetched historical "
-                f"data; run src/data/market_data.py first."
-            )
-
-        end = datetime.now()
-        start = end - timedelta(days=90)
-
-        df = yf.download(
-            ticker,
-            start=start,
-            end=end,
-            progress=False,
-        )
-
-        if df is None or df.empty:
-            raise RuntimeError(
-                f"No data returned for {ticker} - "
-                f"check ticker symbol, yfinance version, "
-                f"or possible rate limiting."
-            )
-
-        if isinstance(
-            df.columns,
-            pd.MultiIndex,
-        ):
-            df.columns = (
-                df.columns
-                .get_level_values(0)
-            )
-
-        df.ta.sma(
-            length=10,
-            append=True,
-        )
-
-        df.ta.rsi(
-            length=14,
-            append=True,
-        )
-
-        df.ta.atr(
-            length=14,
-            append=True,
-        )
-
-        os.makedirs(
-            os.path.dirname(data_path),
-            exist_ok=True,
-        )
-
-        df.to_csv(data_path)
-
-    df = pd.read_csv(
-        data_path,
-        index_col=0,
-        parse_dates=True,
-    )
-
-    if df.empty:
-        raise RuntimeError(
-            f"{data_path} exists but contains no rows."
-        )
-
-    df, atr_col = _ensure_atr(df)
-
-    df = _truncate_to_as_of(
-        df,
-        as_of,
-        ticker,
-    )
-
+    df, atr_col = _load_indicator_frame(ticker, as_of)
     latest = df.iloc[-1]
 
-    for col in (
-        "RSI_14",
-        "SMA_10",
-        atr_col,
-    ):
-        if pd.isna(
-            latest.get(col)
-        ):
+    for col in ("RSI_14", "SMA_10", atr_col):
+        if pd.isna(latest.get(col)):
             raise RuntimeError(
                 f"Latest row for {ticker}"
                 f"{f' as of {as_of}' if as_of else ''} "
-                f"has NaN {col} - not enough history yet "
-                f"at this point."
+                f"has NaN {col} - not enough history yet at this point."
             )
 
-    latest_timestamp = pd.to_datetime(
-        df.index[-1]
-    )
-
-    recent_closes = [
-        float(x)
-        for x in df["Close"]
-        .iloc[-30:]
-        .tolist()
-    ]
+    latest_timestamp = pd.to_datetime(df.index[-1])
+    recent_closes = [float(x) for x in df["Close"].iloc[-30:].tolist()]
 
     return {
-        "close": float(
-            latest["Close"]
-        ),
-        "sma_10": float(
-            latest["SMA_10"]
-        ),
-        "rsi": float(
-            latest["RSI_14"]
-        ),
-        "atr": float(
-            latest[atr_col]
-        ),
+        "close": float(latest["Close"]),
+        "sma_10": float(latest["SMA_10"]),
+        "rsi": float(latest["RSI_14"]),
+        "atr": float(latest[atr_col]),
         "closes": recent_closes,
         "timestamp": latest_timestamp.isoformat(),
     }
@@ -474,206 +457,60 @@ def collect_sentiment(
     as_of: Optional[str] = None,
     discovery_news: Optional[dict] = None,
 ) -> float:
+    """Sentiment in [-1, 1].
 
-    # Historical simulation must not use current discovery news.
+    Historical simulation (as_of) never uses live news: RSI-derived proxy.
+    Live: discovery's scored articles (confidence-weighted) -> an existing scored file ->
+    RSI proxy (when allowed). Articles whose scores carry no confidence are NOT treated as a
+    neutral 0.0: they fall through to the next source with a warning."""
+
+    def _rsi_proxy(**kw) -> float:
+        rsi = collect_market_data(ticker, **kw)["rsi"]
+        return max(-1.0, min(1.0, (rsi - 50) / 50))
+
     if as_of is not None:
-        data = collect_market_data(
-            ticker,
-            as_of=as_of,
-        )
+        return _rsi_proxy(as_of=as_of)
 
-        rsi = data["rsi"]
-        sentiment = (rsi - 50) / 50
-
-        return max(
-            -1.0,
-            min(1.0, sentiment),
-        )
-
-    articles = _flatten_discovery_news(
-        discovery_news
-    )
-
+    articles = _flatten_discovery_news(discovery_news)
     if articles:
-
-        score_values = {
-            "positive": 1.0,
-            "negative": -1.0,
-            "neutral": 0.0,
-        }
-
+        score_values = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}
         weighted_score = 0.0
         total_weight = 0.0
-
         for article in articles:
-
-            sentiment = str(
-                article.get(
-                    "sentiment",
-                    "neutral",
-                )
-            ).lower()
-
-            confidence = float(
-                article.get(
-                    "confidence",
-                    0.0,
-                )
-                or 0.0
-            )
-
-            weighted_score += (
-                score_values.get(
-                    sentiment,
-                    0.0,
-                )
-                * confidence
-            )
-
+            sentiment = str(article.get("sentiment", "neutral")).lower()
+            confidence = float(article.get("confidence", 0.0) or 0.0)
+            weighted_score += score_values.get(sentiment, 0.0) * confidence
             total_weight += confidence
-
         if total_weight > 0:
-            return max(
-                -1.0,
-                min(
-                    1.0,
-                    weighted_score / total_weight,
-                ),
-            )
+            return max(-1.0, min(1.0, weighted_score / total_weight))
+        logger.warning("%s: %d discovered articles carry no sentiment confidence - "
+                       "trying the next source.", ticker, len(articles))
 
-        return 0.0
-
-    # Existing scored-file fallback
-    articles = _load_latest_scored_sentiment(
-        ticker
-    )
-
-    if articles:
-        return _sentiment_score_from_articles(
-            articles
-        )
+    scored = _load_latest_scored_sentiment(ticker)
+    if scored:
+        logger.info("%s: using existing scored-news file.", ticker)
+        return _sentiment_score_from_articles(scored)
 
     if not allow_rsi_fallback:
         raise RuntimeError(
-            f"No scored sentiment available for {ticker}."
+            f"No scored sentiment available for {ticker}. Discovery supplied no usable "
+            f"news and no scored file exists at data/raw/news/{ticker}_news_scored.json."
         )
 
-    logger.warning(
-        "%s: no discovered/scored news found - "
-        "falling back to RSI-derived proxy.",
-        ticker,
-    )
-
-    data = collect_market_data(ticker)
-
-    rsi = data["rsi"]
-    sentiment = (rsi - 50) / 50
-
-    return max(
-        -1.0,
-        min(1.0, sentiment),
-    )   
-    # ---------------------------------------------------------
-    # LIVE MODE - DISCOVERY NEWS
-    # ---------------------------------------------------------
-    if discovery_news:
-
-        scored_sentiment = (
-            _score_discovery_news(
-                ticker,
-                discovery_news,
-            )
-        )
-
-        if scored_sentiment is not None:
-            return scored_sentiment
-
-    # ---------------------------------------------------------
-    # LIVE MODE - EXISTING SCORED FILE
-    # ---------------------------------------------------------
-    articles = _load_latest_scored_sentiment(
-        ticker
-    )
-
-    if articles is not None:
-
-        logger.info(
-            "%s: using existing scored-news file.",
-            ticker,
-        )
-
-        return _sentiment_score_from_articles(
-            articles
-        )
-
-    # ---------------------------------------------------------
-    # LIVE MODE - RSI FALLBACK
-    # ---------------------------------------------------------
-    if not allow_rsi_fallback:
-
-        raise RuntimeError(
-            f"No scored sentiment available for "
-            f"{ticker}. Discovery supplied no usable "
-            f"news and no scored file exists at "
-            f"data/raw/news/{ticker}_news_scored.json."
-        )
-
-    logger.warning(
-        "%s: no discovered/scored news found - "
-        "falling back to RSI-derived proxy.",
-        ticker,
-    )
-
-    data = collect_market_data(
-        ticker
-    )
-
-    rsi = data["rsi"]
-
-    sentiment = (
-        rsi - 50
-    ) / 50
-
-    return max(
-        -1.0,
-        min(1.0, sentiment),
-    )
+    logger.warning("%s: no discovered/scored news found - falling back to RSI-derived proxy.",
+                   ticker)
+    return _rsi_proxy()
 
 
 def collect_ohlcv_frame(
     ticker: str = "AAPL",
     as_of: Optional[str] = None,
 ) -> pd.DataFrame:
-    """
-    Full OHLCV DataFrame for the stability filter.
-    """
-
-    data_path = (
-        f"data/processed/indicators/"
-        f"{ticker}_indicators.csv"
-    )
-
-    if not os.path.exists(data_path):
-        collect_market_data(
-            ticker,
-            as_of=as_of,
-        )
-
-    df = pd.read_csv(
-        data_path,
-        index_col=0,
-        parse_dates=True,
-    )
-
-    df, _ = _ensure_atr(df)
-
-    df = _truncate_to_as_of(
-        df,
-        as_of,
-        ticker,
-    )
-
+    """Full OHLCV DataFrame (with indicators) for the stability filter."""
+    df, _ = _load_indicator_frame(ticker, as_of)
     return df
+
+
 def _flatten_discovery_news(discovery_news):
     if not discovery_news:
         return []
