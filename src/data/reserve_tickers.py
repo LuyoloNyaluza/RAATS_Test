@@ -31,8 +31,9 @@ keep the reserve working when that happens. Run
 to see what each source returned, and which method was used.
 """
 
+import os
 import re
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
 from urllib.parse import unquote
 
 import requests
@@ -40,6 +41,7 @@ import requests
 TRENDING_URL = "https://finance.yahoo.com/markets/stocks/trending/"
 WORLD_INDICES_URL = "https://finance.yahoo.com/markets/world-indices/"
 MOST_ACTIVE_URL = "https://finance.yahoo.com/markets/stocks/most-active/"
+WEEK52_URL = "https://finance.yahoo.com/markets/stocks/52-week-gainers/"
 TRENDING_API_URL = "https://query1.finance.yahoo.com/v1/finance/trending/US"
 
 PER_SOURCE = 10          # tickers taken from each source
@@ -149,6 +151,113 @@ def fetch_most_active(count: int = FETCH_COUNT) -> Tuple[List[str], str]:
     return [], "none"
 
 
+DEEP_PAGE = 25            # rows per screener page
+DEEP_MAX = 250            # how deep the top-up may read
+
+
+def deep_most_active(max_symbols: int = DEEP_MAX) -> Iterable[str]:
+    """Most-active symbols BEYOND the first page, read page by page (yfinance screener).
+
+    Only used to top the reserve up to 30 when duplicates / untradable symbols left a source
+    short. The Yahoo page shows 25 rows; this goes deeper. Stops on an empty or repeated page."""
+    try:
+        import yfinance as yf
+    except Exception:
+        return
+    seen_pages, offset = set(), 0
+    while offset < max_symbols:
+        try:
+            quotes = yf.screen("most_actives", count=DEEP_PAGE, offset=offset).get("quotes", [])
+        except Exception:
+            return
+        page = [normalize(q.get("symbol", "")) for q in quotes if q.get("symbol")]
+        if not page or tuple(page) in seen_pages:
+            return
+        seen_pages.add(tuple(page))
+        for sym in page:
+            yield sym
+        offset += len(page)
+
+
+# ---------------------------------------------------------------- 52-week gainers
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+WEEK52_MAX = _env_int("RAATS_52W_MAX", 300)     # how deep the 52-week list may be read
+WEEK52_LAST: Dict[str, Any] = {"html": 0, "screener": 0}   # what the last read used (for logging)
+
+
+def _html_pages(url: str, max_symbols: int) -> Iterable[str]:
+    """Symbols of a Yahoo markets table, page by page (?start=&count=, 25 rows a page).
+
+    Lazy: a consumer that has enough stops the reading. Stops on an empty or repeated page
+    (a repeated page means Yahoo ignored the paging parameters)."""
+    seen_pages, start = set(), 0
+    while start < max_symbols:
+        page_url = url if start == 0 else f"{url}?start={start}&count={DEEP_PAGE}"
+        page = _page_symbols(page_url)
+        if not page or tuple(page) in seen_pages:
+            return
+        seen_pages.add(tuple(page))
+        for sym in page:
+            yield sym
+        start += len(page)
+
+
+def _screener_52w(max_symbols: int) -> Iterable[str]:
+    """US stocks sorted by 52-week % change (custom Yahoo screener, paged by offset).
+
+    Only a fallback for when the page cannot be paged. Needs a yfinance with EquityQuery; any
+    problem (old yfinance, a changed field name, a network error) just ends the generator."""
+    try:
+        import yfinance as yf
+        from yfinance import EquityQuery
+        query = EquityQuery("and", cast(Any, [
+            EquityQuery("eq", ["region", "us"]),
+            EquityQuery("gt", cast(Any, ["fiftytwowkpercentchange", 0])),
+        ]))
+    except Exception:
+        return
+    seen_pages, offset = set(), 0
+    while offset < max_symbols:
+        try:
+            result = yf.screen(query, offset=offset, size=DEEP_PAGE,
+                               sortField="fiftytwowkpercentchange", sortAsc=False)
+        except Exception:
+            return
+        quotes = (result or {}).get("quotes", []) or []
+        page = [normalize(q.get("symbol", "")) for q in quotes if q.get("symbol")]
+        if not page or tuple(page) in seen_pages:
+            return
+        seen_pages.add(tuple(page))
+        for sym in page:
+            yield sym
+        offset += len(page)
+
+
+def deep_52_week_gainers(max_symbols: Optional[int] = None) -> Iterable[str]:
+    """Yahoo's 52-week gainers (about 1,400 stocks, biggest 52-week move first), read lazily.
+
+    1. the page table, 25 rows at a time (the structure Yahoo serves today);
+    2. if the page cannot be paged any deeper (or cannot be read at all), the custom screener
+       sorted by 52-week change. It restarts at the top, so symbols the consumer already has
+       are simply skipped.
+    The caller (discovery) applies the usable-symbol, duplicate and broker checks."""
+    limit = max_symbols or WEEK52_MAX
+    WEEK52_LAST.update(html=0, screener=0)
+    for sym in _html_pages(WEEK52_URL, limit):
+        WEEK52_LAST["html"] += 1
+        yield sym
+    if WEEK52_LAST["html"] < limit:
+        for sym in _screener_52w(limit):
+            WEEK52_LAST["screener"] += 1
+            yield sym
+
+
 SOURCES: List[Tuple[str, Callable[[], Tuple[List[str], str]]]] = [
     ("trending", fetch_trending),
     ("world_indices", fetch_world_indices),
@@ -162,8 +271,16 @@ def build_reserve(
     per_source: int = PER_SOURCE,
     fetchers: Optional[List[Tuple[str, Callable[[], Tuple[List[str], str]]]]] = None,
     accept: Optional[Callable[[str], bool]] = None,
+    fill_to_total: bool = True,
+    deep_fetcher: Optional[Callable[[], Iterable[str]]] = None,
 ) -> Dict[str, Any]:
     """Pick up to `per_source` NEW tickers from each source.
+
+    fill_to_total: when duplicates or untradable symbols leave the sources short of
+        per_source * (number of sources) (30 by default), the shortfall is filled from deeper
+        most-active pages, with the same duplicate / `accept` checks, so the reserve reaches 30
+        whenever Yahoo has enough names. False = the old behaviour (each source on its own).
+    deep_fetcher: where the top-up reads from (default: deep_most_active).
 
     Args:
         exclude: every ticker the session already knows. They are never returned.
@@ -209,16 +326,53 @@ def build_reserve(
             picked[name].append(sym)
             seen.add(sym)
 
+    topped_up = 0
+    total_target = per_source * len(picked)
+    if fill_to_total and picked and sum(len(v) for v in picked.values()) < total_target:
+        sink = "most_active" if "most_active" in picked else list(picked)[-1]
+        try:
+            for raw in (deep_fetcher or deep_most_active)():
+                if sum(len(v) for v in picked.values()) >= total_target:
+                    break
+                sym = normalize(raw)
+                if not valid_symbol(sym) or sym in seen:
+                    continue
+                if accept is not None:
+                    try:
+                        ok = bool(accept(sym))
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        untradable[sink].append(sym)
+                        continue
+                picked[sink].append(sym)
+                seen.add(sym)
+                topped_up += 1
+        except Exception:
+            pass                                   # a failing top-up never breaks the reserve
+        if topped_up:
+            methods[sink] = f"{methods[sink]} + {topped_up} deeper"
+
     ordered: List[str] = []
-    for i in range(per_source):
+    for i in range(max((len(v) for v in picked.values()), default=0)):
         for name in picked:
             if i < len(picked[name]):
                 ordered.append(picked[name][i])
     return {"tickers": ordered, "by_source": picked, "duplicates_dropped": dropped,
-            "untradable_dropped": untradable, "methods": methods}
+            "untradable_dropped": untradable, "methods": methods, "topped_up": topped_up}
 
 
 if __name__ == "__main__":
+    import sys
+    if "--52w" in sys.argv:                       # python -m src.data.reserve_tickers --52w
+        first = []
+        for symbol in deep_52_week_gainers():
+            first.append(symbol)
+            if len(first) >= 60:
+                break
+        print(f"52-week gainers: {len(first)} read (page rows {WEEK52_LAST['html']}, "
+              f"screener rows {WEEK52_LAST['screener']}): {first}")
+        raise SystemExit(0)
     result = build_reserve()
     for name, tickers in result["by_source"].items():
         print(f"{name:<14} via {result['methods'][name]:<14} {len(tickers):>2}: {tickers}")
@@ -226,4 +380,4 @@ if __name__ == "__main__":
             print(f"{'':<14} duplicates skipped: {result['duplicates_dropped'][name]}")
         if result["untradable_dropped"][name]:
             print(f"{'':<14} not tradable skipped: {result['untradable_dropped'][name]}")
-    print(f"\nreserve ({len(result['tickers'])}): {result['tickers']}")
+    print(f"\nreserve ({len(result['tickers'])}, {result['topped_up']} from deeper pages): {result['tickers']}")

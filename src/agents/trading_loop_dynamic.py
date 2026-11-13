@@ -1950,11 +1950,12 @@ class DynamicTradingManager:
       
         """
         notifier = self._get_notifier()
-        balance = get_account_balance()
+        # Batch approval = which candidates may enter FinalInvestPool. The balance is NOT part of
+        # it (and is not shown): the Main Agent checks it after the pool, in live_agents.py.
         request = notifier.send_approval_request(
             final_invest=list(self.final_invest),
             mt5_data=getattr(self, "mt5_data", None) or {},
-            account_balance=balance,
+            account_balance=None,
         )
         return notifier.wait_for_approval(request.request_id)
 
@@ -2648,7 +2649,14 @@ PAUSE_AFTER_BLOCK_SEC = _batch_env_float("RAATS_BLOCKED_BATCH_PAUSE_SEC", 900.0)
 REJECTED_BATCH_PAUSE_SEC = _batch_env_float("RAATS_REJECTED_BATCH_PAUSE_SEC", 0.0)
 # Macro event window: try a fresh batch again after this long.
 BATCH_MACRO_RETRY_SEC = _batch_env_float("RAATS_MACRO_RETRY_SEC", 600.0)
+# No (or too few) tickers found: wait this long, then start the next batch from the top
+# (Yahoo's lists change during the day, so a later discovery can find new names).
+BATCH_EXHAUSTED_RETRY_SEC = _batch_env_float("RAATS_EXHAUSTED_RETRY_SEC", 900.0)
 RUNNER_POLL_SEC = _batch_env_float("RAATS_RUNNER_POLL_SEC", 2.0)
+# From this batch number on, a batch no longer needs a full 50 tickers: it works with whatever
+# unused tickers are available (only a batch with none at all counts as exhausted).
+# Batches below this number keep the strict 50 rule. Set very high to disable.
+RELAX_FROM_BATCH = int(_batch_env_float("RAATS_RELAX_FROM_BATCH", 5))
 # Retry interval when balance is unreadable
 BATCH_BALANCE_RETRY_SEC = _batch_env_float("RAATS_BATCH_BALANCE_RETRY_SEC", 5.0)
 
@@ -2740,11 +2748,14 @@ def discovery_window(d: Any, day_index: int, used: List[str]):
     if day_index == 0 and not used:
         yield None
         return
-    keys = ("yf", "COMMODITY_TICKERS", "CURRENCY_TICKERS", "TOP_40_EQUITIES_COUNT")
+    keys = ("yf", "COMMODITY_TICKERS", "CURRENCY_TICKERS", "TOP_40_EQUITIES_COUNT",
+            "EXCLUDE_TICKERS", "EMERGENCY_PADDING")
     saved = {k: getattr(d, k) for k in keys}
     window = GainersWindow(saved["yf"], used, 40 if day_index == 1 else 50)
     d.yf = window
     d.TOP_40_EQUITIES_COUNT = window.need
+    d.EXCLUDE_TICKERS = set(window.used)      # the most-active top-up must skip used tickers too
+    d.EMERGENCY_PADDING = False               # later batches: exhausted, not random blue chips
     d.COMMODITY_TICKERS = list(EXTRA_COMMODITY_TICKERS) if day_index == 1 else []
     d.CURRENCY_TICKERS = list(EXTRA_CURRENCY_TICKERS) if day_index == 1 else []
     try:
@@ -2794,8 +2805,13 @@ class BatchPipeline:
     NAMES = ("raats-subagent-1-discovery", "raats-subagent-2-news", "raats-subagent-3-analysis")
 
     def __init__(self, batch_no: int, status_cb: Any = None,
-                 used: Optional[List[str]] = None, day_index: int = 0):
+                 used: Optional[List[str]] = None, day_index: int = 0,
+                 skip_fn: Optional[Any] = None):
         self.batch_no = int(batch_no)
+        # ticker memory: ticker -> reason it should not be proposed now (or None). Applied before
+        # the news and the LLM, so a ticker you rejected or that just lost is not analysed at all.
+        self.skip_fn = skip_fn
+        self.memory_skipped: Dict[str, str] = {}
         self.status_cb = status_cb or (lambda batch_no, status, **info: None)
         self.used = list(used or [])
         self.day_index = int(day_index)
@@ -2835,26 +2851,63 @@ class BatchPipeline:
             raise result.error
         return result
 
+    def _apply_memory_filter(self, df: Any) -> Any:
+        """Drop tickers the ticker memory objects to (you rejected the trade / it just lost) from
+        the ranked table BEFORE the top 10, the waiting list, the news and the scoring are built,
+        so the next-best tickers move up and no news or LLM time is spent on the skipped ones.
+
+        Same method as the MT5 broker filter in discovery.py (rows removed, index reset). The
+        Main Agent keeps its own check as a safety net. Never raises; if the filter would empty
+        the table it is not applied."""
+        if self.skip_fn is None or df is None or "Ticker" not in getattr(df, "columns", []):
+            return df
+        skipped: Dict[str, str] = {}
+        for ticker in df["Ticker"].tolist():
+            try:
+                why = self.skip_fn(str(ticker))
+            except Exception:                              # memory must never break discovery
+                why = None
+            if why:
+                skipped[str(ticker)] = str(why)
+        if not skipped:
+            return df
+        kept = df[~df["Ticker"].astype(str).isin(list(skipped))].reset_index(drop=True).copy()
+        if kept.empty:
+            print("  Ticker memory would remove every instrument; not applied.")
+            return df
+        self.memory_skipped = skipped
+        print(f"  Ticker memory: {len(skipped)} instrument(s) skipped before scoring:")
+        for ticker, why in skipped.items():
+            print(f"    {ticker}: {why}")
+        return kept
+
     # ------------------------------------------------------------------ Subagent 1
     def _subagent1(self) -> None:
         """First half of discovery.main()."""
         try:
             from src.data import discovery as d
             with discovery_window(d, self.day_index, self.used) as window:
-                if window is not None:
-                    window.screen("day_gainers")             # one request, kept for the call below
-                    if window.usable < window.need:
-                        print(f"Yahoo has only {window.usable} unused gainers left "
-                              f"(batch needs {window.need}): discovery sources exhausted.")
+                equity_tickers = d.get_tickers_from_gainers_feed()   # gainers, then most-active top-up
+                relaxed = self.batch_no >= RELAX_FROM_BATCH
+                if window is not None and len(equity_tickers) < window.need:
+                    if relaxed and equity_tickers:
+                        print(f"Batch {self.batch_no}: only {len(equity_tickers)} unused equities "
+                              f"available (a full batch is {window.need}); working with what is there.")
+                    else:
+                        print(f"Only {len(equity_tickers)} unused equities left across day_gainers and "
+                              f"most-active (batch needs {window.need}): discovery sources exhausted.")
                         self.q12.put(DiscoveryBatch(self.batch_no, exhausted=True))
                         return
-                equity_tickers = d.get_tickers_from_gainers_feed()
                 if not equity_tickers:
                     raise ValueError("No equity gainers discovered.")
                 market_universe = d.build_market_universe(equity_tickers)
                 if len(market_universe) != d.TOP_50_COUNT:
-                    raise ValueError(f"Expected {d.TOP_50_COUNT} instruments, "
-                                     f"but built {len(market_universe)}.")
+                    if relaxed and market_universe:
+                        print(f"Batch {self.batch_no}: universe has {len(market_universe)} instruments "
+                              f"(not {d.TOP_50_COUNT}); continuing with the available tickers.")
+                    else:
+                        raise ValueError(f"Expected {d.TOP_50_COUNT} instruments, "
+                                         f"but built {len(market_universe)}.")
             universe = [str(u["Ticker"]).upper() for u in market_universe]
             df_top_50, target_date = d.get_previous_session_returns(market_universe)
             df_top_50 = d.apply_mt5_filter(df_top_50)
@@ -2865,6 +2918,7 @@ class BatchPipeline:
                     self.batch_no, blocked=True, top_50=pd.DataFrame(), top_10=[],
                     waiting=pd.DataFrame(), target_date=target_date))
                 return
+            df_top_50 = self._apply_memory_filter(df_top_50)
             top_50_performing, top_10_to_fetch_articles, waiting_list = d.build_ticker_arrays(df_top_50)
             print(f"\nDiscovered performance universe: {len(df_top_50)} instruments")
             print(f"Top 50 array: {len(top_50_performing)} instruments")
@@ -2929,10 +2983,10 @@ class BatchPipeline:
                 analyst_model=defaults.get("analyst_model"),
                 enable_rgr_gate=defaults.get("enable_rgr_gate", True),
                 rgr_threshold=defaults.get("rgr_threshold", 0.0),
-                enable_mt5=os.environ.get("RAATS_USE_MT5", "").lower() in ("1", "true", "yes"),
+                enable_mt5=mt5_enabled(),
             )
             manager.batch_no = self.batch_no                              # the only addition
-            manager.batch_id = f"{datetime.now():%Y-%m}-B{self.batch_no:03d}"
+            manager.batch_id = f"batch{self.batch_no}_{datetime.now():%Y_%m_%d}"
 
             original_request = manager._request_human_approval            # report the wait, change nothing
             def request_with_status() -> str:
@@ -3027,6 +3081,9 @@ class BatchSink:
         raise NotImplementedError
     def handover(self, manager: Any, batch_no: int, tickers: List[str],
                  first_batch: bool) -> List[str]: raise NotImplementedError   # only APPROVED tickers
+    def memory_check(self, ticker: str) -> Optional[str]:
+        """Ticker memory: why this ticker should not be proposed now, else None (default: no memory)."""
+        return None
     def first_batch_pending(self) -> bool: raise NotImplementedError
     def final_outcome(self, outcomes: List[Tuple[int, str]]) -> None: raise NotImplementedError
 
@@ -3088,8 +3145,11 @@ class BatchRunner(threading.Thread):
         
         sink = self.sink
         sink.status(batch_no, BATCH_PROCESSING, initial=True)
+        extra: Dict[str, Any] = {}
+        if callable(getattr(sink, "memory_check", None)):
+            extra["skip_fn"] = sink.memory_check           # ticker memory, applied before scoring
         pipeline = self.pipeline_cls(batch_no, sink.status, used=sink.used_today(),
-                                     day_index=sink.day_index())
+                                     day_index=sink.day_index(), **extra)
         try:
             result = pipeline.run()
         except Exception as exc:
@@ -3145,8 +3205,18 @@ class BatchRunner(threading.Thread):
             if outcome == "stopped":
                 break
             if outcome == "exhausted":
-                sink.final_outcome(self.outcomes)        # sources exhausted: report and finish
-                break
+                # No (or too few) tickers found: report it, wait, then start the next batch
+                # (a full new discovery) instead of finishing.
+                report = getattr(sink, "final_outcome", None)
+                if callable(report):
+                    try:
+                        report(self.outcomes)
+                    except Exception as exc:                 # a report must never stop the runner
+                        print(f"[batches] could not report the exhausted batch: {exc}")
+                print(f"[batches] batch {batch_no}: no tickers found; next batch starts in "
+                      f"{BATCH_EXHAUSTED_RETRY_SEC:.0f}s")
+                self._wait(BATCH_EXHAUSTED_RETRY_SEC)
+                continue
             if outcome == "handed" and self.first_batch:
                 # the Main Agent works on the first batch before the next one starts
                 while sink.first_batch_pending() and not self._halted():
@@ -3167,16 +3237,53 @@ class BatchRunner(threading.Thread):
 # MAIN
 # ==========================================
 
-def _live_portfolio_value(default: float = 10_000) -> float:
-    """MT5 balance when MT5 is enabled and readable; otherwise the old 10,000 default.
+_MT5_MODE: Optional[bool] = None
 
-    Read only - it never blocks. Without this, a $20 account was sized as if it had
-    $10,000 (50% = $5,000 per trade) the moment real orders are placed.
+
+def _read_balance() -> Optional[float]:
+    """MT5 balance WITHOUT shutting the terminal down (mt5_bridge.get_account_balance() calls
+    mt5.shutdown(), which would cut the live agents off mid-call). Falls back to the bridge
+    only when the order layer is not importable."""
+    try:
+        from src.data import mt5_orders
+        return mt5_orders.account_balance()
+    except Exception:
+        return get_account_balance()
+
+
+def mt5_enabled() -> bool:
+    """Is the real MT5 account the source of truth (balance, margin, symbols)?
+
+    RAATS_USE_MT5=1/true/yes -> yes;  =0/false/no -> no (paper, simulated 10,000);
+    unset or empty -> AUTO: yes when the MT5 terminal answers with a balance. Orders are still
+    only sent when RAATS_LIVE_TRADING is on; otherwise MT5 mode is a dry run.
     """
-    if os.environ.get("RAATS_USE_MT5", "").strip().lower() not in ("1", "true", "yes"):
+    global _MT5_MODE
+    raw = os.environ.get("RAATS_USE_MT5", "").strip().lower()
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("0", "false", "no"):
+        return False
+    if _MT5_MODE is None:
+        try:
+            _MT5_MODE = _read_balance() is not None
+        except Exception:
+            _MT5_MODE = False
+        print(f"[mt5] RAATS_USE_MT5 not set: MT5 {'connected - using the real account' if _MT5_MODE else 'not reachable - PAPER mode (simulated balance)'}")
+    return _MT5_MODE
+
+
+def _live_portfolio_value(default: float = 10_000) -> float:
+    """The real MT5 balance when MT5 mode is on; the simulated default ONLY in paper mode.
+
+    Read only - it never blocks. With MT5 on and the balance unreadable the default is used for
+    the analysis rounds only: the Main Agent never sizes, proposes or trades on it (it reads the
+    MT5 balance itself and defers the trade when it cannot).
+    """
+    if not mt5_enabled():
         return default
-    balance = get_account_balance()
-    return float(balance) if balance else default
+    balance = _read_balance()
+    return float(balance) if balance is not None else default
 
 
 if __name__ == "__main__":
@@ -3237,9 +3344,7 @@ if __name__ == "__main__":
                     _live_portfolio_value(),
                 # RAATS_USE_MT5 used to switch only the discovery filter, so the MT5 symbol
                 # lookup and the balance guard never ran from this entry point.
-                enable_mt5=os.environ.get(
-                    "RAATS_USE_MT5", ""
-                ).strip().lower() in ("1", "true", "yes"),
+                enable_mt5=mt5_enabled(),
             )
         )
 

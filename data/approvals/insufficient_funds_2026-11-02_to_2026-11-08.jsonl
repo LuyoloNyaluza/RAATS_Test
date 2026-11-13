@@ -1,3 +1,5 @@
 {"timestamp": "2026-11-02T18:17:09.766214", "balance": 0.74, "min_required": 20.0, "shortfall": 19.26, "action": "trades_blocked", "final_invest": ["RIVN", "KNF", "GC=F"]}
 {"timestamp": "2026-11-04T17:22:28.159576", "balance": 0.74, "min_required": 20.0, "shortfall": 19.26, "action": "trades_blocked", "final_invest": ["TREX", "EXPE", "NVO"]}
 {"timestamp": "2026-11-05T15:18:04.023430", "balance": 0.74, "min_required": 20.0, "shortfall": 19.26, "action": "trades_blocked", "final_invest": []}
+{"timestamp": "2026-11-08T07:05:53.416633", "balance": 0.74, "min_required": 20.0, "shortfall": 19.26, "action": "trades_blocked", "balance_readable": true, "final_invest": ["NKE"]}
+{"timestamp": "2026-11-08T07:29:58.347679", "balance": 0.74, "min_required": 20.0, "shortfall": 19.26, "action": "trades_blocked", "balance_readable": true, "final_invest": ["GFS"]}

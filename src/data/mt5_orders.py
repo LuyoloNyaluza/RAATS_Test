@@ -6,7 +6,7 @@ read back what is open and how a position ended.
 
 SAFETY
 ------
-Orders are only SENT to the broker when RAATS_LIVE_TRADING=1. Otherwise every call is a
+Orders are SENT to the broker by default. Set RAATS_LIVE_TRADING=0 and every call is a
 dry run: it reads live MT5 prices when MT5 is available, keeps the "position" in memory
 and reports what it would have done. Test on a DEMO account first.
 
@@ -66,7 +66,10 @@ def _require(token: Any) -> None:
 
 
 def live_enabled() -> bool:
-    return os.environ.get("RAATS_LIVE_TRADING", "").strip().lower() in ("1", "true", "yes")
+    """LIVE by default: orders are sent to the broker (your FBS DEMO account).
+
+    Set RAATS_LIVE_TRADING=0 (or false/no/off) to go back to a dry run."""
+    return os.environ.get("RAATS_LIVE_TRADING", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 # ------------------------------------------------------------------ connection
@@ -221,6 +224,70 @@ def _find_position_ticket(symbol: str, order_ticket: int) -> Optional[int]:
     return None
 
 
+# order_check / order_send return codes that mean "the broker will not take an order on this
+# symbol RIGHT NOW" (as opposed to a problem with the order itself).
+_NOT_TRADING_NOW = {
+    10018: "market closed",
+    10017: "trading is disabled for this symbol",
+    10021: "no quotes",
+}
+
+
+def check_order(symbol: str, direction: str, lots: float, sl: Optional[float] = None,
+                tp: Optional[float] = None) -> Dict[str, Any]:
+    """Ask the broker whether this market order WOULD be accepted right now (order_check).
+
+    Nothing is placed and no authority token is needed, so it works in a dry run too: a dry run
+    used to "open" positions on a closed market because it never asked the broker anything.
+
+    Returns {checked, ok, retcode, comment, not_trading_now, reason}.
+      checked=False  MT5 could not answer (not connected, no tick): callers must NOT block on it.
+      not_trading_now=True  market closed / trading disabled / no quotes (reason says which).
+    Other rejections (invalid stops, no money, ...) leave not_trading_now False: they are the
+    order's own problem and are handled where the order is built.
+    """
+    out: Dict[str, Any] = {"checked": False, "ok": False, "retcode": None, "comment": "",
+                           "not_trading_now": False, "reason": ""}
+    with session() as ok:
+        if not ok or mt5 is None:
+            out["comment"] = "MT5 not connected"
+            return out
+        snap = snapshot(symbol)
+        if snap is None:
+            out["comment"] = "no tick / symbol info"
+            return out
+        price = snap["ask"] if direction == "LONG" else snap["bid"]
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": float(lots),
+            "type": mt5.ORDER_TYPE_BUY if direction == "LONG" else mt5.ORDER_TYPE_SELL,
+            "price": price,
+            "sl": float(sl) if sl else 0.0,
+            "tp": float(tp) if tp else 0.0,
+            "deviation": DEVIATION,
+            "magic": MAGIC,
+            "comment": "RAATS check",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": _filling(snap),
+        }
+        try:
+            result = mt5.order_check(request)
+        except Exception as exc:
+            out["comment"] = f"order_check failed: {exc}"
+            return out
+        if result is None:
+            out["comment"] = f"order_check returned None: {mt5.last_error()}"
+            return out
+        code = int(result.retcode)
+        out.update(checked=True, retcode=code, comment=str(getattr(result, "comment", "") or ""),
+                   ok=code in (0, getattr(mt5, "TRADE_RETCODE_DONE", 10009)))
+        reason = _NOT_TRADING_NOW.get(code)
+        if reason:
+            out.update(not_trading_now=True, reason=reason)
+        return out
+
+
 def place_market_order(symbol: str, direction: str, lots: float, sl: Optional[float],
                        tp: Optional[float], comment: str = "RAATS",
                        ref_price: Optional[float] = None, token: Any = None) -> Dict[str, Any]:
@@ -265,14 +332,25 @@ def place_market_order(symbol: str, direction: str, lots: float, sl: Optional[fl
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": _filling(snap),
         }
+        # Pre-trade check: the broker validates volume, stops, margin and trading conditions
+        # WITHOUT placing anything. A rejected check never reaches order_send.
+        check = mt5.order_check(request)
+        if check is None:
+            return _fail(f"order_check returned None: {mt5.last_error()}")
+        if check.retcode not in (0, mt5.TRADE_RETCODE_DONE):
+            return _fail(f"order_check rejected: retcode={check.retcode} "
+                         f"{getattr(check, 'comment', '')}")
         result = mt5.order_send(request)
         if not _ok(result):
             detail = f"retcode={getattr(result, 'retcode', None)} {getattr(result, 'comment', '')}" \
                 if result is not None else f"order_send returned None: {mt5.last_error()}"
             return _fail(detail)
         ticket = _find_position_ticket(symbol, result.order) or result.order
-        return {"ok": True, "dry_run": False, "ticket": ticket,
-                "price": float(result.price or price), "message": "filled"}
+        filled = float(getattr(result, "volume", 0) or lots)
+        note = "filled" if abs(filled - float(lots)) < 1e-9 else \
+            f"filled {filled:g} of {float(lots):g} lots"          # partial fill is reported
+        return {"ok": True, "dry_run": False, "ticket": ticket, "volume": filled,
+                "price": float(result.price or price), "message": note}
 
 
 def modify_sltp(ticket: Any, symbol: str, sl: Optional[float], tp: Optional[float],

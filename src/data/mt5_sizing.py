@@ -42,8 +42,13 @@ def to_mt5_lots(
                 "reason": "missing MT5 contract data (contract_size/volume_min/volume_step)"}
 
     raw = units / contract_size
-    lots = math.floor(raw / volume_step + 1e-9) * volume_step
-    lots = round(lots, _decimals(volume_step))
+    # Valid volumes are volume_min + k * volume_step (identical to k * step when min == step,
+    # the usual case). Always rounded DOWN, never up.
+    if raw + 1e-12 >= volume_min:
+        lots = volume_min + math.floor((raw - volume_min) / volume_step + 1e-9) * volume_step
+    else:
+        lots = 0.0
+    lots = round(lots, max(_decimals(volume_step), _decimals(volume_min)))
 
     if lots < volume_min:
         return {

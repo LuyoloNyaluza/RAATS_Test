@@ -8,7 +8,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field, fields
 from pathlib import Path
 
 import requests
@@ -28,7 +28,19 @@ DEFAULT_HIGH_IMPACT_EVENTS = {
     "UNEMPLOYMENT_CLAIMS": {"window_minutes": 15, "impact": "MEDIUM"},
     "GDP": {"window_minutes": 30, "impact": "HIGH"},
     "FED_SPEECH": {"window_minutes": 15, "impact": "LOW"},
+    # outside the US: central banks and the China data that move currencies and risk
+    "ECB_RATE": {"window_minutes": 30, "impact": "HIGH"},
+    "BOE_RATE": {"window_minutes": 30, "impact": "HIGH"},
+    "BOC_RATE": {"window_minutes": 30, "impact": "HIGH"},
+    "CN_GDP": {"window_minutes": 30, "impact": "HIGH"},
+    "CN_CPI": {"window_minutes": 30, "impact": "MEDIUM"},
+    "CN_PMI": {"window_minutes": 30, "impact": "MEDIUM"},
+    "CN_LPR": {"window_minutes": 30, "impact": "MEDIUM"},
 }
+
+# Regions whose releases legitimately fall on a weekend (China's NBS publishes CPI/PMI on Saturdays
+# and Sundays); every other region on a weekend is a calendar typo.
+WEEKEND_OK_REGIONS = {"CN"}
 
 # Static fallback calendar (update quarterly)
 STATIC_CALENDAR_PATH = Path(__file__).parent / "macro_calendar.json"
@@ -44,7 +56,28 @@ class MacroEvent:
     actual_value: Optional[str] = None
     forecast_value: Optional[str] = None
     previous_value: Optional[str] = None
-    
+    region: str = "US"                         # US | EU | UK | CA | CN ...
+    currencies: List[str] = field(default_factory=list)   # currencies the event moves
+    global_risk: bool = False                  # moves every market (Fed, ECB, US CPI/NFP): blocks all
+    confirmed: bool = True                     # False = indicative / rule-based date
+    source: str = ""
+    local_time: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MacroEvent":
+        """Tolerates keys this version does not know (a newer calendar file)."""
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+    def applies_to(self, currencies: Optional[Set[str]]) -> bool:
+        """Does this event block an asset that trades in `currencies`?
+
+        Unknown asset currencies, a global-risk event, or an event with no currency list
+        (API events) block everything; otherwise only a matching currency blocks."""
+        if not currencies or self.global_risk or not self.currencies:
+            return True
+        return bool(set(self.currencies) & set(currencies))
+
     @property
     def dt(self) -> datetime:
         return datetime.fromisoformat(self.scheduled_time.replace("Z", "+00:00"))
@@ -96,7 +129,7 @@ class MacroEventChecker:
             try:
                 with open(self.calendar_path) as f:
                     data = json.load(f)
-                events = [MacroEvent(**e) for e in data.get("events", [])]
+                events = [MacroEvent.from_dict(e) for e in data.get("events", [])]
                 logger.info(f"Loaded {len(events)} macro events from static calendar")
                 self._warn_on_weekend_events(events)
                 return events
@@ -107,7 +140,7 @@ class MacroEventChecker:
         if self.cache_path.exists():
             try:
                 with open(self.cache_path, encoding="utf-8") as f:
-                    events = [MacroEvent(**e) for e in json.load(f).get("events", [])]
+                    events = [MacroEvent.from_dict(e) for e in json.load(f).get("events", [])]
                 logger.info(f"Loaded {len(events)} macro events from API cache")
                 return events
             except Exception as e:
@@ -120,7 +153,8 @@ class MacroEventChecker:
     @staticmethod
     def _warn_on_weekend_events(events: List[MacroEvent]) -> None:
         """US macro releases never fall on a weekend - a date that does is a typo."""
-        bad = [f"{e.event_type} {e.scheduled_time[:10]}" for e in events if e.dt.weekday() >= 5]
+        bad = [f"{e.event_type} {e.scheduled_time[:10]}" for e in events
+               if e.dt.weekday() >= 5 and e.region not in WEEKEND_OK_REGIONS]
         if bad:
             logger.warning("macro calendar has %d event(s) on a weekend - check them: %s", len(bad), bad)
 
@@ -180,6 +214,7 @@ class MacroEventChecker:
         check_time: Optional[datetime] = None,
         event_types: Optional[Set[str]] = None,
         min_impact: str = "MEDIUM",
+        currencies: Optional[Set[str]] = None,
     ) -> Optional[MacroEvent]:
         """
         Check if any high-impact event window is active at check_time.
@@ -207,6 +242,8 @@ class MacroEventChecker:
                 continue
             if impact_order.get(event.impact, 1) < min_level:
                 continue
+            if not event.applies_to(currencies):
+                continue
 
             event_time = event.dt
             if event_time.tzinfo is None:
@@ -223,6 +260,29 @@ class MacroEventChecker:
                 
         return None
     
+    def status(self, horizon_days: int = 14) -> Dict[str, object]:
+        """Is the calendar usable? loaded / count / next event / last event / ok + a reason.
+
+        ok is False when no calendar is loaded or it holds nothing in the next `horizon_days`
+        (an empty or expired calendar silently disables the event block)."""
+        self.refresh_if_needed()
+        now = datetime.now(timezone.utc)
+        future = sorted((e for e in self._events_cache if e.dt >= now), key=lambda e: e.dt)
+        out: Dict[str, object] = {
+            "loaded": bool(self._events_cache), "count": len(self._events_cache),
+            "upcoming": len(future),
+            "next": f"{future[0].name} {future[0].scheduled_time}" if future else None,
+            "last": max((e.scheduled_time for e in self._events_cache), default=None),
+            "unconfirmed_upcoming": sum(1 for e in future if not e.confirmed),
+        }
+        if not self._events_cache:
+            out.update(ok=False, reason="no macro calendar loaded - event blocking is OFF")
+        elif not future or (future[-1].dt - now).days < horizon_days:
+            out.update(ok=False, reason=f"the macro calendar ends {out['last']} - update macro_calendar.json")
+        else:
+            out.update(ok=True, reason="ok")
+        return out
+
     def get_upcoming_events(self, hours: int = 24) -> List[MacroEvent]:
         """Get events in the next N hours."""
         self.refresh_if_needed()
@@ -232,10 +292,44 @@ class MacroEventChecker:
 
 
 # Convenience function for quick checks
+# Yahoo suffix -> trading currencies (stocks listed outside the US)
+_SUFFIX_CURRENCIES = {
+    ".L": ["GBP"], ".TO": ["CAD"], ".V": ["CAD"], ".DE": ["EUR"], ".PA": ["EUR"], ".AS": ["EUR"],
+    ".MI": ["EUR"], ".MC": ["EUR"], ".BR": ["EUR"], ".HK": ["HKD", "CNY"], ".SS": ["CNY"],
+    ".SZ": ["CNY"], ".T": ["JPY"], ".AX": ["AUD"],
+}
+_INDEX_CURRENCIES = {
+    "^GSPC": ["USD"], "^DJI": ["USD"], "^IXIC": ["USD"], "^RUT": ["USD"], "^FTSE": ["GBP"],
+    "^GDAXI": ["EUR"], "^FCHI": ["EUR"], "^STOXX50E": ["EUR"], "^IBEX": ["EUR"], "^AEX": ["EUR"],
+    "^N225": ["JPY"], "^HSI": ["HKD", "CNY"], "^AXJO": ["AUD"], "^BSESN": ["INR"], "^NSEI": ["INR"],
+    "^KS11": ["KRW"], "^TWII": ["TWD"],
+}
+_COMMODITY_CURRENCIES = {"GC=F": ["USD"], "SI=F": ["USD"], "CL=F": ["USD"], "NG=F": ["USD"],
+                         "HG=F": ["USD", "CNY"]}
+
+
+def asset_currencies(ticker: str) -> Set[str]:
+    """Currencies whose events move this Yahoo ticker: EURUSD=X -> {EUR, USD}, ^GDAXI -> {EUR},
+    NKE -> {USD}. An unknown form returns {USD} (a plain US-listed stock)."""
+    t = (ticker or "").upper().strip()
+    if t.endswith("=X") and len(t) == 8:                 # EURUSD=X
+        return {t[:3], t[3:6]}
+    if t in _INDEX_CURRENCIES:
+        return set(_INDEX_CURRENCIES[t])
+    if t in _COMMODITY_CURRENCIES:
+        return set(_COMMODITY_CURRENCIES[t])
+    for suffix, cur in _SUFFIX_CURRENCIES.items():
+        if t.endswith(suffix):
+            return set(cur)
+    return {"USD"}
+
+
 def is_trade_blocked_by_macro(
     check_time: Optional[datetime] = None,
     min_impact: str = "MEDIUM",
+    currencies: Optional[Set[str]] = None,
 ) -> bool:
     """Quick check - returns True if trade should be blocked."""
     checker = MacroEventChecker()
-    return checker.is_event_window_active(check_time, min_impact=min_impact) is not None
+    return checker.is_event_window_active(
+        check_time, min_impact=min_impact, currencies=currencies) is not None

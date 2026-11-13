@@ -1,0 +1,3 @@
+{"timestamp":"2026-11-10T17:52:52.814615+02:00","type":"error","ticker":"-","date":"2026-11-10","stage":"batch_pipeline_discovery","error":"Expected 50 instruments, but built 43.","context":{"batch_no":1}}
+{"timestamp":"2026-11-10T18:00:23.939572+02:00","type":"error","ticker":"-","date":"2026-11-10","stage":"batch_pipeline_discovery","error":"No valid market pricing data returned.","context":{"batch_no":2}}
+{"timestamp":"2026-11-10T18:01:49.174025+02:00","type":"error","ticker":"-","date":"2026-11-10","stage":"batch_pipeline_discovery","error":"Expected 50 instruments, but built 42.","context":{"batch_no":3}}
