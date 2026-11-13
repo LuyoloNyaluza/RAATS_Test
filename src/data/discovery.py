@@ -40,6 +40,10 @@ SENTIMENT_MODEL = os.environ.get(
 EQUITY_FETCH_PAGE_SIZE = 250   # Yahoo's maximum: one call returns the whole list when it can
 EQUITY_FETCH_MAX = 250
 SCREENER_RETRIES = 3
+# The 52-week list holds ~1,400 stocks and most of its TOP is small caps a broker does not offer,
+# so it is read deep: page by page, advancing the offset, until the 40 are full.
+WEEK52_FETCH_MAX = int(os.environ.get("RAATS_52W_MAX", "1500"))    # rows that may be read at most
+WEEK52_PAGE_SIZE = 250                                              # Yahoo's maximum per call
 
 # ------------------------------------------
 # Yahoo Finance commodity instruments
@@ -414,6 +418,207 @@ def _fetch_most_active(
     return target
 
 
+
+def _week52_queries():
+    """Yahoo queries to try, best first, for US stocks with a positive 52-week change.
+
+    1. restricted to the main exchanges (Nasdaq, NYSE, NYSE American): OTC and pink-sheet names
+       dominate the top of the list and no CFD broker offers them;
+    2. the same without the exchange filter, if Yahoo refuses the restricted one.
+    Raises when this yfinance has no EquityQuery (the caller reports it)."""
+    from yfinance import EquityQuery
+    from typing import Any, cast
+
+    base = [
+        EquityQuery("gt", cast(Any, ["fiftytwowkpercentchange", 0])),
+        EquityQuery("eq", cast(Any, ["region", "us"])),
+    ]
+    queries = []
+
+    try:
+        exchanges = EquityQuery(
+            "is-in", cast(Any, ["exchange", "NMS", "NYQ", "NGM", "NCM", "ASE"])
+        )
+        queries.append(
+            ("main US exchanges", EquityQuery("and", cast(Any, base + [exchanges])))
+        )
+    except Exception as exc:
+        print(f"  52-week gainers: exchange filter not available ({exc}).")
+
+    queries.append(("all US listings", EquityQuery("and", cast(Any, list(base)))))
+
+    return queries
+
+
+def _screen_week52_page(query, offset):
+    """One page of the 52-week screener (biggest 52-week gain first).
+
+    Returns the quotes, an empty list when the list is exhausted, or None when Yahoo failed
+    on every retry."""
+
+    for attempt in range(1, SCREENER_RETRIES + 1):
+
+        try:
+            result = _REAL_YF.screen(
+                query,
+                offset=offset,
+                size=WEEK52_PAGE_SIZE,
+                sortField="fiftytwowkpercentchange",
+                sortAsc=False,
+            )
+
+            return (result or {}).get("quotes", []) or []
+
+        except Exception as exc:
+
+            print(
+                f"  52-week gainers: offset {offset} "
+                f"attempt {attempt} failed: {exc}"
+            )
+
+            if attempt < SCREENER_RETRIES:
+                time.sleep(2 * attempt)
+
+    return None
+
+
+def _fetch_52_week_gainers(
+    target=None,
+    need=TOP_40_EQUITIES_COUNT,
+    exclude=None,
+    skipped=None,
+):
+    """
+    Backup source after day gainers and most-active: Yahoo's 52-week gainers.
+
+    The list is read page by page with an advancing OFFSET (0, 250, 500, ... up to
+    RAATS_52W_MAX rows) and every page is filtered at once, so reading stops the moment the
+    target is full. Each page prints where its symbols went:
+
+        accepted | not usable (not a plain 1-5 letter ticker) | already used | not offered
+        by the broker
+
+    That makes it visible whether the broker list or the source is the bottleneck.
+    RAATS_52W_GAINERS=0 switches the source off.
+    """
+
+    if target is None:
+        target = []
+
+    if exclude is None:
+        exclude = set()
+
+    if skipped is None:
+        skipped = []
+
+    if os.environ.get("RAATS_52W_GAINERS", "1").strip().lower() in ("0", "false", "no", "off"):
+        print("  52-week gainers: switched off (RAATS_52W_GAINERS=0).")
+        return target
+
+    print("  Retrieving Yahoo 52-week gainers...")
+
+    try:
+        queries = _week52_queries()
+    except Exception as exc:
+        print(f"  52-week gainers: could not build Yahoo query: {exc}")
+        return target
+
+    for label, query in queries:
+
+        print(f"  52-week gainers: query = {label}")
+
+        seen_pages = set()
+        offset = 0
+        first_page_ok = False
+        totals = {"read": 0, "unusable": 0, "used": 0, "broker": 0}
+
+        while len(target) < need and offset < WEEK52_FETCH_MAX:
+
+            quotes = _screen_week52_page(query, offset)
+
+            if quotes is None:
+                print(f"  52-week gainers: Yahoo failed at offset {offset}.")
+                break
+
+            first_page_ok = True
+
+            page_symbols = []
+            page_seen = set()
+
+            for quote in quotes:
+                symbol = str(quote.get("symbol", "") or "").strip().upper()
+
+                if symbol and symbol not in page_seen:
+                    page_seen.add(symbol)
+                    page_symbols.append(symbol)
+
+            if not page_symbols:
+                print(f"  52-week gainers: no more results at offset {offset}.")
+                break
+
+            signature = tuple(page_symbols)
+
+            if signature in seen_pages:
+                print(
+                    f"  52-week gainers: repeated page detected at offset {offset}; "
+                    "stopping."
+                )
+                break
+
+            seen_pages.add(signature)
+
+            page = {"unusable": 0, "used": 0, "broker": 0, "accepted": 0}
+
+            for symbol in page_symbols:
+
+                if len(target) >= need:
+                    break
+
+                if not _usable_equity(symbol):
+                    page["unusable"] += 1
+                    continue
+
+                if symbol in exclude or symbol in target:
+                    page["used"] += 1
+                    continue
+
+                if not _broker_offers(symbol):
+                    page["broker"] += 1
+                    if symbol not in skipped:
+                        skipped.append(symbol)
+                    continue
+
+                target.append(symbol)
+                page["accepted"] += 1
+
+            totals["read"] += len(page_symbols)
+            for key in ("unusable", "used", "broker"):
+                totals[key] += page[key]
+
+            print(
+                f"  52-week gainers: offset {offset}, returned {len(page_symbols)} | "
+                f"accepted {page['accepted']}, not usable {page['unusable']}, "
+                f"already used {page['used']}, not offered by broker {page['broker']} | "
+                f"total {len(target)}/{need}"
+            )
+
+            # Advance by what Yahoo actually returned, not by what was requested.
+            offset += len(page_symbols)
+
+        print(
+            f"  52-week gainers ({label}): read {totals['read']} rows, "
+            f"not usable {totals['unusable']}, already used {totals['used']}, "
+            f"not offered by broker {totals['broker']}."
+        )
+
+        # A query Yahoo refused outright (no page at all) falls through to the next one;
+        # a query that worked, whether or not it filled the list, is final.
+        if first_page_ok:
+            break
+
+    return target
+
+
 def _fetch_reserve(exclude):
     """
     Retrieve additional candidates from reserve sources.
@@ -455,19 +660,21 @@ def _fetch_reserve(exclude):
         return []
 
 
+
 def get_tickers_from_gainers_feed():
     """
     Get up to 40 distinct broker-supported equities.
 
     Source order (each source runs only while the list is short):
 
-      1. Yahoo day gainers: the WHOLE ranked list is walked, skipping tickers the broker does
-         not offer, until 40 are collected or the list is exhausted.
-      2. Yahoo most-active: the same, once the gainers list is exhausted.
-      3. Reserve sources (trending ...).
-      4. Emergency fallback, when enabled (batch 1 only).
+      1. Yahoo day gainers
+      2. Yahoo most-active
+      3. Yahoo 52-week gainers
+      4. Reserve sources (trending, world indices, most-active)
+      5. Emergency fallback, when enabled (batch 1 only)
 
-    Tickers in EXCLUDE_TICKERS (used by earlier batches) and duplicates are never returned.
+    Tickers in EXCLUDE_TICKERS (used by earlier batches) and duplicates
+    are never returned.
     """
 
     print("\n" + "=" * 60)
@@ -479,42 +686,99 @@ def get_tickers_from_gainers_feed():
     tickers = []
     skipped = []
 
-    # 1. Day gainers: continue down the list until 40 approved or the list runs out
-    _fetch_day_gainers(target=tickers, need=need, exclude=exclude, skipped=skipped)
+    # 1. Day gainers
+    _fetch_day_gainers(
+        target=tickers,
+        need=need,
+        exclude=exclude,
+        skipped=skipped,
+    )
     print(f"Day gainers gave {len(tickers)}/{need} broker-supported equities.")
 
-    # 2. Most-active: only when the gainers list is exhausted
+    # 2. Most-active
     if len(tickers) < need:
-        print(f"\nGainers exhausted, short by {need - len(tickers)}: checking most-active.")
+        print(
+            f"\nGainers exhausted, short by {need - len(tickers)}: "
+            "checking most-active."
+        )
         before = len(tickers)
-        _fetch_most_active(target=tickers, need=need, exclude=exclude, skipped=skipped)
+
+        _fetch_most_active(
+            target=tickers,
+            need=need,
+            exclude=exclude,
+            skipped=skipped,
+        )
         print(f"Most-active added: {len(tickers) - before}")
 
-    # 3. Reserve top-up
+    # 3. Yahoo 52-week gainers (read deep, with an advancing offset)
     if len(tickers) < need:
-        print(f"\nStill short by {need - len(tickers)}. Loading reserve candidates.")
+        print(
+            f"\nStill short by {need - len(tickers)}. "
+            "Checking Yahoo 52-week gainers."
+        )
         before = len(tickers)
-        _add_unique(tickers, _fetch_reserve(exclude | set(tickers)), need, exclude, skipped=skipped)
+
+        _fetch_52_week_gainers(
+            target=tickers,
+            need=need,
+            exclude=exclude,
+            skipped=skipped,
+        )
+        print(f"52-week gainers added: {len(tickers) - before}")
+
+    # 4. Reserve top-up
+    if len(tickers) < need:
+        print(
+            f"\nStill short by {need - len(tickers)}. "
+            "Loading reserve candidates."
+        )
+        before = len(tickers)
+
+        _add_unique(
+            tickers,
+            _fetch_reserve(exclude | set(tickers)),
+            need,
+            exclude,
+            skipped=skipped,
+        )
         print(f"Reserve added: {len(tickers) - before}")
 
-    # 4. Emergency padding
+    # 5. Emergency padding
     if len(tickers) < need and EMERGENCY_PADDING:
         print("\nUsing emergency equity fallback.")
         before = len(tickers)
-        _add_unique(tickers, EMERGENCY_EQUITY_FALLBACK, need, exclude, skipped=skipped)
+
+        _add_unique(
+            tickers,
+            EMERGENCY_EQUITY_FALLBACK,
+            need,
+            exclude,
+            skipped=skipped,
+        )
         print(f"Emergency fallback added: {len(tickers) - before}")
 
     if skipped:
-        shown = ", ".join(skipped[:15]) + (" ..." if len(skipped) > 15 else "")
-        print(f"\nBroker filter: {len(skipped)} unsupported ticker(s) skipped: {shown}")
+        shown = ", ".join(skipped[:15]) + (
+            " ..." if len(skipped) > 15 else ""
+        )
+        print(
+            f"\nBroker filter: {len(skipped)} unsupported "
+            f"ticker(s) skipped: {shown}"
+        )
 
     if len(tickers) < need:
-        print(f"\nWARNING: only {len(tickers)} of {need} broker-supported equities available.")
+        print(
+            f"\nWARNING: only {len(tickers)} of {need} "
+            "broker-supported equities available."
+        )
     else:
-        print(f"\nSuccessfully collected {len(tickers)} broker-supported equities.")
+        print(
+            f"\nSuccessfully collected {len(tickers)} "
+            "broker-supported equities."
+        )
 
     return tickers[:need]
-
 
 # ==========================================
 # STEP 2: BUILD 40 + 5 + 5 UNIVERSE

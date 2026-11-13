@@ -945,6 +945,19 @@ class MainAgent:
         else:
             required_margin = traded_units * ref                 # paper: no leverage
 
+        if snap and symbol is not None and lots is not None:
+            # Would the broker take this order RIGHT NOW? (order_check places nothing, so this is
+            # the same test in a dry run as live.) A closed market is not proposed to you: you
+            # would approve a trade that cannot be filled. It stays in the pool and is proposed
+            # again when the market opens; the same check re-runs after the entry timer.
+            chk = mt5_orders.check_order(symbol, direction, lots, sl, tp)
+            if chk.get("not_trading_now"):
+                self._event({"type": "market_not_open", "ticker": t, "symbol": symbol,
+                             "reason": chk["reason"], "retcode": chk.get("retcode")})
+                return self._defer(
+                    cand, f"{symbol}: {chk['reason']} (broker: {chk.get('comment') or 'n/a'}); "
+                          f"it is proposed again when the market opens"), None
+
         risk_per_unit = abs(ref - sl)
         risk_amount = risk_per_unit * traded_units
         reward_amount = abs(tp - ref) * traded_units
@@ -1032,7 +1045,7 @@ class MainAgent:
         t = cand.ticker
         approved_proposal = dict(cand.proposal)
         # 4. ONLY NOW does the asynchronous entry timer start (15-30 s, a real wait when live)
-        delay = wait_for_entry(simulate=not self.live)
+        delay = wait_for_entry(simulate=False)          # always a real 15-30 s wait before the order
         print(f"  {t}: approved; entry delay {delay.seconds:.1f}s "
               f"({'simulated' if delay.simulated else 'waited'})")
         # 5. revalidate trading conditions, balance, free margin and price. The wait can be long:
@@ -1528,14 +1541,14 @@ class LiveSink:
         return self.main.memory.check(ticker)
 
     def final_outcome(self, outcomes: List[Tuple[int, str]]) -> None:
-        """The batch runner calls this when a batch found no (or too few) tickers; it then waits and
-        starts the next batch. Reports what every batch of this run did so far."""
+        """The batch runner calls this once when the discovery sources are exhausted and it ends.
+        Report what every batch of this run did; the position engine keeps running."""
         lines = [f"batch {n}: {outcome}" for n, outcome in outcomes]
         handed = sum(1 for _, o in outcomes if o == "handed")
         message = (
-            "NO NEW TICKERS FOUND\n\n"
-            "Discovery found no (or too few) new broker-supported tickers. The next batch starts "
-            "automatically after the retry wait. Open positions keep being monitored.\n\n"
+            "DISCOVERY SOURCES EXHAUSTED\n\n"
+            "No more new broker-supported tickers were available, so no further batches will run "
+            "this session. Open positions keep being monitored.\n\n"
             f"Batches this run: {len(outcomes)} ({handed} approved and handed over)\n"
             + "\n".join(lines)
         )

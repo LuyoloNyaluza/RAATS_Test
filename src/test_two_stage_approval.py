@@ -199,19 +199,22 @@ print("7b. timeouts and errors are never recorded as rejections")
 
 # 7c. a candidate you already approved is never blocked by the memory
 mgr, pool, main, n, ev = stack(["AAA"])
-main.memory.record("trade_rejected", "AAA")
+main.memory.record("trade_rejected", "AAA")             # remembered from an earlier rejection ...
 cand = need(pool, "AAA")
+status, ctx = main._prepare(cand)                       # ... but THIS proposal was approved by you
+assert status == "ok" and ctx is not None
+cand.proposal = dict(ctx["proposal"])
 cand.approval = "APPROVE"
-main._advance(cand)                    # proposed / executed normally, not vetoed
+main._advance(cand)                                     # executes; the memory must not veto it
+assert "AAA" in main.open, "an approved candidate must be executed, not vetoed"
 assert not any(e.get("type") == "candidate_skipped_memory" for e in ev), "human APPROVE wins"
 main.release_authority()
 print("7c. an approved candidate is never vetoed by the memory")
 
-# 7d. a losing close is remembered
+# 7d. a losing close is remembered (the position is opened through the real flow first)
 mgr, pool, main, n, ev = stack(["AAA"])
-rec = {"ticker": "AAA", "ticket": "DRY-1", "direction": "LONG", "entry": 100.0, "sl": 98.0, "tp": 106.0}
-main.open["AAA"] = rec
-main._finish(rec, 98.0, "stop_loss", broker_profit=-12.0)
+assert main.fill_slots(limit=1) == 1 and "AAA" in main.open
+main._finish(main.open["AAA"], 95.0, "stop_loss", -12.0)
 assert "loss" in (main.memory.check("AAA") or ""), "a losing close must start a cooldown"
 main.release_authority()
 print("7d. a losing close starts a cooldown")
@@ -254,5 +257,68 @@ assert LA.LiveSink.memory_check(fake_sink, "BBB") and LA.LiveSink.memory_check(f
 assert TLD.BatchSink.memory_check(cast(Any, NS()), "BBB") is None
 main.release_authority()
 print("8. the trading loop skips remembered tickers before news and scoring (fail-safe)")
+
+# ---- 9: a ticker not found on MT5 is reported to the ticker memory (guardrail)
+from src.data import mt5_orders as _MO
+mgr, pool, main, n, ev = stack(["ORKA"])
+main.use_mt5 = True                                   # MT5 mode with a stubbed terminal
+saved = (_MO.resolve, _MO.available)
+orka = need(pool, "ORKA")        # fetched ONCE: a drop removes the candidate from the pool
+try:
+    _MO.resolve = lambda t: None                      # the broker does not list it ...
+    _MO.available = lambda: False                     # ... but the terminal is NOT reachable
+    status, ctx = main._prepare(orka)
+    assert status == "drop" and main.memory.check("ORKA") is None, \
+        "an MT5 outage must never be remembered as 'not offered'"
+    _MO.available = lambda: True                      # the terminal answered: it is really not offered
+    status, ctx = main._prepare(orka)
+    assert status == "drop" and "not tradable" in (main.memory.check("ORKA") or "")
+finally:
+    _MO.resolve, _MO.available = saved
+main.use_mt5 = False
+main.release_authority()
+print("9. a ticker the broker does not offer goes into the ticker memory (not on an MT5 outage)")
+
+# ---- 10: a closed market is never proposed to you (dry run included)
+mgr, pool, main, n, ev = stack(["AAA"])
+main.use_mt5 = True
+snap = {"symbol": "AAA.US", "bid": 99.9, "ask": 100.1, "digits": 2, "point": 0.01, "stops_level": 0,
+        "contract_size": 1.0, "volume_min": 0.01, "volume_max": 1000.0, "volume_step": 0.01,
+        "filling_mode": 2, "trade_mode": 4}
+names = ("resolve", "available", "snapshot", "account_balance", "account_free_margin",
+         "calc_margin", "check_order")
+saved_mo = {k: getattr(_MO, k) for k in names}
+try:
+    _MO.resolve = lambda t: "AAA.US"
+    _MO.available = lambda: True
+    _MO.snapshot = lambda s_: dict(snap)
+    _MO.account_balance = lambda: 1000.0
+    _MO.account_free_margin = lambda: 1000.0
+    _MO.calc_margin = lambda *a, **k: 10.0
+    _MO.check_order = lambda *a, **k: {"checked": True, "ok": False, "retcode": 10018,
+                                       "comment": "Market closed", "not_trading_now": True,
+                                       "reason": "market closed"}
+    aaa = need(pool, "AAA")
+    status, ctx = main._prepare(aaa)
+    assert status == "defer" and ctx is None, "a closed market must not reach the approval"
+    assert any(e.get("type") == "market_not_open" for e in ev)
+    assert not n.proposals, "nothing is sent to Discord while the market is closed"
+    # the broker cannot answer (checked False): never block on that
+    _MO.check_order = lambda *a, **k: {"checked": False, "ok": False, "retcode": None,
+                                       "comment": "MT5 not connected", "not_trading_now": False,
+                                       "reason": ""}
+    status, ctx = main._prepare(aaa)
+    assert status == "ok" and ctx is not None, "an unanswered check must not block"
+    # the market is open: normal proposal
+    _MO.check_order = lambda *a, **k: {"checked": True, "ok": True, "retcode": 0,
+                                       "comment": "Done", "not_trading_now": False, "reason": ""}
+    status, ctx = main._prepare(aaa)
+    assert status == "ok" and ctx is not None
+finally:
+    for k, v in saved_mo.items():
+        setattr(_MO, k, v)
+main.use_mt5 = False
+main.release_authority()
+print("10. a closed market is deferred (not proposed); an unanswered check never blocks")
 
 print("ALL TWO-STAGE APPROVAL TESTS PASSED")

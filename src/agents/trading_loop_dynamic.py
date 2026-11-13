@@ -2653,6 +2653,10 @@ BATCH_MACRO_RETRY_SEC = _batch_env_float("RAATS_MACRO_RETRY_SEC", 600.0)
 # (Yahoo's lists change during the day, so a later discovery can find new names).
 BATCH_EXHAUSTED_RETRY_SEC = _batch_env_float("RAATS_EXHAUSTED_RETRY_SEC", 900.0)
 RUNNER_POLL_SEC = _batch_env_float("RAATS_RUNNER_POLL_SEC", 2.0)
+# From this batch number on, a batch no longer needs a full 50 tickers: it works with whatever
+# unused tickers are available (only a batch with none at all counts as exhausted).
+# Batches below this number keep the strict 50 rule. Set very high to disable.
+RELAX_FROM_BATCH = int(_batch_env_float("RAATS_RELAX_FROM_BATCH", 5))
 # Retry interval when balance is unreadable
 BATCH_BALANCE_RETRY_SEC = _batch_env_float("RAATS_BATCH_BALANCE_RETRY_SEC", 5.0)
 
@@ -2884,17 +2888,26 @@ class BatchPipeline:
             from src.data import discovery as d
             with discovery_window(d, self.day_index, self.used) as window:
                 equity_tickers = d.get_tickers_from_gainers_feed()   # gainers, then most-active top-up
+                relaxed = self.batch_no >= RELAX_FROM_BATCH
                 if window is not None and len(equity_tickers) < window.need:
-                    print(f"Only {len(equity_tickers)} unused equities left across day_gainers and "
-                          f"most-active (batch needs {window.need}): discovery sources exhausted.")
-                    self.q12.put(DiscoveryBatch(self.batch_no, exhausted=True))
-                    return
+                    if relaxed and equity_tickers:
+                        print(f"Batch {self.batch_no}: only {len(equity_tickers)} unused equities "
+                              f"available (a full batch is {window.need}); working with what is there.")
+                    else:
+                        print(f"Only {len(equity_tickers)} unused equities left across day_gainers and "
+                              f"most-active (batch needs {window.need}): discovery sources exhausted.")
+                        self.q12.put(DiscoveryBatch(self.batch_no, exhausted=True))
+                        return
                 if not equity_tickers:
                     raise ValueError("No equity gainers discovered.")
                 market_universe = d.build_market_universe(equity_tickers)
                 if len(market_universe) != d.TOP_50_COUNT:
-                    raise ValueError(f"Expected {d.TOP_50_COUNT} instruments, "
-                                     f"but built {len(market_universe)}.")
+                    if relaxed and market_universe:
+                        print(f"Batch {self.batch_no}: universe has {len(market_universe)} instruments "
+                              f"(not {d.TOP_50_COUNT}); continuing with the available tickers.")
+                    else:
+                        raise ValueError(f"Expected {d.TOP_50_COUNT} instruments, "
+                                         f"but built {len(market_universe)}.")
             universe = [str(u["Ticker"]).upper() for u in market_universe]
             df_top_50, target_date = d.get_previous_session_returns(market_universe)
             df_top_50 = d.apply_mt5_filter(df_top_50)
