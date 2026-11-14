@@ -115,11 +115,27 @@ APPROVAL_JOIN_SEC = _env_float("RAATS_APPROVAL_JOIN_SEC", 0.2)
 # "retry" = keep it in final INVEST and propose it again after TRADE_REJECT_RETRY_SEC.
 TRADE_REJECT_POLICY = os.environ.get("RAATS_TRADE_REJECT_POLICY", "skip").strip().lower()
 TRADE_REJECT_RETRY_SEC = _env_float("RAATS_TRADE_REJECT_RETRY_SEC", 3600.0)
-# After the approval the proposal is recalculated; it is sent for approval AGAIN when the entry
-# moved by more than this many risk units, the size changed by more than 2 %, or the required
-# margin rose by more than 10 %. At most MAX_REPROPOSALS times for one candidate.
-REPROPOSE_DRIFT_R = _env_float("RAATS_REPROPOSE_DRIFT_R", 0.25)
-MAX_REPROPOSALS = int(_env_float("RAATS_MAX_REPROPOSALS", 3))
+# After the approval and the entry timer the proposal is recalculated at a fresh quote (ask for a
+# BUY, bid for a SELL). If the entry moved by no more than the tolerance, the levels are
+# recalculated at the new entry, the risk / margin checks run again and the order goes on (a
+# "Trade Refreshed" message is sent). If it moved more, or the direction changed, the size
+# changed by more than 2 % or the required margin rose by more than 10 %, the trade is sent for
+# approval AGAIN: at most MAX_REVALIDATIONS times per trade (never reset by a new approval).
+# The tolerance is in the instrument's own quoted units: the larger of EXEC_TOLERANCE_PRICE and
+# EXEC_TOLERANCE_PCT percent of the approved entry (0.20 is meaningless on an index at 9,000).
+EXEC_TOLERANCE_PRICE = _env_float("RAATS_EXEC_TOLERANCE_PRICE", 0.20)
+EXEC_TOLERANCE_PCT = _env_float("RAATS_EXEC_TOLERANCE_PCT", 0.10)
+MAX_REVALIDATIONS = int(_env_float("RAATS_MAX_REVALIDATIONS", 2))
+# Risk budget per trade: the loss if the stop is hit, as a percentage of the balance. Below
+# SMALL_ACCOUNT_BALANCE the lot size is chosen so the loss at the stop fits this budget; when even
+# the broker's minimum lot is above it, the minimum lot is used and the approval message WARNS
+# (the decision stays with you; nothing is skipped).
+MAX_RISK_LONG_PCT = _env_float("RAATS_MAX_RISK_LONG_PCT", 10.0)
+MAX_RISK_SHORT_PCT = _env_float("RAATS_MAX_RISK_SHORT_PCT", 7.5)
+# More warnings in the approval message: margin in use after this trade, and the stop-loss risk of
+# all open positions plus this trade, each as a percentage of the balance.
+MAX_MARGIN_USED_PCT = _env_float("RAATS_MAX_MARGIN_USED_PCT", 50.0)
+MAX_COMBINED_RISK_PCT = _env_float("RAATS_MAX_COMBINED_RISK_PCT", 30.0)
 STOP_FILE = os.environ.get("RAATS_STOP_FILE", "data/STOP")
 STATE_FILE = os.environ.get("RAATS_STATE_FILE", "data/state/live_discovery.json")
 
@@ -905,32 +921,44 @@ class MainAgent:
             return self._drop(t, f"risk manager: {reason}"), None
         direction = "LONG" if d == 1 else "SHORT"
 
-        lots, traded_units, oversize = None, units, None
-        if snap:
-            sized = to_mt5_lots(units, snap["contract_size"], snap["volume_min"], snap["volume_step"])
-            if sized["feasible"]:
-                lots = min(sized["lots"], snap["volume_max"])
-            elif "min_lot_units" in sized:
-                # RAATS sized it below the broker's minimum lot
-                if balance is not None and balance < SMALL_ACCOUNT_BALANCE:
-                    oversize = sized.get("oversize_factor")
-                    if MAX_MIN_LOT_OVERSIZE > 0 and oversize and oversize > MAX_MIN_LOT_OVERSIZE:
-                        return self._drop(
-                            t, f"the minimum lot is {oversize:.1f}x the size RAATS wanted "
-                               f"(cap {MAX_MIN_LOT_OVERSIZE:g}x); skipped"), None
-                    lots = snap["volume_min"]          # small account: the smallest trade there is
-                else:
-                    return self._defer(cand, sized["reason"]), None   # wait for the balance to grow
-            else:
-                return self._drop(t, sized["reason"]), None
-            traded_units = lots * snap["contract_size"]
-
         risk_unit, _gf = self.rm.compute_risk_unit(atr, m_norm)
         ref = md["close"]
         if snap:
             ref = snap["ask"] if direction == "LONG" else snap["bid"]
         sl, tp = self.rm.compute_initial_levels(ref, d, risk_unit)
         # Initial TP uses rrr (3R), ceiling only applies during monitoring in _manage
+        risk_limit_pct = MAX_RISK_LONG_PCT if direction == "LONG" else MAX_RISK_SHORT_PCT
+        risk_budget = balance * risk_limit_pct / 100.0
+        chk_sl = mt5_orders.clamp_levels(direction, sl, tp, snap)[0] if snap else sl
+
+        lots, traded_units, oversize = None, units, None
+        if snap:
+            if balance < SMALL_ACCOUNT_BALANCE and symbol is not None:
+                # Small account: size from the STOP, not from capital or margin. Lots are chosen so
+                # that the loss at the stop (MT5's own calculation, account currency) fits the risk
+                # budget, rounded DOWN to the lot step. If even the minimum lot costs more than the
+                # budget, the minimum lot is used and the approval message warns with the real risk.
+                vmin, vstep, csize = snap["volume_min"], snap["volume_step"], snap["contract_size"]
+                loss_min = self._monetary_risk(direction, symbol, vmin, vmin * csize, ref, chk_sl)
+                if loss_min <= 0:
+                    return self._drop(t, "the loss at the stop cannot be calculated"), None
+                raw_lots = vmin * risk_budget / loss_min
+                sized = to_mt5_lots(raw_lots * csize, csize, vmin, vstep)
+                if sized["feasible"]:
+                    lots = min(sized["lots"], snap["volume_max"])
+                else:
+                    lots = vmin
+                    oversize = round(loss_min / risk_budget, 2) if risk_budget > 0 else None
+            else:
+                sized = to_mt5_lots(units, snap["contract_size"], snap["volume_min"], snap["volume_step"])
+                if sized["feasible"]:
+                    lots = min(sized["lots"], snap["volume_max"])
+                elif "min_lot_units" in sized:
+                    return self._defer(cand, sized["reason"]), None   # wait for the balance to grow
+                else:
+                    return self._drop(t, sized["reason"]), None
+            traded_units = lots * snap["contract_size"]
+
         required_margin, free_margin = None, balance
         if snap:
             sl, tp = mt5_orders.clamp_levels(direction, sl, tp, snap)
@@ -959,7 +987,28 @@ class MainAgent:
                           f"it is proposed again when the market opens"), None
 
         risk_per_unit = abs(ref - sl)
-        risk_amount = risk_per_unit * traded_units
+        risk_amount = self._monetary_risk(direction, symbol, lots, traded_units, ref, sl)
+        # Warnings shown in the approval message. They never block: you decide.
+        warnings: List[str] = []
+        if balance > 0:
+            if risk_amount > risk_budget + 1e-9:
+                warnings.append(
+                    f"Risk ${risk_amount:,.2f} if the stop is hit = {risk_amount / balance * 100:.0f}% of "
+                    f"the balance (limit {risk_limit_pct:g}% = ${risk_budget:,.2f})"
+                    + (f"; the broker's smallest lot is {oversize:.1f}x the budget" if oversize else ""))
+            used = self._margin_used()
+            if used is not None and required_margin is not None:
+                after = used + required_margin
+                if after > balance * MAX_MARGIN_USED_PCT / 100.0:
+                    warnings.append(
+                        f"Margin in use after this trade ${after:,.2f} = {after / balance * 100:.0f}% of "
+                        f"the balance (limit {MAX_MARGIN_USED_PCT:g}%)")
+            open_risk = self._open_risk()
+            if open_risk is not None and open_risk + risk_amount > balance * MAX_COMBINED_RISK_PCT / 100.0:
+                warnings.append(
+                    f"Combined stop-loss risk of open positions (${open_risk:,.2f}) plus this trade = "
+                    f"${open_risk + risk_amount:,.2f} = {(open_risk + risk_amount) / balance * 100:.0f}% of "
+                    f"the balance (limit {MAX_COMBINED_RISK_PCT:g}%)")
         reward_amount = abs(tp - ref) * traded_units
         rr = (abs(tp - ref) / risk_per_unit) if risk_per_unit else None
         proposal = {
@@ -970,6 +1019,7 @@ class MainAgent:
             "paper": not self.use_mt5, "dry_run": bool(self.use_mt5 and not self.live),
             "lots": lots, "units": traded_units, "entry": ref, "stop_loss": sl, "take_profit": tp,
             "risk_amount": risk_amount, "reward_amount": reward_amount,
+            "risk_pct": (risk_amount / balance * 100.0) if balance else None, "warnings": warnings,
             "risk_reward": f"1:{rr:.1f}" if rr else "n/a", "time": _now(),
         }
         ctx = {"md": md, "atr": atr, "m": m, "m_norm": m_norm, "symbol": symbol, "snap": snap,
@@ -1027,18 +1077,75 @@ class MainAgent:
         return "rejected"
 
     @staticmethod
-    def _materially_changed(old: Dict[str, Any], new: Dict[str, Any], risk_unit: float) -> bool:
-        """Did the proposal change enough while waiting that the human must see it again?"""
+    def _monetary_risk(direction: str, symbol: Optional[str], lots: Optional[float],
+                       units: float, ref: float, sl: float) -> float:
+        """Loss if the stop is hit, in ACCOUNT currency: MT5's own calculation when it answers
+        (contract size, tick value and currency conversion), else distance x units."""
+        if symbol is not None and lots:
+            value = mt5_orders.calc_profit(direction, symbol, lots, ref, sl)
+            if value is not None:
+                return abs(value)
+        return abs(ref - sl) * units
+
+    @staticmethod
+    def _exec_tolerance(entry: float) -> float:
+        """Largest entry move, in the instrument's quoted units, that needs no new approval."""
+        return max(EXEC_TOLERANCE_PRICE, abs(entry) * EXEC_TOLERANCE_PCT / 100.0)
+
+    @staticmethod
+    def _change_reason(old: Dict[str, Any], new: Dict[str, Any], tolerance: float) -> Optional[str]:
+        """Why the human must approve again (None = the approved trade still stands)."""
         if old.get("side") != new.get("side"):
-            return True
+            return f"direction changed ({old.get('side')} -> {new.get('side')})"
         for key in ("lots", "units"):
             if old.get(key) and new.get(key) is not None \
                     and abs(new[key] - old[key]) > 0.02 * abs(old[key]):
-                return True
-        if risk_unit and abs(new["entry"] - old["entry"]) > REPROPOSE_DRIFT_R * risk_unit:
-            return True
+                return f"{key} changed ({old[key]:g} -> {new[key]:g})"
+        move = abs(new["entry"] - old["entry"])
+        if move > tolerance:
+            return f"entry moved {move:,.4f} (tolerance {tolerance:,.4f})"
         o, n = old.get("required_margin"), new.get("required_margin")
-        return bool(o and n is not None and n > o * 1.10)
+        if o and n is not None and n > o * 1.10:
+            return f"required margin rose ({o:,.2f} -> {n:,.2f})"
+        return None
+
+    def _margin_used(self) -> Optional[float]:
+        """Margin in use by open positions (None if MT5 cannot be read)."""
+        if not self.use_mt5 or not self.live:
+            return sum(float(r.get("margin") or 0.0) for r in self.open.values())
+        return mt5_orders.account_margin_used()
+
+    def _open_risk(self) -> Optional[float]:
+        """Loss if every open position hit its CURRENT stop, in account currency (a stop moved into
+        profit counts as zero). Read from the broker's positions, so it is right after a restart and
+        after trailing stops; None if MT5 cannot be read."""
+        if not self.use_mt5 or not self.live:
+            return sum(float(r.get("risk") or 0.0) for r in self.open.values())
+        positions = mt5_orders.list_positions()
+        if positions is None:
+            return None
+        total = 0.0
+        for p in positions.values():
+            if not p.get("sl"):
+                continue
+            value = mt5_orders.calc_profit(p["direction"], p["symbol"], p["volume"],
+                                           p["price_open"], p["sl"])
+            if value is not None and value < 0:
+                total += -value
+        return total
+
+    def _trade_refreshed(self, old: Dict[str, Any], new: Dict[str, Any], tolerance: float,
+                         outcome: str) -> None:
+        """Sent after EVERY entry timer: the price at approval, the price now, the tolerance and
+        what happens next."""
+        self._event({"type": "trade_refreshed", "ticker": new.get("ticker"), "old": old,
+                     "new": new, "tolerance": tolerance, "outcome": outcome})
+        print(f"  {new.get('ticker')}: entry {old.get('entry')} -> {new.get('entry')} "
+              f"(tolerance {tolerance:,.4f}); {outcome}")
+        try:
+            self._get_notifier().send_trade_refreshed(old, new, tolerance, outcome)
+        except Exception as exc:
+            print(f"  (Trade Refreshed not sent: {exc})")
 
     # -- steps 4-6: timer, revalidation, order
     def _execute_approved(self, cand: Candidate) -> str:
@@ -1070,15 +1177,22 @@ class MainAgent:
         status, ctx = self._prepare(cand)
         if status != "ok" or ctx is None:
             return status                          # dropped / deferred / halted: nothing is sent
-        if self._materially_changed(approved_proposal, ctx["proposal"], ctx["risk_unit"]):
-            if cand.approval_rounds >= MAX_REPROPOSALS:
-                return self._drop(t, "the proposal kept changing; not executed")
-            self._event({"type": "trade_reproposed", "ticker": t, "old": approved_proposal,
-                         "new": ctx["proposal"]})
-            self._alert(f"{t}: the proposal changed while waiting (entry "
-                        f"{approved_proposal['entry']} -> {ctx['proposal']['entry']}); "
-                        f"sending it for approval again.")
+        new_proposal = ctx["proposal"]
+        tolerance = self._exec_tolerance(approved_proposal.get("entry") or new_proposal["entry"])
+        why = self._change_reason(approved_proposal, new_proposal, tolerance)
+        if why:
+            if cand.approval_rounds > MAX_REVALIDATIONS:     # round 1 = the first approval
+                return self._drop(t, f"the trade changed again ({why}) after {MAX_REVALIDATIONS} "
+                                     f"revalidations; not executed")
+            self._event({"type": "trade_reproposed", "ticker": t, "reason": why,
+                         "old": approved_proposal, "new": new_proposal})
+            self._trade_refreshed(
+                approved_proposal, new_proposal, tolerance,
+                f"{why}: sending it for approval again (revalidation "
+                f"{cand.approval_rounds}/{MAX_REVALIDATIONS})")
             return self._request_trade_approval(cand, ctx)
+        self._trade_refreshed(approved_proposal, new_proposal, tolerance,
+                              "within tolerance: levels recalculated, sending the order")
         return self._submit(cand, ctx)
 
     def _submit(self, cand: Candidate, ctx: Dict[str, Any]) -> str:
@@ -1122,7 +1236,8 @@ class MainAgent:
                "lots": lots, "units": traded_units, "entry": fill, "sl": new_sl, "tp": new_tp,
                "opened": _now(), "confidence": cand.confidence, "source": cand.source,
                "batch": cand.batch, "dry_run": bool(self.use_mt5 and not self.live),
-               "margin": margin_needed, "approval_rounds": cand.approval_rounds}
+               "margin": margin_needed, "approval_rounds": cand.approval_rounds,
+               "risk": ctx["proposal"].get("risk_amount")}
         self.open[t] = rec
         self._forget(t)
         if t in self.manager.final_invest:

@@ -1,1 +1,1 @@
-{"date": "2026-11-12", "pool": []}
+{"date": "2026-11-13", "pool": [{"ticker": "COIN", "confidence": 0.7, "direction": "SHORT", "source": "batch3", "batch": 3, "ready": true, "approved": true, "created": 1794585823.7302096}, {"ticker": "PBR", "confidence": 0.7, "direction": "SHORT", "source": "batch3", "batch": 3, "ready": true, "approved": true, "created": 1794585823.7287052}]}

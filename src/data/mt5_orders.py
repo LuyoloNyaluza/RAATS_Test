@@ -181,12 +181,34 @@ def account_free_margin() -> Optional[float]:
         return float(info.margin_free) if info is not None else None
 
 
+def account_margin_used() -> Optional[float]:
+    """Margin currently used by open positions (None if MT5 cannot be read)."""
+    with session() as ok:
+        if not ok or mt5 is None:
+            return None
+        info = mt5.account_info()
+        return float(info.margin) if info is not None else None
+
+
 def calc_margin(direction: str, symbol: str, lots: float, price: float) -> Optional[float]:
     with session() as ok:
         if not ok or mt5 is None:
             return None
         action = mt5.ORDER_TYPE_BUY if direction == "LONG" else mt5.ORDER_TYPE_SELL
         value = mt5.order_calc_margin(action, symbol, lots, price)
+        return float(value) if value is not None else None
+
+
+def calc_profit(direction: str, symbol: str, lots: float, open_price: float,
+                close_price: float) -> Optional[float]:
+    """Profit (negative = loss) in ACCOUNT currency if a position opened at open_price is closed
+    at close_price, from MT5's own calculation (contract size, tick value and currency
+    conversion included). None when MT5 cannot answer."""
+    with session() as ok:
+        if not ok or mt5 is None:
+            return None
+        action = mt5.ORDER_TYPE_BUY if direction == "LONG" else mt5.ORDER_TYPE_SELL
+        value = mt5.order_calc_profit(action, symbol, lots, open_price, close_price)
         return float(value) if value is not None else None
 
 
