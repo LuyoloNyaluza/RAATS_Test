@@ -3256,7 +3256,8 @@ class BatchRunner(threading.Thread):
                 self._wait(BATCH_EXHAUSTED_RETRY_SEC)
                 continue
             if outcome == "empty":
-                retained = getattr(sink, "shared_candidates", lambda: [])()
+                retained_fn = getattr(sink, "shared_candidates", lambda: [])
+                retained = retained_fn()
                 if retained and callable(getattr(sink, "recheck_shared", None)):
                     self._wait(BATCH_EXHAUSTED_RETRY_SEC)
                     if not self._halted():
@@ -3265,6 +3266,21 @@ class BatchRunner(threading.Thread):
                             while sink.first_batch_pending() and not self._halted():
                                 self._wait(RUNNER_POLL_SEC)
                             self.first_batch = False
+                    # If all 10 shared slots are occupied, do not start discovery batches
+                    # that cannot contribute anything. Recheck only until a handover frees slots.
+                    retained = retained_fn()
+                    while len(retained) >= 10 and not self._halted():
+                        self._wait(BATCH_EXHAUSTED_RETRY_SEC)
+                        if self._halted():
+                            break
+                        recheck = sink.recheck_shared(batch_no, self.first_batch)
+                        if recheck == "stopped":
+                            break
+                        if recheck == "handed" and self.first_batch:
+                            while sink.first_batch_pending() and not self._halted():
+                                self._wait(RUNNER_POLL_SEC)
+                            self.first_batch = False
+                        retained = retained_fn()
             if outcome == "handed" and self.first_batch:
                 # the Main Agent works on the first batch before the next one starts
                 while sink.first_batch_pending() and not self._halted():
