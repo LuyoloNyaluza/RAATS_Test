@@ -3255,6 +3255,16 @@ class BatchRunner(threading.Thread):
                       f"{BATCH_EXHAUSTED_RETRY_SEC:.0f}s")
                 self._wait(BATCH_EXHAUSTED_RETRY_SEC)
                 continue
+            if outcome == "empty":
+                retained = getattr(sink, "shared_candidates", lambda: [])()
+                if retained and callable(getattr(sink, "recheck_shared", None)):
+                    self._wait(BATCH_EXHAUSTED_RETRY_SEC)
+                    if not self._halted():
+                        recheck = sink.recheck_shared(batch_no, self.first_batch)
+                        if recheck == "handed" and self.first_batch:
+                            while sink.first_batch_pending() and not self._halted():
+                                self._wait(RUNNER_POLL_SEC)
+                            self.first_batch = False
             if outcome == "handed" and self.first_batch:
                 # the Main Agent works on the first batch before the next one starts
                 while sink.first_batch_pending() and not self._halted():
