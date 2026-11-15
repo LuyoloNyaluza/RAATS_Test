@@ -1835,6 +1835,13 @@ class DynamicTradingManager:
             self.mt5_order_plan = build_order_plan(
                 self.risk_manager, self.mt5_data,
             )
+
+        # Merge retained candidates and screen market availability before Discord approval.
+        market_filter = getattr(self, "batch_market_filter", None)
+        if callable(market_filter):
+            self.final_invest = market_filter(self)
+
+        if self.enable_mt5 and self.mt5_order_plan:
             print("\n" + format_order_plan(self.mt5_order_plan))
 
         if self.final_invest:
@@ -2806,11 +2813,15 @@ class BatchPipeline:
 
     def __init__(self, batch_no: int, status_cb: Any = None,
                  used: Optional[List[str]] = None, day_index: int = 0,
-                 skip_fn: Optional[Any] = None):
+                 skip_fn: Optional[Any] = None,
+                 shared_candidates: Optional[List[Dict[str, Any]]] = None,
+                 market_filter: Optional[Callable[[Any], List[str]]] = None):
         self.batch_no = int(batch_no)
         # ticker memory: ticker -> reason it should not be proposed now (or None). Applied before
         # the news and the LLM, so a ticker you rejected or that just lost is not analysed at all.
         self.skip_fn = skip_fn
+        self.shared_candidates = list(shared_candidates or [])
+        self.market_filter = market_filter
         self.memory_skipped: Dict[str, str] = {}
         self.status_cb = status_cb or (lambda batch_no, status, **info: None)
         self.used = list(used or [])
@@ -2985,8 +2996,13 @@ class BatchPipeline:
                 rgr_threshold=defaults.get("rgr_threshold", 0.0),
                 enable_mt5=mt5_enabled(),
             )
-            manager.batch_no = self.batch_no                              # the only addition
+            manager.batch_no = self.batch_no
             manager.batch_id = f"batch{self.batch_no}_{datetime.now():%Y_%m_%d}"
+            # Retained candidates occupy slots; this batch analyses only the remaining vacancies.
+            manager.max_active_positions = max(
+                0, manager.max_active_positions - min(len(self.shared_candidates), 10)
+            )
+            manager.batch_market_filter = self.market_filter
 
             original_request = manager._request_human_approval            # report the wait, change nothing
             def request_with_status() -> str:
@@ -3148,6 +3164,10 @@ class BatchRunner(threading.Thread):
         extra: Dict[str, Any] = {}
         if callable(getattr(sink, "memory_check", None)):
             extra["skip_fn"] = sink.memory_check           # ticker memory, applied before scoring
+        if callable(getattr(sink, "shared_candidates", None)):
+            extra["shared_candidates"] = sink.shared_candidates()
+        if callable(getattr(sink, "prepare_batch", None)):
+            extra["market_filter"] = sink.prepare_batch
         pipeline = self.pipeline_cls(batch_no, sink.status, used=sink.used_today(),
                                      day_index=sink.day_index(), **extra)
         try:
