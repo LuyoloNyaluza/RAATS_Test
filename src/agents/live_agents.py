@@ -1643,7 +1643,7 @@ class LiveSink:
         if self.use_mt5 and balance is None:
             self.main._alert("Shared candidate recheck paused: MT5 balance is unavailable.")
             return "retry"
-        if self.use_mt5 and balance is not None and balance < self.min_balance:
+        if self.use_mt5 and balance < self.min_balance:
             tickers = [x["ticker"] for x in self.shared_candidates()]
             self.report_insufficient(balance, tickers)
             self.live_cannot_run()
@@ -1672,7 +1672,7 @@ class LiveSink:
             response = manager._request_human_approval()
         else:
             response = "APPROVE"
-        setattr(manager, "approval_response", response)
+        manager.approval_response = response
         if response != "APPROVE":
             self.ledger.append({"type": "shared_final_invest_recheck", "batch_no": batch_no,
                                 "result": "rejected", "response": response, "tickers": tickers})
