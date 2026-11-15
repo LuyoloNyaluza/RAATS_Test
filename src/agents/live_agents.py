@@ -28,8 +28,8 @@ At the end of a batch the result is sent for approval on Discord (inside Subagen
 no approved ticker says so on Discord. Approved tickers are handed to the MAIN AGENT, which opens
 them one by one (balance check -> entry timer -> open) and monitors / adapts SL and TP. Batches
 2, 3, ... run in the background; they pause only when 10 positions are open AND final INVEST holds
-10. Blocked (insufficient funds) and rejected batches are never recovered: the next batch is
-fresh, with the next batch number.
+10. Blocked batches stop the run. Candidates from a rejected batch remain in the shared
+final INVEST list; only candidates successfully inserted into FinalInvestPool leave that list.
 """
 
 import copy
@@ -115,29 +115,17 @@ APPROVAL_JOIN_SEC = _env_float("RAATS_APPROVAL_JOIN_SEC", 0.2)
 # "retry" = keep it in final INVEST and propose it again after TRADE_REJECT_RETRY_SEC.
 TRADE_REJECT_POLICY = os.environ.get("RAATS_TRADE_REJECT_POLICY", "skip").strip().lower()
 TRADE_REJECT_RETRY_SEC = _env_float("RAATS_TRADE_REJECT_RETRY_SEC", 3600.0)
-# After the approval and the entry timer the proposal is recalculated at a fresh quote (ask for a
-# BUY, bid for a SELL). If the entry moved by no more than the tolerance, the levels are
-# recalculated at the new entry, the risk / margin checks run again and the order goes on (a
-# "Trade Refreshed" message is sent). If it moved more, or the direction changed, the size
-# changed by more than 2 % or the required margin rose by more than 10 %, the trade is sent for
-# approval AGAIN: at most MAX_REVALIDATIONS times per trade (never reset by a new approval).
-# The tolerance is in the instrument's own quoted units: the larger of EXEC_TOLERANCE_PRICE and
-# EXEC_TOLERANCE_PCT percent of the approved entry (0.20 is meaningless on an index at 9,000).
-EXEC_TOLERANCE_PRICE = _env_float("RAATS_EXEC_TOLERANCE_PRICE", 0.20)
-EXEC_TOLERANCE_PCT = _env_float("RAATS_EXEC_TOLERANCE_PCT", 0.10)
-MAX_REVALIDATIONS = int(_env_float("RAATS_MAX_REVALIDATIONS", 2))
-# Risk budget per trade: the loss if the stop is hit, as a percentage of the balance. Below
-# SMALL_ACCOUNT_BALANCE the lot size is chosen so the loss at the stop fits this budget; when even
-# the broker's minimum lot is above it, the minimum lot is used and the approval message WARNS
-# (the decision stays with you; nothing is skipped).
-MAX_RISK_LONG_PCT = _env_float("RAATS_MAX_RISK_LONG_PCT", 10.0)
-MAX_RISK_SHORT_PCT = _env_float("RAATS_MAX_RISK_SHORT_PCT", 7.5)
-# More warnings in the approval message: margin in use after this trade, and the stop-loss risk of
-# all open positions plus this trade, each as a percentage of the balance.
-MAX_MARGIN_USED_PCT = _env_float("RAATS_MAX_MARGIN_USED_PCT", 50.0)
-MAX_COMBINED_RISK_PCT = _env_float("RAATS_MAX_COMBINED_RISK_PCT", 30.0)
+# After the approval the proposal is recalculated; it is sent for approval AGAIN when the entry
+# moved by more than this many risk units, the size changed by more than 2 %, or the required
+# margin rose by more than 10 %. At most MAX_REPROPOSALS times for one candidate.
+REPROPOSE_DRIFT_R = _env_float("RAATS_REPROPOSE_DRIFT_R", 0.25)
+MAX_REPROPOSALS = int(_env_float("RAATS_MAX_REPROPOSALS", 3))
 STOP_FILE = os.environ.get("RAATS_STOP_FILE", "data/STOP")
 STATE_FILE = os.environ.get("RAATS_STATE_FILE", "data/state/live_discovery.json")
+SHARED_FINAL_INVEST_FILE = os.environ.get(
+    "RAATS_SHARED_FINAL_INVEST_FILE",
+    os.path.join(os.path.dirname(STATE_FILE), "shared_final_invest.json"),
+)
 
 # Ranks 6-10 (discovery.py uses ranks 1-5 of each).
 
@@ -526,6 +514,7 @@ class MainAgent:
         self._token = object()
         self._lock = threading.RLock()
         self.on_state_change: Callable[[], None] = lambda: None
+        self.shared_candidates_fn: Optional[Callable[[], List[Dict[str, Any]]]] = None
         self.blocked = False                             # insufficient funds: live does not run
         self.balance_gate_passed = False                 # the initial balance check (first approved batch)
         self._gate_unavailable = False
@@ -697,7 +686,10 @@ class MainAgent:
                      "news_by_ticker", "daily_results"):
             if hasattr(batch_manager, name):
                 setattr(self.manager, name, getattr(batch_manager, name))
-        self.manager.final_invest = [c for c in self.pool.tickers()]
+        if callable(self.shared_candidates_fn):
+            self.manager.final_invest = [x["ticker"] for x in self.shared_candidates_fn()]
+        else:
+            self.manager.final_invest = [c for c in self.pool.tickers()]
 
     def _maybe_release_batches(self, opened: int) -> None:
         """After one opening pass that opened nothing, the first batch is as open as it can be."""
@@ -921,44 +913,32 @@ class MainAgent:
             return self._drop(t, f"risk manager: {reason}"), None
         direction = "LONG" if d == 1 else "SHORT"
 
+        lots, traded_units, oversize = None, units, None
+        if snap:
+            sized = to_mt5_lots(units, snap["contract_size"], snap["volume_min"], snap["volume_step"])
+            if sized["feasible"]:
+                lots = min(sized["lots"], snap["volume_max"])
+            elif "min_lot_units" in sized:
+                # RAATS sized it below the broker's minimum lot
+                if balance is not None and balance < SMALL_ACCOUNT_BALANCE:
+                    oversize = sized.get("oversize_factor")
+                    if MAX_MIN_LOT_OVERSIZE > 0 and oversize and oversize > MAX_MIN_LOT_OVERSIZE:
+                        return self._drop(
+                            t, f"the minimum lot is {oversize:.1f}x the size RAATS wanted "
+                               f"(cap {MAX_MIN_LOT_OVERSIZE:g}x); skipped"), None
+                    lots = snap["volume_min"]          # small account: the smallest trade there is
+                else:
+                    return self._defer(cand, sized["reason"]), None   # wait for the balance to grow
+            else:
+                return self._drop(t, sized["reason"]), None
+            traded_units = lots * snap["contract_size"]
+
         risk_unit, _gf = self.rm.compute_risk_unit(atr, m_norm)
         ref = md["close"]
         if snap:
             ref = snap["ask"] if direction == "LONG" else snap["bid"]
         sl, tp = self.rm.compute_initial_levels(ref, d, risk_unit)
         # Initial TP uses rrr (3R), ceiling only applies during monitoring in _manage
-        risk_limit_pct = MAX_RISK_LONG_PCT if direction == "LONG" else MAX_RISK_SHORT_PCT
-        risk_budget = balance * risk_limit_pct / 100.0
-        chk_sl = mt5_orders.clamp_levels(direction, sl, tp, snap)[0] if snap else sl
-
-        lots, traded_units, oversize = None, units, None
-        if snap:
-            if balance < SMALL_ACCOUNT_BALANCE and symbol is not None:
-                # Small account: size from the STOP, not from capital or margin. Lots are chosen so
-                # that the loss at the stop (MT5's own calculation, account currency) fits the risk
-                # budget, rounded DOWN to the lot step. If even the minimum lot costs more than the
-                # budget, the minimum lot is used and the approval message warns with the real risk.
-                vmin, vstep, csize = snap["volume_min"], snap["volume_step"], snap["contract_size"]
-                loss_min = self._monetary_risk(direction, symbol, vmin, vmin * csize, ref, chk_sl)
-                if loss_min <= 0:
-                    return self._drop(t, "the loss at the stop cannot be calculated"), None
-                raw_lots = vmin * risk_budget / loss_min
-                sized = to_mt5_lots(raw_lots * csize, csize, vmin, vstep)
-                if sized["feasible"]:
-                    lots = min(sized["lots"], snap["volume_max"])
-                else:
-                    lots = vmin
-                    oversize = round(loss_min / risk_budget, 2) if risk_budget > 0 else None
-            else:
-                sized = to_mt5_lots(units, snap["contract_size"], snap["volume_min"], snap["volume_step"])
-                if sized["feasible"]:
-                    lots = min(sized["lots"], snap["volume_max"])
-                elif "min_lot_units" in sized:
-                    return self._defer(cand, sized["reason"]), None   # wait for the balance to grow
-                else:
-                    return self._drop(t, sized["reason"]), None
-            traded_units = lots * snap["contract_size"]
-
         required_margin, free_margin = None, balance
         if snap:
             sl, tp = mt5_orders.clamp_levels(direction, sl, tp, snap)
@@ -987,28 +967,7 @@ class MainAgent:
                           f"it is proposed again when the market opens"), None
 
         risk_per_unit = abs(ref - sl)
-        risk_amount = self._monetary_risk(direction, symbol, lots, traded_units, ref, sl)
-        # Warnings shown in the approval message. They never block: you decide.
-        warnings: List[str] = []
-        if balance > 0:
-            if risk_amount > risk_budget + 1e-9:
-                warnings.append(
-                    f"Risk ${risk_amount:,.2f} if the stop is hit = {risk_amount / balance * 100:.0f}% of "
-                    f"the balance (limit {risk_limit_pct:g}% = ${risk_budget:,.2f})"
-                    + (f"; the broker's smallest lot is {oversize:.1f}x the budget" if oversize else ""))
-            used = self._margin_used()
-            if used is not None and required_margin is not None:
-                after = used + required_margin
-                if after > balance * MAX_MARGIN_USED_PCT / 100.0:
-                    warnings.append(
-                        f"Margin in use after this trade ${after:,.2f} = {after / balance * 100:.0f}% of "
-                        f"the balance (limit {MAX_MARGIN_USED_PCT:g}%)")
-            open_risk = self._open_risk()
-            if open_risk is not None and open_risk + risk_amount > balance * MAX_COMBINED_RISK_PCT / 100.0:
-                warnings.append(
-                    f"Combined stop-loss risk of open positions (${open_risk:,.2f}) plus this trade = "
-                    f"${open_risk + risk_amount:,.2f} = {(open_risk + risk_amount) / balance * 100:.0f}% of "
-                    f"the balance (limit {MAX_COMBINED_RISK_PCT:g}%)")
+        risk_amount = risk_per_unit * traded_units
         reward_amount = abs(tp - ref) * traded_units
         rr = (abs(tp - ref) / risk_per_unit) if risk_per_unit else None
         proposal = {
@@ -1019,7 +978,6 @@ class MainAgent:
             "paper": not self.use_mt5, "dry_run": bool(self.use_mt5 and not self.live),
             "lots": lots, "units": traded_units, "entry": ref, "stop_loss": sl, "take_profit": tp,
             "risk_amount": risk_amount, "reward_amount": reward_amount,
-            "risk_pct": (risk_amount / balance * 100.0) if balance else None, "warnings": warnings,
             "risk_reward": f"1:{rr:.1f}" if rr else "n/a", "time": _now(),
         }
         ctx = {"md": md, "atr": atr, "m": m, "m_norm": m_norm, "symbol": symbol, "snap": snap,
@@ -1077,75 +1035,18 @@ class MainAgent:
         return "rejected"
 
     @staticmethod
-    def _monetary_risk(direction: str, symbol: Optional[str], lots: Optional[float],
-                       units: float, ref: float, sl: float) -> float:
-        """Loss if the stop is hit, in ACCOUNT currency: MT5's own calculation when it answers
-        (contract size, tick value and currency conversion), else distance x units."""
-        if symbol is not None and lots:
-            value = mt5_orders.calc_profit(direction, symbol, lots, ref, sl)
-            if value is not None:
-                return abs(value)
-        return abs(ref - sl) * units
-
-    @staticmethod
-    def _exec_tolerance(entry: float) -> float:
-        """Largest entry move, in the instrument's quoted units, that needs no new approval."""
-        return max(EXEC_TOLERANCE_PRICE, abs(entry) * EXEC_TOLERANCE_PCT / 100.0)
-
-    @staticmethod
-    def _change_reason(old: Dict[str, Any], new: Dict[str, Any], tolerance: float) -> Optional[str]:
-        """Why the human must approve again (None = the approved trade still stands)."""
+    def _materially_changed(old: Dict[str, Any], new: Dict[str, Any], risk_unit: float) -> bool:
+        """Did the proposal change enough while waiting that the human must see it again?"""
         if old.get("side") != new.get("side"):
-            return f"direction changed ({old.get('side')} -> {new.get('side')})"
+            return True
         for key in ("lots", "units"):
             if old.get(key) and new.get(key) is not None \
                     and abs(new[key] - old[key]) > 0.02 * abs(old[key]):
-                return f"{key} changed ({old[key]:g} -> {new[key]:g})"
-        move = abs(new["entry"] - old["entry"])
-        if move > tolerance:
-            return f"entry moved {move:,.4f} (tolerance {tolerance:,.4f})"
+                return True
+        if risk_unit and abs(new["entry"] - old["entry"]) > REPROPOSE_DRIFT_R * risk_unit:
+            return True
         o, n = old.get("required_margin"), new.get("required_margin")
-        if o and n is not None and n > o * 1.10:
-            return f"required margin rose ({o:,.2f} -> {n:,.2f})"
-        return None
-
-    def _margin_used(self) -> Optional[float]:
-        """Margin in use by open positions (None if MT5 cannot be read)."""
-        if not self.use_mt5 or not self.live:
-            return sum(float(r.get("margin") or 0.0) for r in self.open.values())
-        return mt5_orders.account_margin_used()
-
-    def _open_risk(self) -> Optional[float]:
-        """Loss if every open position hit its CURRENT stop, in account currency (a stop moved into
-        profit counts as zero). Read from the broker's positions, so it is right after a restart and
-        after trailing stops; None if MT5 cannot be read."""
-        if not self.use_mt5 or not self.live:
-            return sum(float(r.get("risk") or 0.0) for r in self.open.values())
-        positions = mt5_orders.list_positions()
-        if positions is None:
-            return None
-        total = 0.0
-        for p in positions.values():
-            if not p.get("sl"):
-                continue
-            value = mt5_orders.calc_profit(p["direction"], p["symbol"], p["volume"],
-                                           p["price_open"], p["sl"])
-            if value is not None and value < 0:
-                total += -value
-        return total
-
-    def _trade_refreshed(self, old: Dict[str, Any], new: Dict[str, Any], tolerance: float,
-                         outcome: str) -> None:
-        """Sent after EVERY entry timer: the price at approval, the price now, the tolerance and
-        what happens next."""
-        self._event({"type": "trade_refreshed", "ticker": new.get("ticker"), "old": old,
-                     "new": new, "tolerance": tolerance, "outcome": outcome})
-        print(f"  {new.get('ticker')}: entry {old.get('entry')} -> {new.get('entry')} "
-              f"(tolerance {tolerance:,.4f}); {outcome}")
-        try:
-            self._get_notifier().send_trade_refreshed(old, new, tolerance, outcome)
-        except Exception as exc:
-            print(f"  (Trade Refreshed not sent: {exc})")
+        return bool(o and n is not None and n > o * 1.10)
 
     # -- steps 4-6: timer, revalidation, order
     def _execute_approved(self, cand: Candidate) -> str:
@@ -1177,22 +1078,15 @@ class MainAgent:
         status, ctx = self._prepare(cand)
         if status != "ok" or ctx is None:
             return status                          # dropped / deferred / halted: nothing is sent
-        new_proposal = ctx["proposal"]
-        tolerance = self._exec_tolerance(approved_proposal.get("entry") or new_proposal["entry"])
-        why = self._change_reason(approved_proposal, new_proposal, tolerance)
-        if why:
-            if cand.approval_rounds > MAX_REVALIDATIONS:     # round 1 = the first approval
-                return self._drop(t, f"the trade changed again ({why}) after {MAX_REVALIDATIONS} "
-                                     f"revalidations; not executed")
-            self._event({"type": "trade_reproposed", "ticker": t, "reason": why,
-                         "old": approved_proposal, "new": new_proposal})
-            self._trade_refreshed(
-                approved_proposal, new_proposal, tolerance,
-                f"{why}: sending it for approval again (revalidation "
-                f"{cand.approval_rounds}/{MAX_REVALIDATIONS})")
+        if self._materially_changed(approved_proposal, ctx["proposal"], ctx["risk_unit"]):
+            if cand.approval_rounds >= MAX_REPROPOSALS:
+                return self._drop(t, "the proposal kept changing; not executed")
+            self._event({"type": "trade_reproposed", "ticker": t, "old": approved_proposal,
+                         "new": ctx["proposal"]})
+            self._alert(f"{t}: the proposal changed while waiting (entry "
+                        f"{approved_proposal['entry']} -> {ctx['proposal']['entry']}); "
+                        f"sending it for approval again.")
             return self._request_trade_approval(cand, ctx)
-        self._trade_refreshed(approved_proposal, new_proposal, tolerance,
-                              "within tolerance: levels recalculated, sending the order")
         return self._submit(cand, ctx)
 
     def _submit(self, cand: Candidate, ctx: Dict[str, Any]) -> str:
@@ -1236,8 +1130,7 @@ class MainAgent:
                "lots": lots, "units": traded_units, "entry": fill, "sl": new_sl, "tp": new_tp,
                "opened": _now(), "confidence": cand.confidence, "source": cand.source,
                "batch": cand.batch, "dry_run": bool(self.use_mt5 and not self.live),
-               "margin": margin_needed, "approval_rounds": cand.approval_rounds,
-               "risk": ctx["proposal"].get("risk_amount")}
+               "margin": margin_needed, "approval_rounds": cand.approval_rounds}
         self.open[t] = rec
         self._forget(t)
         if t in self.manager.final_invest:
@@ -1593,6 +1486,204 @@ class LiveSink:
         self.main, self.ledger, self.use_mt5 = main, ledger, use_mt5
         self.min_balance = MIN_ACCOUNT_BALANCE
         self.paused = False
+        self._shared_lock = threading.RLock()
+        self._shared_final_invest: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._load_shared_final_invest()
+
+    def _load_shared_final_invest(self) -> None:
+        """Restore the cross-batch candidate list independently of the execution pool."""
+        try:
+            with open(SHARED_FINAL_INVEST_FILE, encoding="utf-8") as f:
+                state = json.load(f)
+            if state.get("date") != datetime.now().strftime("%Y-%m-%d"):
+                return
+            for item in state.get("candidates", []) or []:
+                if len(self._shared_final_invest) >= MAX_FINAL_INVEST:
+                    break
+                ticker = str(item.get("ticker") or "").upper().strip()
+                if ticker and ticker not in self._shared_final_invest:
+                    self._shared_final_invest[ticker] = item
+            print(f"[batches] restored {len(self._shared_final_invest)} shared final INVEST candidate(s)")
+        except (OSError, ValueError, TypeError):
+            return
+
+    def _save_shared_final_invest(self) -> None:
+        """Atomically persist retained candidates; they are not subject to pool TTL."""
+        try:
+            os.makedirs(os.path.dirname(SHARED_FINAL_INVEST_FILE) or ".", exist_ok=True)
+            tmp = SHARED_FINAL_INVEST_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "candidates": list(self._shared_final_invest.values()),
+                }, f, default=str)
+            os.replace(tmp, SHARED_FINAL_INVEST_FILE)
+        except OSError as exc:
+            _log_error("-", exc, "save_shared_final_invest")
+
+    def shared_candidates(self) -> List[Dict[str, Any]]:
+        with self._shared_lock:
+            return copy.deepcopy(list(self._shared_final_invest.values()))
+
+    def seed_shared_from_manager(self, manager: Any) -> None:
+        """Persist a pre-approved compatibility batch before attempting its pool handover."""
+        results = {str(r.get("ticker", "")).upper(): r
+                   for r in getattr(manager, "daily_results", []) if r.get("ticker")}
+        plans = dict(getattr(manager, "mt5_order_plan", {}) or {})
+        market_data = dict(getattr(manager, "mt5_data", {}) or {})
+        with self._shared_lock:
+            for raw_ticker in getattr(manager, "final_invest", []) or []:
+                ticker = str(raw_ticker).upper()
+                if ticker not in self._shared_final_invest and len(self._shared_final_invest) >= MAX_FINAL_INVEST:
+                    continue
+                old = self._shared_final_invest.get(ticker, {})
+                result = results.get(ticker, {})
+                self._shared_final_invest[ticker] = {
+                    "ticker": ticker,
+                    "confidence": float(result.get("confidence") or old.get("confidence") or 0.0),
+                    "direction": result.get("direction") or old.get("direction"),
+                    "result": result or old.get("result") or {},
+                    "order_plan": plans.get(ticker) or old.get("order_plan") or {},
+                    "mt5_data": market_data.get(ticker) or old.get("mt5_data") or {},
+                    "batch": int(getattr(manager, "batch_no", 0) or old.get("batch") or 0),
+                    "created": old.get("created") or time.time(),
+                }
+            self._save_shared_final_invest()
+
+    def prepare_batch(self, manager: Any) -> List[str]:
+        """Merge retained + newly analysed candidates, then admit only broker-open markets.
+
+        A candidate remains in this shared collection until adopt_batch confirms that the
+        execution pool accepted it. Closed/unquotable markets stay here for the next check.
+        """
+        results = {str(r.get("ticker", "")).upper(): r
+                   for r in getattr(manager, "daily_results", []) if r.get("ticker")}
+        current = [str(t).upper() for t in getattr(manager, "final_invest", [])]
+        plans = dict(getattr(manager, "mt5_order_plan", {}) or {})
+        market_data = dict(getattr(manager, "mt5_data", {}) or {})
+        with self._shared_lock:
+            for ticker in current:
+                old = self._shared_final_invest.get(ticker, {})
+                if not old and len(self._shared_final_invest) >= MAX_FINAL_INVEST:
+                    continue
+                result = results.get(ticker, {})
+                self._shared_final_invest[ticker] = {
+                    "ticker": ticker,
+                    "confidence": float(result.get("confidence") or old.get("confidence") or 0.0),
+                    "direction": result.get("direction") or old.get("direction"),
+                    "result": result or old.get("result") or {},
+                    "order_plan": plans.get(ticker) or old.get("order_plan") or {},
+                    "mt5_data": market_data.get(ticker) or old.get("mt5_data") or {},
+                    "batch": int(getattr(manager, "batch_no", 0) or old.get("batch") or 0),
+                    "created": old.get("created") or time.time(),
+                }
+
+            merged = list(self._shared_final_invest.values())[:MAX_FINAL_INVEST]
+            manager.mt5_order_plan = {
+                **{str(k).upper(): v for k, v in plans.items()},
+                **{x["ticker"]: x.get("order_plan", {}) for x in merged},
+            }
+            manager.mt5_data = {
+                **{str(k).upper(): v for k, v in market_data.items()},
+                **{x["ticker"]: x.get("mt5_data", {}) for x in merged},
+            }
+            known = {str(r.get("ticker", "")).upper() for r in manager.daily_results if r.get("ticker")}
+            for item in merged:
+                if item["ticker"] not in known and item.get("result"):
+                    manager.daily_results.append(item["result"])
+            self._save_shared_final_invest()
+
+            if not self.use_mt5:
+                return [x["ticker"] for x in merged]
+
+            open_tickers: List[str] = []
+            for item in merged:
+                ticker = item["ticker"]
+                plan = item.get("order_plan") or {}
+                md = item.get("mt5_data") or {}
+                symbol = plan.get("mt5_symbol") or md.get("mt5_symbol") or mt5_orders.resolve(ticker)
+                direction = plan.get("direction") or item.get("direction")
+                if direction not in ("LONG", "SHORT") or not symbol:
+                    continue
+                lots = plan.get("lots")
+                levels = plan.get("levels") or {}
+                snap = mt5_orders.snapshot(symbol)
+                if (not snap or int(snap.get("trade_mode", 0)) != 4
+                        or float(snap.get("bid") or 0) <= 0
+                        or float(snap.get("ask") or 0) <= 0):
+                    continue
+                # Refresh the quote/spec shown in the batch approval. The individual trade
+                # approval still recalculates entry, SL, TP, lots and margin before execution.
+                bid, ask = float(snap["bid"]), float(snap["ask"])
+                mid = (bid + ask) / 2.0
+                manager.mt5_data[ticker] = {
+                    **md, **snap, "mt5_symbol": symbol, "tradable": True,
+                    "spread_pct": round((ask - bid) / mid * 100, 4) if mid else None,
+                }
+                if not lots or float(lots) <= 0:
+                    lots = snap.get("volume_min")
+                if not lots:
+                    continue
+                check = mt5_orders.check_order(
+                    symbol, direction, float(lots),
+                    levels.get("stop_loss"), levels.get("take_profit"),
+                )
+                if not check.get("checked") or check.get("not_trading_now"):
+                    continue
+                open_tickers.append(ticker)
+            return open_tickers
+
+    def recheck_shared(self, batch_no: int, first_batch: bool = False) -> str:
+        """Recheck retained candidates without running another discovery/analysis batch."""
+        from src.agents.trading_loop_dynamic import DynamicTradingManager, _live_portfolio_value
+
+        if not self.has_room():
+            return "waiting"
+        balance = self.read_balance()
+        if self.use_mt5 and balance is None:
+            self.main._alert("Shared candidate recheck paused: MT5 balance is unavailable.")
+            return "retry"
+        if self.use_mt5 and balance is not None and balance < self.min_balance:
+            tickers = [x["ticker"] for x in self.shared_candidates()]
+            self.report_insufficient(balance, tickers)
+            self.live_cannot_run()
+            return "stopped"
+
+        manager = DynamicTradingManager(
+            top_50_performing=[], top_10=[], waiting_list=[],
+            portfolio_value=_live_portfolio_value(), enable_mt5=self.use_mt5,
+        )
+        manager.simulate_date = None
+        manager.batch_no = int(batch_no)
+        manager.batch_id = f"shared_recheck_{batch_no}_{datetime.now():%Y%m%d_%H%M%S}"
+        # No new analysis: only reuse the saved analysis and recheck current broker availability.
+        manager.final_invest = self.prepare_batch(manager)
+        if not manager.final_invest:
+            self.ledger.append({"type": "shared_final_invest_recheck", "batch_no": batch_no,
+                                "result": "no_market_open", "retained": len(self.shared_candidates())})
+            return "waiting"
+
+        tickers = list(manager.final_invest)
+        require_approval = os.environ.get("RAATS_REQUIRE_APPROVAL", "").strip().lower() in (
+            "1", "true", "yes"
+        )
+        if require_approval:
+            self.status(batch_no, WAITING_FOR_APPROVAL, tickers=tickers, recheck=True)
+            response = manager._request_human_approval()
+        else:
+            response = "APPROVE"
+        setattr(manager, "approval_response", response)
+        if response != "APPROVE":
+            self.ledger.append({"type": "shared_final_invest_recheck", "batch_no": batch_no,
+                                "result": "rejected", "response": response, "tickers": tickers})
+            return "rejected"
+
+        accepted = self.handover(manager, batch_no, tickers, first_batch)
+        self.ledger.append({"type": "shared_final_invest_recheck", "batch_no": batch_no,
+                            "result": "handed" if accepted else "pool_full",
+                            "approved": tickers, "accepted": accepted,
+                            "retained": len(self.shared_candidates())})
+        return "handed" if accepted else "waiting"
 
     # -- state of the position engine
     def should_stop(self) -> bool:
@@ -1629,6 +1720,11 @@ class LiveSink:
     def live_cannot_run(self) -> None:
         self.main.blocked = True
         discard_pool_state()
+        try:
+            if os.path.exists(SHARED_FINAL_INVEST_FILE):
+                os.remove(SHARED_FINAL_INVEST_FILE)
+        except OSError as exc:
+            _log_error("-", exc, "discard_shared_final_invest")
         self.main.stop()
 
     # -- the persisted batch history
@@ -1662,8 +1758,9 @@ class LiveSink:
         handed = sum(1 for _, o in outcomes if o == "handed")
         message = (
             "DISCOVERY SOURCES EXHAUSTED\n\n"
-            "No more new broker-supported tickers were available, so no further batches will run "
-            "this session. Open positions keep being monitored.\n\n"
+            "No more new broker-supported tickers are available. Any retained final INVEST "
+            "candidates will continue to be rechecked for market availability without rerunning "
+            "discovery just for those checks. Open positions keep being monitored.\n\n"
             f"Batches this run: {len(outcomes)} ({handed} approved and handed over)\n"
             + "\n".join(lines)
         )
@@ -1677,8 +1774,15 @@ class LiveSink:
     # -- the hand-over to the main agent
     def handover(self, manager: Any, batch_no: int, tickers: List[str], first_batch: bool) -> List[str]:
         accepted = self.main.adopt_batch(manager, batch_no)
-        self.main.sync_summary(manager)
+        # Persist the execution queue BEFORE removing shared candidates. A crash between these
+        # writes can then only cause a harmless duplicate, never lose an accepted candidate.
         self.main.on_state_change()
+        # Only a successful pool insertion removes a candidate from shared final INVEST.
+        with self._shared_lock:
+            for ticker in accepted:
+                self._shared_final_invest.pop(str(ticker).upper(), None)
+            self._save_shared_final_invest()
+        self.main.sync_summary(manager)
         if first_batch and accepted:
             self.main.expect_first_open = True     # open it first, then batches 2, 3, ... start
         return accepted
@@ -1712,6 +1816,11 @@ def _apply_global_block(ledger: BatchLedger, main: "MainAgent", info: Dict[str, 
     for batch_no, tickers in (info.get("by_batch") or {}).items():
         ledger.status(batch_no, INSUFFICIENT_FUNDS, tickers=tickers, balance=info.get("balance"))
     discard_pool_state()
+    try:
+        if os.path.exists(SHARED_FINAL_INVEST_FILE):
+            os.remove(SHARED_FINAL_INVEST_FILE)
+    except OSError as exc:
+        _log_error("-", exc, "discard_shared_final_invest")
     main.stop()
 
 
@@ -1734,13 +1843,16 @@ def _prepare_live(manager: Any, notifier: Any, ledger: BatchLedger, use_mt5: boo
     main.recover_open_positions()
     restored = load_pool_state(pool)
     recovered = main.open_count()
+    sink = LiveSink(main, ledger, use_mt5)
+    main.shared_candidates_fn = sink.shared_candidates
     if handed:
         n = ledger.next_batch_no()
         tickers = list(manager.final_invest)
         ledger.status(n, BATCH_PROCESSING, initial=True,
                       universe=[str(t).upper() for t in getattr(manager, "ticker_universe", [])])
         ledger.status(n, READY, tickers=tickers)
-        accepted = main.adopt_batch(manager, n)
+        sink.seed_shared_from_manager(manager)
+        accepted = sink.handover(manager, n, tickers, first_batch=False)
         ledger.status(n, HANDED_OVER, tickers=accepted, approved=tickers)
         ledger.status(n, BATCH_COMPLETED, tickers=accepted)
         main.on_state_change()
@@ -1750,7 +1862,7 @@ def _prepare_live(manager: Any, notifier: Any, ledger: BatchLedger, use_mt5: boo
         _keep_mt5_connected()
     from src.agents.trading_loop_dynamic import BatchRunner      # the batch runner
     from src.agents.deep_batch import DeepBatchPipeline          # Deep Agents: main agent + 3 subagents
-    runner = BatchRunner(LiveSink(main, ledger, use_mt5), use_mt5,
+    runner = BatchRunner(sink, use_mt5,
                          first_batch=not (recovered or restored),
                          pipeline_cls=DeepBatchPipeline)         # RAATS_DEEP_AGENTS=0 -> plain threads
     return main, pool, runner
@@ -1786,8 +1898,8 @@ def run_live_phase(manager: Any, notifier: Any = None) -> None:
 def run_live(notifier: Any = None) -> None:
     """RAATS entry point.
 
-    1. Read the persisted batch history (cases A-E) and take the next batch number. A blocked or
-       rejected batch is never recovered.
+    1. Read the persisted batch history (cases A-E) and take the next batch number. A blocked
+       batch stops; candidates from a rejected batch remain in shared final INVEST for rechecking.
     2. Start the main agent: it takes over positions still open on MT5 and keeps managing them.
     3. Run batches (three thread-based subagents each) in the background: the first batch is
        approved on Discord, passed to the main agent and opened one by one; batches 2, 3, ...

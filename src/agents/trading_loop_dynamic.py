@@ -55,7 +55,7 @@ goes ahead with what is available - it never waits for 10.
 """
 
 import os
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable, cast
 from datetime import datetime
 
 import pandas as pd
@@ -619,7 +619,7 @@ class DynamicTradingManager:
 
         self.daily_results = []
 
-        self.final_invest = []
+        self.final_invest: List[str] = []
 
         self.hold_history = []
 
@@ -628,6 +628,7 @@ class DynamicTradingManager:
         # Batch metadata is populated by the batch coordinator.
         self.batch_no: Optional[int] = None
         self.batch_id: Optional[str] = None
+        self.batch_market_filter: Optional[Callable[[Any], List[str]]] = None
 
         # One-time reserve (30 extra tickers) state
         self.reserve_loaded = False
@@ -963,7 +964,10 @@ class DynamicTradingManager:
             # Skip already resolved INVEST
             # ----------------------------------
 
-            if ticker in self.final_invest:
+            if (
+                isinstance(self.final_invest, list)
+                and ticker in self.final_invest
+            ):
 
                 print(
                     f"\nSkipping {ticker}: "
@@ -1835,6 +1839,13 @@ class DynamicTradingManager:
             self.mt5_order_plan = build_order_plan(
                 self.risk_manager, self.mt5_data,
             )
+
+        # Merge retained candidates and screen market availability before Discord approval.
+        market_filter = getattr(self, "batch_market_filter", None)
+        if callable(market_filter):
+            self.final_invest = cast(List[str], market_filter(self))
+
+        if self.enable_mt5 and self.mt5_order_plan:
             print("\n" + format_order_plan(self.mt5_order_plan))
 
         if self.final_invest:
@@ -2653,10 +2664,9 @@ BATCH_MACRO_RETRY_SEC = _batch_env_float("RAATS_MACRO_RETRY_SEC", 600.0)
 # (Yahoo's lists change during the day, so a later discovery can find new names).
 BATCH_EXHAUSTED_RETRY_SEC = _batch_env_float("RAATS_EXHAUSTED_RETRY_SEC", 900.0)
 RUNNER_POLL_SEC = _batch_env_float("RAATS_RUNNER_POLL_SEC", 2.0)
-# From this batch OF THE DAY on (5 = the fifth batch that discovered tickers today), a batch no
-# longer needs a full 50 tickers: it works with whatever unused tickers are available (only a
-# batch with none at all counts as exhausted). Earlier batches keep the strict 50 rule.
-# Set very high to disable.
+# From this batch number on, a batch no longer needs a full 50 tickers: it works with whatever
+# unused tickers are available (only a batch with none at all counts as exhausted).
+# Batches below this number keep the strict 50 rule. Set very high to disable.
 RELAX_FROM_BATCH = int(_batch_env_float("RAATS_RELAX_FROM_BATCH", 5))
 # Retry interval when balance is unreadable
 BATCH_BALANCE_RETRY_SEC = _batch_env_float("RAATS_BATCH_BALANCE_RETRY_SEC", 5.0)
@@ -2807,11 +2817,15 @@ class BatchPipeline:
 
     def __init__(self, batch_no: int, status_cb: Any = None,
                  used: Optional[List[str]] = None, day_index: int = 0,
-                 skip_fn: Optional[Any] = None):
+                 skip_fn: Optional[Any] = None,
+                 shared_candidates: Optional[List[Dict[str, Any]]] = None,
+                 market_filter: Optional[Callable[[Any], List[str]]] = None):
         self.batch_no = int(batch_no)
         # ticker memory: ticker -> reason it should not be proposed now (or None). Applied before
         # the news and the LLM, so a ticker you rejected or that just lost is not analysed at all.
         self.skip_fn = skip_fn
+        self.shared_candidates = list(shared_candidates or [])
+        self.market_filter = market_filter
         self.memory_skipped: Dict[str, str] = {}
         self.status_cb = status_cb or (lambda batch_no, status, **info: None)
         self.used = list(used or [])
@@ -2889,12 +2903,10 @@ class BatchPipeline:
             from src.data import discovery as d
             with discovery_window(d, self.day_index, self.used) as window:
                 equity_tickers = d.get_tickers_from_gainers_feed()   # gainers, then most-active top-up
-                # the Nth batch OF THE DAY onward (day_index is 0 for the first batch of the day);
-                # batch_no is a monthly counter and would relax the first batch of every day
-                relaxed = (self.day_index + 1) >= RELAX_FROM_BATCH
+                relaxed = self.batch_no >= RELAX_FROM_BATCH
                 if window is not None and len(equity_tickers) < window.need:
                     if relaxed and equity_tickers:
-                        print(f"Batch {self.batch_no} (day batch {self.day_index + 1}): only {len(equity_tickers)} unused equities "
+                        print(f"Batch {self.batch_no}: only {len(equity_tickers)} unused equities "
                               f"available (a full batch is {window.need}); working with what is there.")
                     else:
                         print(f"Only {len(equity_tickers)} unused equities left across day_gainers and "
@@ -2906,7 +2918,7 @@ class BatchPipeline:
                 market_universe = d.build_market_universe(equity_tickers)
                 if len(market_universe) != d.TOP_50_COUNT:
                     if relaxed and market_universe:
-                        print(f"Batch {self.batch_no} (day batch {self.day_index + 1}): universe has {len(market_universe)} instruments "
+                        print(f"Batch {self.batch_no}: universe has {len(market_universe)} instruments "
                               f"(not {d.TOP_50_COUNT}); continuing with the available tickers.")
                     else:
                         raise ValueError(f"Expected {d.TOP_50_COUNT} instruments, "
@@ -2988,8 +3000,10 @@ class BatchPipeline:
                 rgr_threshold=defaults.get("rgr_threshold", 0.0),
                 enable_mt5=mt5_enabled(),
             )
-            manager.batch_no = self.batch_no                              # the only addition
+            manager.batch_no = self.batch_no
             manager.batch_id = f"batch{self.batch_no}_{datetime.now():%Y_%m_%d}"
+            # Retained candidates are merged at the pre-approval checkpoint.
+            manager.batch_market_filter = self.market_filter
 
             original_request = manager._request_human_approval            # report the wait, change nothing
             def request_with_status() -> str:
@@ -3094,8 +3108,8 @@ class BatchSink:
 class BatchRunner(threading.Thread):
     """Runs batch after batch (each one = the three subagents) beside the position engine.
 
-    * every batch is sent to Discord inside Subagent 3; only the APPROVED tickers are handed over
-      (to FinalInvestPool), and a rejected batch adds nothing and the loop goes on
+    * every batch is screened for market availability before Discord approval; only approved
+      tickers are handed to FinalInvestPool, while unhanded candidates remain in shared final INVEST
     * a batch starts while FinalInvestPool has capacity; it pauses when the pool is full
     * it stops at once when GLOBAL_STATE is blocked (the Main Agent's balance gate failed)
     * when the discovery sources are exhausted the final outcome is reported and it ends
@@ -3151,6 +3165,10 @@ class BatchRunner(threading.Thread):
         extra: Dict[str, Any] = {}
         if callable(getattr(sink, "memory_check", None)):
             extra["skip_fn"] = sink.memory_check           # ticker memory, applied before scoring
+        if callable(getattr(sink, "shared_candidates", None)):
+            extra["shared_candidates"] = sink.shared_candidates()
+        if callable(getattr(sink, "prepare_batch", None)):
+            extra["market_filter"] = sink.prepare_batch
         pipeline = self.pipeline_cls(batch_no, sink.status, used=sink.used_today(),
                                      day_index=sink.day_index(), **extra)
         try:
@@ -3216,10 +3234,57 @@ class BatchRunner(threading.Thread):
                         report(self.outcomes)
                     except Exception as exc:                 # a report must never stop the runner
                         print(f"[batches] could not report the exhausted batch: {exc}")
+                retained = getattr(sink, "shared_candidates", lambda: [])()
+                if retained and callable(getattr(sink, "recheck_shared", None)):
+                    print(f"[batches] discovery exhausted; retaining {len(retained)} candidate(s) "
+                          "for market-open rechecks without rediscovery")
+                    while retained and not self._halted():
+                        self._wait(BATCH_EXHAUSTED_RETRY_SEC)
+                        if self._halted():
+                            break
+                        recheck = sink.recheck_shared(batch_no, self.first_batch)
+                        if recheck == "stopped":
+                            break
+                        if recheck == "handed" and self.first_batch:
+                            while sink.first_batch_pending() and not self._halted():
+                                self._wait(RUNNER_POLL_SEC)
+                            self.first_batch = False
+                        retained = getattr(sink, "shared_candidates", lambda: [])()
+                    if self._halted():
+                        break
+                    # All retained candidates have been handed over; resume discovery later.
+                    self._wait(BATCH_EXHAUSTED_RETRY_SEC)
+                    continue
                 print(f"[batches] batch {batch_no}: no tickers found; next batch starts in "
                       f"{BATCH_EXHAUSTED_RETRY_SEC:.0f}s")
                 self._wait(BATCH_EXHAUSTED_RETRY_SEC)
                 continue
+            if outcome == "empty":
+                retained_fn = getattr(sink, "shared_candidates", lambda: [])
+                retained = retained_fn()
+                if retained and callable(getattr(sink, "recheck_shared", None)):
+                    self._wait(BATCH_EXHAUSTED_RETRY_SEC)
+                    if not self._halted():
+                        recheck = sink.recheck_shared(batch_no, self.first_batch)
+                        if recheck == "handed" and self.first_batch:
+                            while sink.first_batch_pending() and not self._halted():
+                                self._wait(RUNNER_POLL_SEC)
+                            self.first_batch = False
+                    # If all 10 shared slots are occupied, do not start discovery batches
+                    # that cannot contribute anything. Recheck only until a handover frees slots.
+                    retained = retained_fn()
+                    while len(retained) >= 10 and not self._halted():
+                        self._wait(BATCH_EXHAUSTED_RETRY_SEC)
+                        if self._halted():
+                            break
+                        recheck = sink.recheck_shared(batch_no, self.first_batch)
+                        if recheck == "stopped":
+                            break
+                        if recheck == "handed" and self.first_batch:
+                            while sink.first_batch_pending() and not self._halted():
+                                self._wait(RUNNER_POLL_SEC)
+                            self.first_batch = False
+                        retained = retained_fn()
             if outcome == "handed" and self.first_batch:
                 # the Main Agent works on the first batch before the next one starts
                 while sink.first_batch_pending() and not self._halted():
