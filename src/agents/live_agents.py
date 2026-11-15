@@ -1606,6 +1606,16 @@ class LiveSink:
                 if not lots or float(lots) <= 0:
                     snap = mt5_orders.snapshot(symbol)
                     lots = (snap or {}).get("volume_min")
+                snap = mt5_orders.snapshot(symbol)
+                if not snap or int(snap.get("trade_mode", 0)) != 4:
+                    continue
+                # Refresh the quote/spec shown in the batch approval. The individual trade
+                # approval still recalculates entry, SL, TP, lots and margin before execution.
+                manager.mt5_data[ticker] = {
+                    **md, **snap, "mt5_symbol": symbol, "tradable": True,
+                }
+                if not lots:
+                    lots = snap.get("volume_min")
                 if not lots:
                     continue
                 check = mt5_orders.check_order(
