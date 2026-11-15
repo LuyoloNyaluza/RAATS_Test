@@ -1113,6 +1113,19 @@ class MainAgent:
                                                 comment=f"RAATS {t}", ref_price=ref,
                                                 token=self._token)
             if not res["ok"]:
+                retcode = res.get("retcode")
+                why = None
+                if isinstance(retcode, int):
+                    why = mt5_orders.NOT_TRADING_NOW.get(retcode)
+                if why:
+                    # The broker would not take the order because the market is not trading.
+                    # That is not the order's fault: the candidate stays in final INVEST and is
+                    # proposed again when the market opens (never dropped for this).
+                    self._event({"type": "market_not_open", "ticker": t, "symbol": symbol,
+                                 "reason": why, "retcode": retcode, "at": "order_send"})
+                    return self._defer(
+                        cand, f"{symbol}: {why} (broker: {res['message']}); "
+                              f"it is proposed again when the market opens")
                 return self._drop(t, f"order failed: {res['message']}")
             ticket, fill = res["ticket"], res["price"] or ref
 
@@ -1643,7 +1656,7 @@ class LiveSink:
         if self.use_mt5 and balance is None:
             self.main._alert("Shared candidate recheck paused: MT5 balance is unavailable.")
             return "retry"
-        if self.use_mt5 and balance < self.min_balance:
+        if self.use_mt5 and balance is not None and balance < self.min_balance:
             tickers = [x["ticker"] for x in self.shared_candidates()]
             self.report_insufficient(balance, tickers)
             self.live_cannot_run()
@@ -1672,7 +1685,7 @@ class LiveSink:
             response = manager._request_human_approval()
         else:
             response = "APPROVE"
-        manager.approval_response = response
+        setattr(manager, "approval_response", response)
         if response != "APPROVE":
             self.ledger.append({"type": "shared_final_invest_recheck", "batch_no": batch_no,
                                 "result": "rejected", "response": response, "tickers": tickers})
@@ -1714,7 +1727,7 @@ class LiveSink:
     def read_balance(self) -> Optional[float]:
         return mt5_orders.account_balance()
 
-    def report_insufficient(self, balance: float, tickers: List[str]) -> None:
+    def report_insufficient(self, balance: Optional[float], tickers: List[str]) -> None:
         report_insufficient_funds(balance, tickers, alert=self.main._alert)
 
     def live_cannot_run(self) -> None:

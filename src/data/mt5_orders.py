@@ -24,6 +24,7 @@ import contextlib
 import itertools
 import os
 import threading
+import time
 from typing import Any, Dict, Optional
 
 try:
@@ -230,8 +231,9 @@ def _ok(result: Any) -> bool:
     return result.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED)
 
 
-def _fail(message: str) -> Dict[str, Any]:
-    return {"ok": False, "dry_run": False, "ticket": None, "price": None, "message": message}
+def _fail(message: str, retcode: Optional[int] = None) -> Dict[str, Any]:
+    return {"ok": False, "dry_run": False, "ticket": None, "price": None, "message": message,
+            "retcode": retcode}
 
 
 def _find_position_ticket(symbol: str, order_ticket: int) -> Optional[int]:
@@ -253,6 +255,28 @@ _NOT_TRADING_NOW = {
     10017: "trading is disabled for this symbol",
     10021: "no quotes",
 }
+NOT_TRADING_NOW = _NOT_TRADING_NOW          # public name for callers that read a result's retcode
+
+# Some brokers' order_check() answers "OK" on a closed market and only order_send() says 10018.
+# When that happens the symbol is remembered as closed for a while, and check_order() reports it
+# as not trading, so every screen built on check_order keeps the candidate waiting instead of
+# proposing it again straight away.
+CLOSED_COOLDOWN_SEC = float(os.environ.get("RAATS_CLOSED_MARKET_COOLDOWN_SEC", "900"))
+_CLOSED_UNTIL: Dict[str, float] = {}
+
+
+def mark_closed(symbol: str, seconds: Optional[float] = None) -> None:
+    with _LOCK:
+        _CLOSED_UNTIL[symbol] = time.time() + (CLOSED_COOLDOWN_SEC if seconds is None else seconds)
+
+
+def recently_closed(symbol: str) -> bool:
+    with _LOCK:
+        until = _CLOSED_UNTIL.get(symbol, 0.0)
+        if until and until <= time.time():
+            _CLOSED_UNTIL.pop(symbol, None)
+            return False
+        return bool(until)
 
 
 def check_order(symbol: str, direction: str, lots: float, sl: Optional[float] = None,
@@ -270,6 +294,11 @@ def check_order(symbol: str, direction: str, lots: float, sl: Optional[float] = 
     """
     out: Dict[str, Any] = {"checked": False, "ok": False, "retcode": None, "comment": "",
                            "not_trading_now": False, "reason": ""}
+    if recently_closed(symbol):
+        out.update(checked=True, retcode=10018, not_trading_now=True,
+                   comment="broker refused an order on this symbol a moment ago",
+                   reason="market closed")
+        return out
     with session() as ok:
         if not ok or mt5 is None:
             out["comment"] = "MT5 not connected"
@@ -360,13 +389,18 @@ def place_market_order(symbol: str, direction: str, lots: float, sl: Optional[fl
         if check is None:
             return _fail(f"order_check returned None: {mt5.last_error()}")
         if check.retcode not in (0, mt5.TRADE_RETCODE_DONE):
+            if int(check.retcode) in _NOT_TRADING_NOW:
+                mark_closed(symbol)
             return _fail(f"order_check rejected: retcode={check.retcode} "
-                         f"{getattr(check, 'comment', '')}")
+                         f"{getattr(check, 'comment', '')}", retcode=int(check.retcode))
         result = mt5.order_send(request)
         if not _ok(result):
+            code = int(result.retcode) if result is not None and getattr(result, "retcode", None) is not None else None
+            if code in _NOT_TRADING_NOW:
+                mark_closed(symbol)
             detail = f"retcode={getattr(result, 'retcode', None)} {getattr(result, 'comment', '')}" \
                 if result is not None else f"order_send returned None: {mt5.last_error()}"
-            return _fail(detail)
+            return _fail(detail, retcode=code)
         ticket = _find_position_ticket(symbol, result.order) or result.order
         filled = float(getattr(result, "volume", 0) or lots)
         note = "filled" if abs(filled - float(lots)) < 1e-9 else \

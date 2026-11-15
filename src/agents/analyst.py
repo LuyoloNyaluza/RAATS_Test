@@ -33,7 +33,7 @@ DEFAULT_ANALYST_MODEL = os.environ.get(
 )
 
 
-ANALYST_PROMPT = """You are a financial analyst.
+ANALYST_PROMPT = """You are an objective financial analyst.
 
 Given the following market data for {ticker}:
 
@@ -43,24 +43,21 @@ Given the following market data for {ticker}:
 - Sentiment score: {sentiment}
 
 Recent discovered news:
-
 {news_context}
 
-Decide only whether this is a genuine trading OPPORTUNITY worth acting on
-right now, or whether conditions do not justify a trade.
+Historical Context & Prior Signals:
+{history_block}
 
-Use the market data, sentiment, and relevant news as supporting evidence.
-
-Do NOT pick a direction.
-Do NOT say BUY or SELL.
-
-Trade direction is determined separately from price trend data.
-
-If the news is unrelated, weak, duplicated, or unclear, do not treat it
-as strong evidence for an opportunity.
+### Evaluation Rules:
+1. **Opportunity Assessment**: Decide strictly whether current conditions present a genuine, actionable trading opportunity or if they do not justify a trade. Avoid unjustified investments.
+2. **Evidence Evaluation**: Objectively weigh relevant evidence. If news is unrelated, weak, duplicated, stale, or unclear, do not treat it as strong evidence. Avoid overstating the market impact of news headlines.
+3. **Historical Context Utilization**: Cross-reference historical context to ensure consistency, avoid repeating recent false starts, and account for prior trends without blindly chasing outdated setups. Historical signals must not override genuinely improved current conditions.
+4. **Strict Constraints**:
+  - Do NOT pick a direction.
+  - Do NOT say BUY or SELL (trade direction is handled separately from price trend data).
+5. **Confidence Assessment**: Confidence should reflect the strength and consistency of the available evidence supporting the decision.
 
 Respond ONLY in valid JSON, no extra text.
-
 Keep "justification" to ONE short sentence, under 20 words:
 
 {{
@@ -68,7 +65,6 @@ Keep "justification" to ONE short sentence, under 20 words:
   "confidence": <0-1 float>,
   "justification": "<one short sentence, max 20 words>"
 }}"""
-
 
 def _safe_parse_json(
     raw_text: str,
@@ -307,6 +303,30 @@ def analyze_market(
         discovery_news
     )
 
+    # Earlier days' coverage of this ticker, kept separate from live news.
+    # Strictly before simulate_date/today, so it cannot leak future articles.
+    history_block = ""
+
+    try:
+        from src.rag.news_memory import (
+            format_history_block,
+            recent_for_ticker,
+        )
+
+        history_block = format_history_block(
+            ticker,
+            recent_for_ticker(
+                ticker,
+                as_of=state.get("simulate_date"),
+            ),
+        )
+    except Exception as exc:
+        logger.warning(
+            "News history unavailable for %s: %s",
+            ticker,
+            exc,
+        )
+
     prompt = ANALYST_PROMPT.format(
         ticker=ticker,
         close=market_data["close"],
@@ -314,6 +334,7 @@ def analyze_market(
         rsi=market_data["rsi"],
         sentiment=sentiment,
         news_context=news_context,
+        history_block=history_block,
     )
 
     try:

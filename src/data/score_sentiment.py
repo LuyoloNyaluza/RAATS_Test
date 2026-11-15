@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 try:
     import ollama
@@ -14,7 +14,7 @@ logger = logging.getLogger("raats.data.score_sentiment")
 
 DEFAULT_SENTIMENT_MODEL = os.environ.get(
     "RAATS_SENTIMENT_MODEL",
-    "mistral",
+    "qwen2.5:3b",
 )
 
 
@@ -26,7 +26,7 @@ Ticker: {ticker}
 Source: {source}
 Headline: {headline}
 Summary: {summary}
-
+{related_block}
 Consider whether the article is positive, negative, or neutral for the specific ticker.
 
 {{
@@ -74,12 +74,42 @@ def _normalise_sentiment(value: str) -> str:
     return "neutral"
 
 
+def _related_block_for(
+    ticker: str,
+    article: Dict[str, Any],
+    as_of: Optional[str],
+):
+    """
+    Related earlier coverage from src/rag/news_memory.py.
+    Returns (prompt_block, number_of_items). Never raises: if the memory is
+    missing, empty or broken, scoring proceeds exactly as before.
+    """
+    try:
+        from src.rag.news_memory import (
+            format_related_block,
+            retrieve_related,
+        )
+
+        items = retrieve_related(article, as_of=as_of, k=2)
+        return format_related_block(ticker, items), len(items)
+    except Exception as exc:
+        logger.warning("news memory unavailable: %s", exc)
+        return "", 0
+
+
 def score_article(
     ticker: str,
     article: Dict[str, Any],
     model_name: str = DEFAULT_SENTIMENT_MODEL,
+    use_memory: bool = False,
+    as_of: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Score one discovered news article."""
+    """Score one discovered news article.
+
+    use_memory=True adds up to two related headlines (same batch or earlier
+    days, any ticker) to the prompt as background. Default False keeps the
+    old behaviour for every other caller.
+    """
 
     if ollama is None:
         raise ImportError(
@@ -95,11 +125,21 @@ def score_article(
         ),
     )
 
+    related_block, related_count = ("", 0)
+
+    if use_memory:
+        related_block, related_count = _related_block_for(
+            ticker,
+            article,
+            as_of,
+        )
+
     prompt = SENTIMENT_PROMPT.format(
         ticker=ticker,
         source=source,
         headline=article.get("title", ""),
         summary=article.get("description", ""),
+        related_block=related_block,
     )
 
     try:
@@ -146,6 +186,9 @@ def score_article(
         result.get("reasoning", "")
     )
 
+    if use_memory:
+        scored_article["related_count"] = related_count
+
     return scored_article
 
 
@@ -153,6 +196,8 @@ def score_articles(
     ticker: str,
     articles: List[Dict[str, Any]],
     model_name: str = DEFAULT_SENTIMENT_MODEL,
+    use_memory: bool = False,
+    as_of: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Score all discovered articles for one ticker."""
 
@@ -163,6 +208,8 @@ def score_articles(
             ticker,
             article,
             model_name=model_name,
+            use_memory=use_memory,
+            as_of=as_of,
         )
 
         scored.append(scored_article)
