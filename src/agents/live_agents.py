@@ -1603,18 +1603,20 @@ class LiveSink:
                     continue
                 lots = plan.get("lots")
                 levels = plan.get("levels") or {}
-                if not lots or float(lots) <= 0:
-                    snap = mt5_orders.snapshot(symbol)
-                    lots = (snap or {}).get("volume_min")
                 snap = mt5_orders.snapshot(symbol)
-                if not snap or int(snap.get("trade_mode", 0)) != 4:
+                if (not snap or int(snap.get("trade_mode", 0)) != 4
+                        or float(snap.get("bid") or 0) <= 0
+                        or float(snap.get("ask") or 0) <= 0):
                     continue
                 # Refresh the quote/spec shown in the batch approval. The individual trade
                 # approval still recalculates entry, SL, TP, lots and margin before execution.
+                bid, ask = float(snap["bid"]), float(snap["ask"])
+                mid = (bid + ask) / 2.0
                 manager.mt5_data[ticker] = {
                     **md, **snap, "mt5_symbol": symbol, "tradable": True,
+                    "spread_pct": round((ask - bid) / mid * 100, 4) if mid else None,
                 }
-                if not lots:
+                if not lots or float(lots) <= 0:
                     lots = snap.get("volume_min")
                 if not lots:
                     continue
@@ -1631,6 +1633,8 @@ class LiveSink:
         """Recheck retained candidates without running another discovery/analysis batch."""
         from src.agents.trading_loop_dynamic import DynamicTradingManager, _live_portfolio_value
 
+        if not self.has_room():
+            return "waiting"
         balance = self.read_balance()
         if self.use_mt5 and balance is None:
             self.main._alert("Shared candidate recheck paused: MT5 balance is unavailable.")
@@ -1761,13 +1765,15 @@ class LiveSink:
     # -- the hand-over to the main agent
     def handover(self, manager: Any, batch_no: int, tickers: List[str], first_batch: bool) -> List[str]:
         accepted = self.main.adopt_batch(manager, batch_no)
+        # Persist the execution queue BEFORE removing shared candidates. A crash between these
+        # writes can then only cause a harmless duplicate, never lose an accepted candidate.
+        self.main.on_state_change()
         # Only a successful pool insertion removes a candidate from shared final INVEST.
         with self._shared_lock:
             for ticker in accepted:
                 self._shared_final_invest.pop(str(ticker).upper(), None)
             self._save_shared_final_invest()
         self.main.sync_summary(manager)
-        self.main.on_state_change()
         if first_batch and accepted:
             self.main.expect_first_open = True     # open it first, then batches 2, 3, ... start
         return accepted
