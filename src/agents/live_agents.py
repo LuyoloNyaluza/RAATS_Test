@@ -1521,6 +1521,31 @@ class LiveSink:
         with self._shared_lock:
             return copy.deepcopy(list(self._shared_final_invest.values()))
 
+    def seed_shared_from_manager(self, manager: Any) -> None:
+        """Persist a pre-approved compatibility batch before attempting its pool handover."""
+        results = {str(r.get("ticker", "")).upper(): r
+                   for r in getattr(manager, "daily_results", []) if r.get("ticker")}
+        plans = dict(getattr(manager, "mt5_order_plan", {}) or {})
+        market_data = dict(getattr(manager, "mt5_data", {}) or {})
+        with self._shared_lock:
+            for raw_ticker in getattr(manager, "final_invest", []) or []:
+                ticker = str(raw_ticker).upper()
+                if ticker not in self._shared_final_invest and len(self._shared_final_invest) >= MAX_FINAL_INVEST:
+                    continue
+                old = self._shared_final_invest.get(ticker, {})
+                result = results.get(ticker, {})
+                self._shared_final_invest[ticker] = {
+                    "ticker": ticker,
+                    "confidence": float(result.get("confidence") or old.get("confidence") or 0.0),
+                    "direction": result.get("direction") or old.get("direction"),
+                    "result": result or old.get("result") or {},
+                    "order_plan": plans.get(ticker) or old.get("order_plan") or {},
+                    "mt5_data": market_data.get(ticker) or old.get("mt5_data") or {},
+                    "batch": int(getattr(manager, "batch_no", 0) or old.get("batch") or 0),
+                    "created": old.get("created") or time.time(),
+                }
+            self._save_shared_final_invest()
+
     def prepare_batch(self, manager: Any) -> List[str]:
         """Merge retained + newly analysed candidates, then admit only broker-open markets.
 
@@ -1704,8 +1729,9 @@ class LiveSink:
         handed = sum(1 for _, o in outcomes if o == "handed")
         message = (
             "DISCOVERY SOURCES EXHAUSTED\n\n"
-            "No more new broker-supported tickers were available, so no further batches will run "
-            "this session. Open positions keep being monitored.\n\n"
+            "No more new broker-supported tickers are available. Any retained final INVEST "
+            "candidates will continue to be rechecked for market availability without rerunning "
+            "discovery just for those checks. Open positions keep being monitored.\n\n"
             f"Batches this run: {len(outcomes)} ({handed} approved and handed over)\n"
             + "\n".join(lines)
         )
@@ -1786,13 +1812,15 @@ def _prepare_live(manager: Any, notifier: Any, ledger: BatchLedger, use_mt5: boo
     main.recover_open_positions()
     restored = load_pool_state(pool)
     recovered = main.open_count()
+    sink = LiveSink(main, ledger, use_mt5)
     if handed:
         n = ledger.next_batch_no()
         tickers = list(manager.final_invest)
         ledger.status(n, BATCH_PROCESSING, initial=True,
                       universe=[str(t).upper() for t in getattr(manager, "ticker_universe", [])])
         ledger.status(n, READY, tickers=tickers)
-        accepted = main.adopt_batch(manager, n)
+        sink.seed_shared_from_manager(manager)
+        accepted = sink.handover(manager, n, tickers, first_batch=False)
         ledger.status(n, HANDED_OVER, tickers=accepted, approved=tickers)
         ledger.status(n, BATCH_COMPLETED, tickers=accepted)
         main.on_state_change()
@@ -1802,7 +1830,7 @@ def _prepare_live(manager: Any, notifier: Any, ledger: BatchLedger, use_mt5: boo
         _keep_mt5_connected()
     from src.agents.trading_loop_dynamic import BatchRunner      # the batch runner
     from src.agents.deep_batch import DeepBatchPipeline          # Deep Agents: main agent + 3 subagents
-    runner = BatchRunner(LiveSink(main, ledger, use_mt5), use_mt5,
+    runner = BatchRunner(sink, use_mt5,
                          first_batch=not (recovered or restored),
                          pipeline_cls=DeepBatchPipeline)         # RAATS_DEEP_AGENTS=0 -> plain threads
     return main, pool, runner
