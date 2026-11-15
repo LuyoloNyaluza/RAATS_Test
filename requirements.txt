@@ -28,3 +28,7 @@ fastapi
 uvicorn
 prometheus-fastapi-instrumentator==8.1.0
 
+# LangChain integrations used by the news RAG pipeline
+langchain-ollama
+langchain-chroma
+langchain-classic
