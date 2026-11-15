@@ -247,7 +247,8 @@ class DiscordNotifier:
             ("Entry price", self._num(p.get("entry"), "{:,.4f}", prefix="$")),
             ("Stop Loss", self._num(p.get("stop_loss"), "{:,.4f}", prefix="$")),
             ("Take Profit", self._num(p.get("take_profit"), "{:,.4f}", prefix="$")),
-            ("Risk amount", self._num(p.get("risk_amount"), prefix="$")),
+            ("Risk amount", self._num(p.get("risk_amount"), prefix="$")
+             + (f" ({float(p['risk_pct']):.1f}% of balance)" if p.get("risk_pct") is not None else "")),
             ("Risk-to-Reward", str(p.get("risk_reward") or "N/A")),
         ]
         width = max(len(k) for k, _ in rows)
@@ -266,9 +267,7 @@ class DiscordNotifier:
             + (f" ({symbol})" if symbol else "")
             + f" \u2014 {p.get('side', '')} {p.get('direction', '')}".rstrip(),
             "```", table, "```",
-            *([f"\u26a0\ufe0f Minimum lot is {float(p['oversize']):.1f}x the size RAATS wanted "
-               f"(risk is above its normal budget)"]
-              if p.get("oversize") and float(p["oversize"]) > 1.0 else []),
+            *[f"\u26a0\ufe0f **WARNING:** {w}" for w in (p.get("warnings") or [])],
             f"React within {self.timeout_minutes:g} min: {keys}",
             "_Approving this trade starts the entry timer; the order is sent to MT5 only after it._",
         ])
@@ -431,6 +430,46 @@ class DiscordNotifier:
             return True
         except Exception as exc:
             print(f"Discord alert failed: {exc}")
+            return False
+
+    def send_trade_refreshed(self, old: Mapping[str, Any], new: Mapping[str, Any],
+                             tolerance: float, outcome: str = "") -> bool:
+        """RAATS - Trade Refreshed: sent after EVERY entry timer. Shows the price at approval, the
+        price now, the tolerance and what happens next. Information only (a new approval, when
+        needed, arrives as its own request)."""
+        if not self.configured:
+            print("Trade refreshed (Discord not configured).")
+            return False
+        try:
+            new_entry = new.get("entry")
+            old_entry = old.get("entry")
+            move = (abs(float(new_entry) - float(old_entry))
+                    if new_entry is not None and old_entry is not None else 0.0)
+
+            def row(label: str, key: str, fmt: str = "{:,.4f}", prefix: str = "$") -> str:
+                return (f"{label.ljust(12)}  {self._num(old.get(key), fmt, prefix=prefix)}"
+                        f"  ->  {self._num(new.get(key), fmt, prefix=prefix)}")
+
+            table = "\n".join([
+                row("Entry price", "entry"), row("Stop Loss", "stop_loss"),
+                row("Take Profit", "take_profit"), row("Risk amount", "risk_amount", "{:,.2f}"),
+                row("Margin", "required_margin", "{:,.2f}"),
+                row("Lots", "lots", "{:g}", ""),
+            ])
+            symbol = new.get("mt5_symbol")
+            self.send_message("\n".join([
+                "\U0001F504 **RAATS \u2013 Trade Refreshed**",
+                f"Ticker: **{new.get('ticker', '?')}**" + (f" ({symbol})" if symbol else "")
+                + f" \u2014 {new.get('side', '')} {new.get('direction', '')}".rstrip(),
+                f"Price at approval {self._num(old.get('entry'), '{:,.4f}')} -> now "
+                f"{self._num(new.get('entry'), '{:,.4f}')} (moved {move:,.4f}, tolerance {tolerance:,.4f})",
+                *([f"Result: {outcome}"] if outcome else []),
+                "```", table, "```",
+                *[f"\u26a0\ufe0f **WARNING:** {w}" for w in (new.get("warnings") or [])],
+            ]))
+            return True
+        except Exception as exc:
+            print(f"Discord trade-refreshed message failed: {exc}")
             return False
 
     def send_summary(self, summary: Union[str, Mapping[str, Any]]) -> bool:

@@ -55,7 +55,7 @@ goes ahead with what is available - it never waits for 10.
 """
 
 import os
-from typing import List, Dict, Any, Optional, Tuple, Callable
+from typing import List, Dict, Any, Optional, Tuple, Callable, cast
 from datetime import datetime
 
 import pandas as pd
@@ -619,7 +619,7 @@ class DynamicTradingManager:
 
         self.daily_results = []
 
-        self.final_invest = []
+        self.final_invest: List[str] = []
 
         self.hold_history = []
 
@@ -628,6 +628,7 @@ class DynamicTradingManager:
         # Batch metadata is populated by the batch coordinator.
         self.batch_no: Optional[int] = None
         self.batch_id: Optional[str] = None
+        self.batch_market_filter: Optional[Callable[[Any], List[str]]] = None
 
         # One-time reserve (30 extra tickers) state
         self.reserve_loaded = False
@@ -963,7 +964,10 @@ class DynamicTradingManager:
             # Skip already resolved INVEST
             # ----------------------------------
 
-            if ticker in self.final_invest:
+            if (
+                isinstance(self.final_invest, list)
+                and ticker in self.final_invest
+            ):
 
                 print(
                     f"\nSkipping {ticker}: "
@@ -1839,7 +1843,7 @@ class DynamicTradingManager:
         # Merge retained candidates and screen market availability before Discord approval.
         market_filter = getattr(self, "batch_market_filter", None)
         if callable(market_filter):
-            self.final_invest = market_filter(self)
+            self.final_invest = cast(List[str], market_filter(self))
 
         if self.enable_mt5 and self.mt5_order_plan:
             print("\n" + format_order_plan(self.mt5_order_plan))

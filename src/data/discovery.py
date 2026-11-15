@@ -1234,6 +1234,34 @@ def score_top_10_news(top_10_records):
 
     scored_top_10 = []
 
+    # ------------------------------------------------------------
+    # News memory: index the WHOLE batch (raw text, no labels) before
+    # any article is scored, so each article can see the others.
+    # Failure here must never stop scoring.
+    # ------------------------------------------------------------
+    news_date = time.strftime("%Y-%m-%d")
+
+    try:
+        from src.rag.news_memory import ingest_many
+
+        added = ingest_many(
+            [
+                (
+                    rec["Ticker"],
+                    list(rec.get("yfinance_news", []) or [])
+                    + list(rec.get("google_news", []) or []),
+                )
+                for rec in top_10_records
+            ],
+            news_date,
+        )
+
+        print(f"  News memory: {added} new article(s) indexed.")
+
+    except Exception as exc:
+
+        print(f"  [Diagnostic] News memory skipped: {exc}")
+
     for item in top_10_records:
 
         ticker = item["Ticker"]
@@ -1296,6 +1324,8 @@ def score_top_10_news(top_10_records):
             ticker,
             articles,
             model_name=SENTIMENT_MODEL,
+            use_memory=True,
+            as_of=news_date,
         )
 
         summary = summarize_ticker_sentiment(
