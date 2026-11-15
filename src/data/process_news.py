@@ -67,8 +67,10 @@ def _article_to_document(article: dict[str, Any], file_path: Path) -> Document |
         identity = f"{ticker}|{text}"
     article_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
+    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     metadata = {
         "article_id": article_id,
+        "content_hash": content_hash,
         "ticker": ticker,
         "title": title,
         "source": source,
@@ -153,12 +155,21 @@ def update_vector_stores(
             embeddings,
             allow_dangerous_deserialization=True,
         )
+        existing_docs = list(faiss_store.docstore._dict.values())
         known_ids = {
             doc.metadata.get("article_id")
-            for doc in faiss_store.docstore._dict.values()
+            for doc in existing_docs
             if doc.metadata.get("article_id")
         }
-        faiss_new = [doc for doc in documents if doc.metadata["article_id"] not in known_ids]
+        known_content = {
+            hashlib.sha256(doc.page_content.encode("utf-8")).hexdigest()
+            for doc in existing_docs
+        }
+        faiss_new = [
+            doc for doc in documents
+            if doc.metadata["article_id"] not in known_ids
+            and doc.metadata["content_hash"] not in known_content
+        ]
     else:
         faiss_store = None
         faiss_new = documents
@@ -178,15 +189,17 @@ def update_vector_stores(
         embedding_function=embeddings,
         persist_directory=str(chroma_path),
     )
-    chroma_ids = [doc.metadata["article_id"] for doc in documents]
-    existing = set()
-    for start in range(0, len(chroma_ids), 500):
-        result = chroma_store.get(ids=chroma_ids[start:start + 500])
-        existing.update(result.get("ids", []))
-
+    existing_chroma = chroma_store.get(include=["metadatas", "documents"])
+    existing_chroma_ids = set(existing_chroma.get("ids", []))
+    existing_chroma_content = {
+        hashlib.sha256(text.encode("utf-8")).hexdigest()
+        for text in existing_chroma.get("documents", [])
+        if text
+    }
     chroma_new = [
         doc for doc in documents
-        if doc.metadata["article_id"] not in existing
+        if doc.metadata["article_id"] not in existing_chroma_ids
+        and doc.metadata["content_hash"] not in existing_chroma_content
     ]
     if chroma_new:
         chroma_store.add_documents(
