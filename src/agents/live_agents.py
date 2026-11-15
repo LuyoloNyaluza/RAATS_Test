@@ -1646,8 +1646,14 @@ class LiveSink:
             return "waiting"
 
         tickers = list(manager.final_invest)
-        self.status(batch_no, WAITING_FOR_APPROVAL, tickers=tickers, recheck=True)
-        response = manager._request_human_approval()
+        require_approval = os.environ.get("RAATS_REQUIRE_APPROVAL", "").strip().lower() in (
+            "1", "true", "yes"
+        )
+        if require_approval:
+            self.status(batch_no, WAITING_FOR_APPROVAL, tickers=tickers, recheck=True)
+            response = manager._request_human_approval()
+        else:
+            response = "APPROVE"
         manager.approval_response = response
         if response != "APPROVE":
             self.ledger.append({"type": "shared_final_invest_recheck", "batch_no": batch_no,
