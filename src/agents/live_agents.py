@@ -1888,8 +1888,8 @@ def run_live_phase(manager: Any, notifier: Any = None) -> None:
 def run_live(notifier: Any = None) -> None:
     """RAATS entry point.
 
-    1. Read the persisted batch history (cases A-E) and take the next batch number. A blocked or
-       rejected batch is never recovered.
+    1. Read the persisted batch history (cases A-E) and take the next batch number. A blocked
+       batch stops; candidates from a rejected batch remain in shared final INVEST for rechecking.
     2. Start the main agent: it takes over positions still open on MT5 and keeps managing them.
     3. Run batches (three thread-based subagents each) in the background: the first batch is
        approved on Discord, passed to the main agent and opened one by one; batches 2, 3, ...
