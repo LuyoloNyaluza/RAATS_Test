@@ -1494,6 +1494,8 @@ class LiveSink:
             if state.get("date") != datetime.now().strftime("%Y-%m-%d"):
                 return
             for item in state.get("candidates", []) or []:
+                if len(self._shared_final_invest) >= MAX_FINAL_INVEST:
+                    break
                 ticker = str(item.get("ticker") or "").upper().strip()
                 if ticker and ticker not in self._shared_final_invest:
                     self._shared_final_invest[ticker] = item
@@ -1532,8 +1534,10 @@ class LiveSink:
         market_data = dict(getattr(manager, "mt5_data", {}) or {})
         with self._shared_lock:
             for ticker in current:
-                result = results.get(ticker, {})
                 old = self._shared_final_invest.get(ticker, {})
+                if not old and len(self._shared_final_invest) >= MAX_FINAL_INVEST:
+                    continue
+                result = results.get(ticker, {})
                 self._shared_final_invest[ticker] = {
                     "ticker": ticker,
                     "confidence": float(result.get("confidence") or old.get("confidence") or 0.0),
@@ -1545,7 +1549,7 @@ class LiveSink:
                     "created": old.get("created") or time.time(),
                 }
 
-            merged = list(self._shared_final_invest.values())
+            merged = list(self._shared_final_invest.values())[:MAX_FINAL_INVEST]
             manager.mt5_order_plan = {
                 **{str(k).upper(): v for k, v in plans.items()},
                 **{x["ticker"]: x.get("order_plan", {}) for x in merged},
@@ -1587,6 +1591,50 @@ class LiveSink:
                     continue
                 open_tickers.append(ticker)
             return open_tickers
+
+    def recheck_shared(self, batch_no: int, first_batch: bool = False) -> str:
+        """Recheck retained candidates without running another discovery/analysis batch."""
+        from src.agents.trading_loop_dynamic import DynamicTradingManager, _live_portfolio_value
+
+        balance = self.read_balance()
+        if self.use_mt5 and balance is None:
+            self.main._alert("Shared candidate recheck paused: MT5 balance is unavailable.")
+            return "retry"
+        if self.use_mt5 and balance < self.min_balance:
+            tickers = [x["ticker"] for x in self.shared_candidates()]
+            self.report_insufficient(balance, tickers)
+            self.live_cannot_run()
+            return "stopped"
+
+        manager = DynamicTradingManager(
+            top_50_performing=[], top_10=[], waiting_list=[],
+            portfolio_value=_live_portfolio_value(), enable_mt5=self.use_mt5,
+        )
+        manager.simulate_date = None
+        manager.batch_no = int(batch_no)
+        manager.batch_id = f"shared_recheck_{batch_no}_{datetime.now():%Y%m%d_%H%M%S}"
+        # No new analysis: only reuse the saved analysis and recheck current broker availability.
+        manager.final_invest = self.prepare_batch(manager)
+        if not manager.final_invest:
+            self.ledger.append({"type": "shared_final_invest_recheck", "batch_no": batch_no,
+                                "result": "no_market_open", "retained": len(self.shared_candidates())})
+            return "waiting"
+
+        tickers = list(manager.final_invest)
+        self.status(batch_no, WAITING_FOR_APPROVAL, tickers=tickers, recheck=True)
+        response = manager._request_human_approval()
+        manager.approval_response = response
+        if response != "APPROVE":
+            self.ledger.append({"type": "shared_final_invest_recheck", "batch_no": batch_no,
+                                "result": "rejected", "response": response, "tickers": tickers})
+            return "rejected"
+
+        accepted = self.handover(manager, batch_no, tickers, first_batch)
+        self.ledger.append({"type": "shared_final_invest_recheck", "batch_no": batch_no,
+                            "result": "handed" if accepted else "pool_full",
+                            "approved": tickers, "accepted": accepted,
+                            "retained": len(self.shared_candidates())})
+        return "handed" if accepted else "waiting"
 
     # -- state of the position engine
     def should_stop(self) -> bool:
