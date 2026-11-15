@@ -3104,8 +3104,8 @@ class BatchSink:
 class BatchRunner(threading.Thread):
     """Runs batch after batch (each one = the three subagents) beside the position engine.
 
-    * every batch is sent to Discord inside Subagent 3; only the APPROVED tickers are handed over
-      (to FinalInvestPool), and a rejected batch adds nothing and the loop goes on
+    * every batch is screened for market availability before Discord approval; only approved
+      tickers are handed to FinalInvestPool, while unhanded candidates remain in shared final INVEST
     * a batch starts while FinalInvestPool has capacity; it pauses when the pool is full
     * it stops at once when GLOBAL_STATE is blocked (the Main Agent's balance gate failed)
     * when the discovery sources are exhausted the final outcome is reported and it ends
