@@ -28,8 +28,8 @@ At the end of a batch the result is sent for approval on Discord (inside Subagen
 no approved ticker says so on Discord. Approved tickers are handed to the MAIN AGENT, which opens
 them one by one (balance check -> entry timer -> open) and monitors / adapts SL and TP. Batches
 2, 3, ... run in the background; they pause only when 10 positions are open AND final INVEST holds
-10. Blocked (insufficient funds) and rejected batches are never recovered: the next batch is
-fresh, with the next batch number.
+10. Blocked batches stop the run. Candidates from a rejected batch remain in the shared
+final INVEST list; only candidates successfully inserted into FinalInvestPool leave that list.
 """
 
 import copy
