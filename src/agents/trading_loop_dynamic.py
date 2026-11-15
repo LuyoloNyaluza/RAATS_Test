@@ -55,7 +55,7 @@ goes ahead with what is available - it never waits for 10.
 """
 
 import os
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from datetime import datetime
 
 import pandas as pd
@@ -2998,10 +2998,7 @@ class BatchPipeline:
             )
             manager.batch_no = self.batch_no
             manager.batch_id = f"batch{self.batch_no}_{datetime.now():%Y_%m_%d}"
-            # Retained candidates occupy slots; this batch analyses only the remaining vacancies.
-            manager.max_active_positions = max(
-                0, manager.max_active_positions - min(len(self.shared_candidates), 10)
-            )
+            # Retained candidates are merged at the pre-approval checkpoint.
             manager.batch_market_filter = self.market_filter
 
             original_request = manager._request_human_approval            # report the wait, change nothing
@@ -3233,6 +3230,27 @@ class BatchRunner(threading.Thread):
                         report(self.outcomes)
                     except Exception as exc:                 # a report must never stop the runner
                         print(f"[batches] could not report the exhausted batch: {exc}")
+                retained = getattr(sink, "shared_candidates", lambda: [])()
+                if retained and callable(getattr(sink, "recheck_shared", None)):
+                    print(f"[batches] discovery exhausted; retaining {len(retained)} candidate(s) "
+                          "for market-open rechecks without rediscovery")
+                    while retained and not self._halted():
+                        self._wait(BATCH_EXHAUSTED_RETRY_SEC)
+                        if self._halted():
+                            break
+                        recheck = sink.recheck_shared(batch_no, self.first_batch)
+                        if recheck == "stopped":
+                            break
+                        if recheck == "handed" and self.first_batch:
+                            while sink.first_batch_pending() and not self._halted():
+                                self._wait(RUNNER_POLL_SEC)
+                            self.first_batch = False
+                        retained = getattr(sink, "shared_candidates", lambda: [])()
+                    if self._halted():
+                        break
+                    # All retained candidates have been handed over; resume discovery later.
+                    self._wait(BATCH_EXHAUSTED_RETRY_SEC)
+                    continue
                 print(f"[batches] batch {batch_no}: no tickers found; next batch starts in "
                       f"{BATCH_EXHAUSTED_RETRY_SEC:.0f}s")
                 self._wait(BATCH_EXHAUSTED_RETRY_SEC)
