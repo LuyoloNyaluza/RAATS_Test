@@ -1720,6 +1720,11 @@ class LiveSink:
     def live_cannot_run(self) -> None:
         self.main.blocked = True
         discard_pool_state()
+        try:
+            if os.path.exists(SHARED_FINAL_INVEST_FILE):
+                os.remove(SHARED_FINAL_INVEST_FILE)
+        except OSError as exc:
+            _log_error("-", exc, "discard_shared_final_invest")
         self.main.stop()
 
     # -- the persisted batch history
