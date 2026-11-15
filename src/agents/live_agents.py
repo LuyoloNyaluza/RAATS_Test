@@ -514,6 +514,7 @@ class MainAgent:
         self._token = object()
         self._lock = threading.RLock()
         self.on_state_change: Callable[[], None] = lambda: None
+        self.shared_candidates_fn: Optional[Callable[[], List[Dict[str, Any]]]] = None
         self.blocked = False                             # insufficient funds: live does not run
         self.balance_gate_passed = False                 # the initial balance check (first approved batch)
         self._gate_unavailable = False
@@ -685,7 +686,10 @@ class MainAgent:
                      "news_by_ticker", "daily_results"):
             if hasattr(batch_manager, name):
                 setattr(self.manager, name, getattr(batch_manager, name))
-        self.manager.final_invest = [x["ticker"] for x in self.shared_candidates()]
+        if callable(self.shared_candidates_fn):
+            self.manager.final_invest = [x["ticker"] for x in self.shared_candidates_fn()]
+        else:
+            self.manager.final_invest = [c for c in self.pool.tickers()]
 
     def _maybe_release_batches(self, opened: int) -> None:
         """After one opening pass that opened nothing, the first batch is as open as it can be."""
@@ -1835,6 +1839,7 @@ def _prepare_live(manager: Any, notifier: Any, ledger: BatchLedger, use_mt5: boo
     restored = load_pool_state(pool)
     recovered = main.open_count()
     sink = LiveSink(main, ledger, use_mt5)
+    main.shared_candidates_fn = sink.shared_candidates
     if handed:
         n = ledger.next_batch_no()
         tickers = list(manager.final_invest)
