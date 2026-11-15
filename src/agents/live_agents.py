@@ -122,6 +122,10 @@ REPROPOSE_DRIFT_R = _env_float("RAATS_REPROPOSE_DRIFT_R", 0.25)
 MAX_REPROPOSALS = int(_env_float("RAATS_MAX_REPROPOSALS", 3))
 STOP_FILE = os.environ.get("RAATS_STOP_FILE", "data/STOP")
 STATE_FILE = os.environ.get("RAATS_STATE_FILE", "data/state/live_discovery.json")
+SHARED_FINAL_INVEST_FILE = os.environ.get(
+    "RAATS_SHARED_FINAL_INVEST_FILE",
+    os.path.join(os.path.dirname(STATE_FILE), "shared_final_invest.json"),
+)
 
 # Ranks 6-10 (discovery.py uses ranks 1-5 of each).
 
@@ -681,7 +685,7 @@ class MainAgent:
                      "news_by_ticker", "daily_results"):
             if hasattr(batch_manager, name):
                 setattr(self.manager, name, getattr(batch_manager, name))
-        self.manager.final_invest = [c for c in self.pool.tickers()]
+        self.manager.final_invest = [x["ticker"] for x in self.shared_candidates()]
 
     def _maybe_release_batches(self, opened: int) -> None:
         """After one opening pass that opened nothing, the first batch is as open as it can be."""
@@ -1478,6 +1482,111 @@ class LiveSink:
         self.main, self.ledger, self.use_mt5 = main, ledger, use_mt5
         self.min_balance = MIN_ACCOUNT_BALANCE
         self.paused = False
+        self._shared_lock = threading.RLock()
+        self._shared_final_invest: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._load_shared_final_invest()
+
+    def _load_shared_final_invest(self) -> None:
+        """Restore the cross-batch candidate list independently of the execution pool."""
+        try:
+            with open(SHARED_FINAL_INVEST_FILE, encoding="utf-8") as f:
+                state = json.load(f)
+            if state.get("date") != datetime.now().strftime("%Y-%m-%d"):
+                return
+            for item in state.get("candidates", []) or []:
+                ticker = str(item.get("ticker") or "").upper().strip()
+                if ticker and ticker not in self._shared_final_invest:
+                    self._shared_final_invest[ticker] = item
+            print(f"[batches] restored {len(self._shared_final_invest)} shared final INVEST candidate(s)")
+        except (OSError, ValueError, TypeError):
+            return
+
+    def _save_shared_final_invest(self) -> None:
+        """Atomically persist retained candidates; they are not subject to pool TTL."""
+        try:
+            os.makedirs(os.path.dirname(SHARED_FINAL_INVEST_FILE) or ".", exist_ok=True)
+            tmp = SHARED_FINAL_INVEST_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "candidates": list(self._shared_final_invest.values()),
+                }, f, default=str)
+            os.replace(tmp, SHARED_FINAL_INVEST_FILE)
+        except OSError as exc:
+            _log_error("-", exc, "save_shared_final_invest")
+
+    def shared_candidates(self) -> List[Dict[str, Any]]:
+        with self._shared_lock:
+            return copy.deepcopy(list(self._shared_final_invest.values()))
+
+    def prepare_batch(self, manager: Any) -> List[str]:
+        """Merge retained + newly analysed candidates, then admit only broker-open markets.
+
+        A candidate remains in this shared collection until adopt_batch confirms that the
+        execution pool accepted it. Closed/unquotable markets stay here for the next check.
+        """
+        results = {str(r.get("ticker", "")).upper(): r
+                   for r in getattr(manager, "daily_results", []) if r.get("ticker")}
+        current = [str(t).upper() for t in getattr(manager, "final_invest", [])]
+        plans = dict(getattr(manager, "mt5_order_plan", {}) or {})
+        market_data = dict(getattr(manager, "mt5_data", {}) or {})
+        with self._shared_lock:
+            for ticker in current:
+                result = results.get(ticker, {})
+                old = self._shared_final_invest.get(ticker, {})
+                self._shared_final_invest[ticker] = {
+                    "ticker": ticker,
+                    "confidence": float(result.get("confidence") or old.get("confidence") or 0.0),
+                    "direction": result.get("direction") or old.get("direction"),
+                    "result": result or old.get("result") or {},
+                    "order_plan": plans.get(ticker) or old.get("order_plan") or {},
+                    "mt5_data": market_data.get(ticker) or old.get("mt5_data") or {},
+                    "batch": int(getattr(manager, "batch_no", 0) or old.get("batch") or 0),
+                    "created": old.get("created") or time.time(),
+                }
+
+            merged = list(self._shared_final_invest.values())
+            manager.mt5_order_plan = {
+                **{str(k).upper(): v for k, v in plans.items()},
+                **{x["ticker"]: x.get("order_plan", {}) for x in merged},
+            }
+            manager.mt5_data = {
+                **{str(k).upper(): v for k, v in market_data.items()},
+                **{x["ticker"]: x.get("mt5_data", {}) for x in merged},
+            }
+            known = {str(r.get("ticker", "")).upper() for r in manager.daily_results if r.get("ticker")}
+            for item in merged:
+                if item["ticker"] not in known and item.get("result"):
+                    manager.daily_results.append(item["result"])
+            self._save_shared_final_invest()
+
+            if not self.use_mt5:
+                return [x["ticker"] for x in merged]
+
+            open_tickers: List[str] = []
+            for item in merged:
+                ticker = item["ticker"]
+                plan = item.get("order_plan") or {}
+                md = item.get("mt5_data") or {}
+                symbol = plan.get("mt5_symbol") or md.get("mt5_symbol") or mt5_orders.resolve(ticker)
+                direction = plan.get("direction") or item.get("direction")
+                if direction not in ("LONG", "SHORT") or not symbol:
+                    continue
+                lots = plan.get("lots")
+                levels = plan.get("levels") or {}
+                if not lots or float(lots) <= 0:
+                    snap = mt5_orders.snapshot(symbol)
+                    lots = (snap or {}).get("volume_min")
+                if not lots:
+                    continue
+                check = mt5_orders.check_order(
+                    symbol, direction, float(lots),
+                    levels.get("stop_loss"), levels.get("take_profit"),
+                )
+                if not check.get("checked") or check.get("not_trading_now"):
+                    continue
+                open_tickers.append(ticker)
+            return open_tickers
 
     # -- state of the position engine
     def should_stop(self) -> bool:
@@ -1562,6 +1671,11 @@ class LiveSink:
     # -- the hand-over to the main agent
     def handover(self, manager: Any, batch_no: int, tickers: List[str], first_batch: bool) -> List[str]:
         accepted = self.main.adopt_batch(manager, batch_no)
+        # Only a successful pool insertion removes a candidate from shared final INVEST.
+        with self._shared_lock:
+            for ticker in accepted:
+                self._shared_final_invest.pop(str(ticker).upper(), None)
+            self._save_shared_final_invest()
         self.main.sync_summary(manager)
         self.main.on_state_change()
         if first_batch and accepted:
@@ -1597,6 +1711,11 @@ def _apply_global_block(ledger: BatchLedger, main: "MainAgent", info: Dict[str, 
     for batch_no, tickers in (info.get("by_batch") or {}).items():
         ledger.status(batch_no, INSUFFICIENT_FUNDS, tickers=tickers, balance=info.get("balance"))
     discard_pool_state()
+    try:
+        if os.path.exists(SHARED_FINAL_INVEST_FILE):
+            os.remove(SHARED_FINAL_INVEST_FILE)
+    except OSError as exc:
+        _log_error("-", exc, "discard_shared_final_invest")
     main.stop()
 
 
