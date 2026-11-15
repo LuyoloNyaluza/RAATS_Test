@@ -35,7 +35,7 @@ def _resolve_path(path: str | Path) -> Path:
 def _normalise_text(value: Any) -> str:
     if value is None:
         return ""
-    return re.sub(r"\\s+", " ", str(value)).strip()
+    return re.sub(r"\s+", " ", str(value)).strip()
 
 
 def _article_to_document(article: dict[str, Any], file_path: Path) -> Document | None:
