@@ -33,7 +33,7 @@ DOWNLOAD_RETRIES = 3
 
 SENTIMENT_MODEL = os.environ.get(
     "RAATS_SENTIMENT_MODEL",
-    "qwen2.5:3b",
+    "phi3:mini-128k",
 )
 
 # Progressive Yahoo screener retrieval.
@@ -101,7 +101,9 @@ EMERGENCY_EQUITY_FALLBACK = [
     "JNJ", "ABBV", "BMY", "LLY", "GILD", "AMGN", "VRTX",
     "REGN", "BIIB", "AZN", "NVS", "RHHBY", "SNY", "BNTX",
     "MRNA", "PINS", "TWTR", "SNAP", "ZM", "DOCU", "FSLY",
-    "ROKU", "SPOT", "SQ", "ETSY",
+    "ROKU", "SPOT", "SQ", "ETSY","CPI.JO","AU","HD","DIS",
+    "KO","PEP","MCD","SBUX","NKE","LULU","VFC","RL","TIF",
+    "BRK-B","BA","ANT", 
 ]
 
 

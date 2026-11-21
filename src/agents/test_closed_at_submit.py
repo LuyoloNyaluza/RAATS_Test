@@ -9,6 +9,7 @@ from src.data.ticker_memory import TickerMemory
 from src.data import mt5_orders as _MO
 
 LA.wait_for_entry = lambda simulate=True: NS(seconds=0.0, simulated=True)
+LA.market_hours.is_ticker_market_open = lambda t, **k: True      # this test is about the broker's answer, not the clock
 class N:
     def __init__(self):
         self.msgs = []

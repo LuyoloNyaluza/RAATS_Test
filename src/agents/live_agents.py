@@ -50,6 +50,7 @@ from src.data.mt5_sizing import to_mt5_lots
 from src.data.ticker_memory import (TickerMemory, TRADE_REJECTED, BATCH_REJECTED, CLOSED, SEEN,
                                     NOT_TRADABLE)
 from src.utils.async_timer import wait_for_entry
+from src.utils import market_hours
 
 
 def _env_int(name: str, default: int) -> int:
@@ -87,6 +88,16 @@ LADDER_STEP_R = 0.5
 LOCK_GAP_R = 0.5
 CEILING_GAP_R = 1.5
 MAX_SPREAD_FRAC = _env_float("RAATS_MAX_SPREAD_FRAC_OF_RISK", 0.5)
+# Stop distance is sized from INTRADAY volatility (positions are held minutes to hours, so a daily-ATR
+# stop of ~6% is unreachable by the 2R ladder). "D1" restores the old daily-ATR behaviour.
+RISK_ATR_TIMEFRAME = os.environ.get("RAATS_ATR_TIMEFRAME", "M5").strip().upper() or "M5"
+RISK_ATR_PERIOD = int(_env_float("RAATS_ATR_PERIOD", 14))
+# Warning level (trades are NEVER skipped for this): the cash lost if the stop is hit, as a fraction of
+# the balance. Small accounts (balance below RISK_WARN_SMALL_BALANCE) get the higher level because the
+# minimum lot forces a large risk. The Discord approval shows a warning above it; 0 disables.
+RISK_WARN_PCT_SMALL = _env_float("RAATS_RISK_WARN_PCT_SMALL", 0.20)
+RISK_WARN_PCT_LARGE = _env_float("RAATS_RISK_WARN_PCT_LARGE", 0.10)
+RISK_WARN_SMALL_BALANCE = _env_float("RAATS_RISK_WARN_SMALL_BALANCE", 200.0)
 # Small accounts: below this balance a trade sized under the broker's minimum lot is opened at
 # the minimum lot (if the margin fits). The minimum lot can risk more than RAATS sized, so this
 # is an explicit choice; set to 0 to restore "never round up".
@@ -515,6 +526,9 @@ class MainAgent:
         self._lock = threading.RLock()
         self.on_state_change: Callable[[], None] = lambda: None
         self.shared_candidates_fn: Optional[Callable[[], List[Dict[str, Any]]]] = None
+        # Gives a candidate whose market is closed back to the trading loop's shared final INVEST
+        # (it waits there until the market opens). None = no trading loop: it stays in the pool.
+        self.retain_shared_fn: Optional[Callable[[Candidate], bool]] = None
         self.blocked = False                             # insufficient funds: live does not run
         self.balance_gate_passed = False                 # the initial balance check (first approved batch)
         self._gate_unavailable = False
@@ -667,6 +681,12 @@ class MainAgent:
             entries.append((float(result.get("confidence") or 0.0), ticker, result))
         accepted: List[str] = []
         for confidence, ticker, result in sorted(entries, key=lambda e: e[0]):   # best ends first
+            if not market_hours.is_ticker_market_open(ticker):
+                # Live agents never take a ticker whose market is closed: it stays in the trading
+                # loop's shared final INVEST until its market opens.
+                self._event({"type": "market_not_open", "ticker": ticker, "at": "handover",
+                             "reason": "market closed"})
+                continue
             if getattr(batch_manager, "risk_manager", None) is self.rm:
                 self.rm.positions.pop(ticker, None)
             kept = self.pool.put(Candidate(
@@ -697,6 +717,26 @@ class MainAgent:
             self.expect_first_open = False
             print("[main] the first batch is opened as far as the balance allows; batches 2, 3, ... start")
             self.first_open_done.set()
+
+    def _risk_atr(self, md: Dict[str, Any], symbol: Optional[str],
+                  snap: Optional[Dict[str, Any]]) -> Tuple[float, str]:
+        """ATR that sizes the stop: intraday (MT5 bars) when available, else the daily ATR.
+
+        The gradient (m_norm) keeps using the daily ATR; only the stop distance changes.
+        A floor of 1.5 x the spread keeps MAX_SPREAD_FRAC satisfiable on thin symbols.
+        """
+        daily = float(md["atr"])
+        if RISK_ATR_TIMEFRAME in ("D1", "DAILY") or not (self.use_mt5 and symbol):
+            return daily, "D1"
+        try:
+            intra = mt5_orders.intraday_atr(symbol, RISK_ATR_TIMEFRAME, RISK_ATR_PERIOD)
+        except Exception:
+            intra = None
+        if not intra:
+            return daily, "D1 (fallback: no intraday bars)"
+        if snap and snap.get("ask") and snap.get("bid"):
+            intra = max(intra, 1.5 * (snap["ask"] - snap["bid"]))
+        return float(intra), RISK_ATR_TIMEFRAME
 
     def _mt5_view(self, tickers: List[str]) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
@@ -732,7 +772,8 @@ class MainAgent:
                 snap = mt5_orders.snapshot(p["symbol"])
                 units = p["volume"] * (snap["contract_size"] if snap else 1.0)
                 d = 1 if p["direction"] == "LONG" else -1
-                pos = self.rm.open_position(ticker, d, p["price_open"], units, md["atr"], m, m_norm)
+                risk_atr, _src = self._risk_atr(md, p["symbol"], snap)
+                pos = self.rm.open_position(ticker, d, p["price_open"], units, risk_atr, m, m_norm)
                 if p.get("sl"):
                     pos.stop_loss = p["sl"]
                 if p.get("tp"):
@@ -807,6 +848,25 @@ class MainAgent:
                     key=f"defer:{cand.ticker}", cooldown=1800)
         return "defer"
 
+    def _return_to_shared(self, cand: Candidate, reason: str) -> str:
+        """The candidate's market is closed: it leaves the execution pool and goes back to the
+        trading loop's shared final INVEST, where it waits until the market opens. (Without a
+        trading loop it is deferred inside the pool, as before.)"""
+        retain = self.retain_shared_fn
+        kept = False
+        if callable(retain):
+            try:
+                kept = bool(retain(cand))
+            except Exception as exc:
+                _log_error(cand.ticker, exc, "return_to_shared")
+        if not kept:
+            return self._defer(cand, reason)
+        self._forget(cand.ticker)
+        self._event({"type": "candidate_returned_to_shared", "ticker": cand.ticker, "reason": reason})
+        self._alert(f"Waiting for the market to open (back in shared final INVEST): "
+                    f"{cand.ticker} - {reason}", key=f"closed:{cand.ticker}", cooldown=1800)
+        return "defer"
+
     def _free_margin(self) -> Optional[float]:
         """Free margin that may still be used for NEW positions (None if MT5 cannot be read).
 
@@ -870,6 +930,10 @@ class MainAgent:
         """Market data, direction, size, margin and levels at the CURRENT price. Returns
         ("ok", ctx) with the proposal, or ("drop" | "defer" | "halt", None)."""
         t = cand.ticker
+        if not market_hours.is_ticker_market_open(t):
+            self._event({"type": "market_not_open", "ticker": t, "at": "prepare",
+                         "reason": "market closed (exchange hours)"})
+            return self._return_to_shared(cand, "market closed (exchange hours)"), None
         try:
             md = self._market_data(t)
             atr, closes = md["atr"], md["closes"]
@@ -898,6 +962,7 @@ class MainAgent:
                 return self._drop(t, "MT5 trading is not fully enabled for this symbol"), None
 
         price = (snap["bid"] + snap["ask"]) / 2 if snap else md["close"]
+        risk_atr, atr_source = self._risk_atr(md, symbol, snap)
         # MT5 mode: the real balance, never a made-up number. `_portfolio_value()` turns an unreadable
         # balance into 0.0 (typed float), which the risk manager would REJECT and so drop a good
         # candidate on a momentary MT5 hiccup; here an unreadable balance defers instead.
@@ -907,7 +972,7 @@ class MainAgent:
             return self._defer(cand, "the MT5 balance cannot be read; no proposal made"), None
         approved, units, d, reason = self.rm.validate_trade(
             ticker=t, signal="INVEST", current_price=price,
-            portfolio_value=balance, atr=atr, m_norm=m_norm, is_top_five=False,
+            portfolio_value=balance, atr=risk_atr, m_norm=m_norm, is_top_five=False,
         )
         if not approved:
             return self._drop(t, f"risk manager: {reason}"), None
@@ -933,7 +998,7 @@ class MainAgent:
                 return self._drop(t, sized["reason"]), None
             traded_units = lots * snap["contract_size"]
 
-        risk_unit, _gf = self.rm.compute_risk_unit(atr, m_norm)
+        risk_unit, _gf = self.rm.compute_risk_unit(risk_atr, m_norm)
         ref = md["close"]
         if snap:
             ref = snap["ask"] if direction == "LONG" else snap["bid"]
@@ -962,13 +1027,19 @@ class MainAgent:
             if chk.get("not_trading_now"):
                 self._event({"type": "market_not_open", "ticker": t, "symbol": symbol,
                              "reason": chk["reason"], "retcode": chk.get("retcode")})
-                return self._defer(
+                return self._return_to_shared(
                     cand, f"{symbol}: {chk['reason']} (broker: {chk.get('comment') or 'n/a'}); "
                           f"it is proposed again when the market opens"), None
 
         risk_per_unit = abs(ref - sl)
         risk_amount = risk_per_unit * traded_units
         reward_amount = abs(tp - ref) * traded_units
+        risk_pct = (risk_amount / balance * 100) if balance else None
+        warnings: List[str] = []
+        warn_level = RISK_WARN_PCT_SMALL if (balance or 0) < RISK_WARN_SMALL_BALANCE else RISK_WARN_PCT_LARGE
+        if warn_level > 0 and balance and risk_amount > warn_level * balance:
+            warnings.append(f"If the stop is hit this trade loses ${risk_amount:,.2f}, "
+                            f"{risk_pct:.0f}% of the ${balance:,.2f} balance (warning level {warn_level:.0%}).")
         rr = (abs(tp - ref) / risk_per_unit) if risk_per_unit else None
         proposal = {
             "ticker": t, "mt5_symbol": symbol, "side": "BUY" if d == 1 else "SELL",
@@ -978,9 +1049,11 @@ class MainAgent:
             "paper": not self.use_mt5, "dry_run": bool(self.use_mt5 and not self.live),
             "lots": lots, "units": traded_units, "entry": ref, "stop_loss": sl, "take_profit": tp,
             "risk_amount": risk_amount, "reward_amount": reward_amount,
+            "risk_pct": risk_pct, "warnings": warnings,
+            "atr_source": atr_source, "risk_atr": risk_atr, "daily_atr": atr,
             "risk_reward": f"1:{rr:.1f}" if rr else "n/a", "time": _now(),
         }
-        ctx = {"md": md, "atr": atr, "m": m, "m_norm": m_norm, "symbol": symbol, "snap": snap,
+        ctx = {"md": md, "atr": atr, "risk_atr": risk_atr, "atr_source": atr_source, "m": m, "m_norm": m_norm, "symbol": symbol, "snap": snap,
                "direction": direction, "d": d, "lots": lots, "units": traded_units,
                "risk_unit": risk_unit, "ref": ref, "sl": sl, "tp": tp,
                "required_margin": required_margin, "proposal": proposal}
@@ -1102,6 +1175,7 @@ class MainAgent:
         sl, tp, traded_units = ctx["sl"], ctx["tp"], ctx["units"]
         margin_needed = ctx["required_margin"]
         atr, m, m_norm = ctx["atr"], ctx["m"], ctx["m_norm"]
+        risk_atr = ctx.get("risk_atr", atr)
 
         ticket, fill = f"PAPER-{t}", ref
         if snap:
@@ -1123,14 +1197,14 @@ class MainAgent:
                     # proposed again when the market opens (never dropped for this).
                     self._event({"type": "market_not_open", "ticker": t, "symbol": symbol,
                                  "reason": why, "retcode": retcode, "at": "order_send"})
-                    return self._defer(
+                    return self._return_to_shared(
                         cand, f"{symbol}: {why} (broker: {res['message']}); "
                               f"it is proposed again when the market opens")
                 return self._drop(t, f"order failed: {res['message']}")
             ticket, fill = res["ticket"], res["price"] or ref
 
         pos = self.rm.open_position(ticker=t, direction=d, entry_price=fill, size=traded_units,
-                                    atr=atr, m=m, m_norm=m_norm)
+                                    atr=risk_atr, m=m, m_norm=m_norm)
         new_sl = pos.stop_loss
         new_tp = pos.take_profit  # Use RiskManager's TP (rrr-based)
         if snap:
@@ -1143,7 +1217,9 @@ class MainAgent:
                "lots": lots, "units": traded_units, "entry": fill, "sl": new_sl, "tp": new_tp,
                "opened": _now(), "confidence": cand.confidence, "source": cand.source,
                "batch": cand.batch, "dry_run": bool(self.use_mt5 and not self.live),
-               "margin": margin_needed, "approval_rounds": cand.approval_rounds}
+               "margin": margin_needed, "approval_rounds": cand.approval_rounds,
+               "init_sl": new_sl, "init_tp": new_tp, "risk_unit": pos.risk_unit,
+               "atr_source": ctx.get("atr_source", "D1"), "risk_atr": risk_atr}
         self.open[t] = rec
         self._forget(t)
         if t in self.manager.final_invest:
@@ -1270,7 +1346,8 @@ class MainAgent:
                                             rec["lots"], ref_price=price, token=self._token)
         if res["ok"]:
             info = (mt5_orders.closed_deal_info(rec["ticket"]) or {}) if rec.get("mt5_symbol") else {}
-            self._finish(rec, info.get("price") or res.get("price") or price, reason, info.get("profit"))
+            self._finish(rec, info.get("price") or res.get("price") or price, reason, info.get("profit"),
+                         detail=info.get("detail"))
         else:
             self._alert(f"{rec['ticker']}: exit signal ({reason}) but close failed: {res['message']}",
                         key=f"closefail:{rec['ticker']}", cooldown=300)
@@ -1303,7 +1380,7 @@ class MainAgent:
             pos.stop_loss = actual_sl            # a tighter stop already at the broker is never loosened
 
         # 2. profit ratio and trading conditions
-        ratio = pos.current_rr(price)
+        ratio = self.rm.observe(t, price)            # also records max_rr_seen
         spread_ok = True
         if snap and pos.risk_unit:
             spread_ok = (snap["ask"] - snap["bid"]) <= MAX_SPREAD_FRAC * pos.risk_unit
@@ -1358,19 +1435,25 @@ class MainAgent:
             self._apply_levels(rec, sl, tp, f"ratio {ratio:.2f}R{locked}")
     
     def _finish(self, rec: Dict[str, Any], exit_px: Optional[float], reason: str,
-                broker_profit: Optional[float] = None) -> None:
+                broker_profit: Optional[float] = None, detail: Optional[Dict[str, Any]] = None) -> None:
         """7. Record the closing result and notify Discord; the slot is refilled by the loop."""
         t = rec["ticker"]
         pos = self.rm.positions.get(t)
-        if pos is not None and pos.locked_rr is not None and reason in ("stop_loss", "closed_at_broker"):
+        if pos is not None and pos.locked_rr is not None and reason == "stop_loss":
             reason = "take_profit_trailing_stop"        # the locked stop was hit: profit taken
         if exit_px is None:
             exit_px = rec["entry"]
         pnl = broker_profit
+        closed: Dict[str, Any] = {}
         if pos is not None:
             closed = self.rm.close_position(t, exit_px, reason=reason)
             if pnl is None:
                 pnl = closed["pnl"]
+            else:
+                # The broker's profit (contract size, commission, swap) is the truth. Make the
+                # RiskManager books, daily P&L and session metrics agree with the MT5 balance.
+                self.rm.update_daily_pnl(pnl - closed["pnl"])
+                closed["pnl"] = pnl
         self.open.pop(t, None)
         self.pool.reset_retry()                     # margin freed: waiting candidates retry now
         self.closed_today.add(t)
@@ -1383,7 +1466,11 @@ class MainAgent:
                     f"entry {rec['entry']} | PnL {pnl:+.2f} | open {len(self.open)}/{self.max_positions}")
         self._event({"type": "position_closed", "ticker": t, "ticket": rec["ticket"],
                      "direction": rec["direction"], "entry": rec["entry"], "exit": exit_px,
-                     "reason": reason, "pnl": pnl, "final_sl": rec["sl"], "final_tp": rec["tp"]})
+                     "reason": reason, "pnl": pnl, "final_sl": rec["sl"], "final_tp": rec["tp"],
+                     "init_sl": rec.get("init_sl"), "init_tp": rec.get("init_tp"),
+                     "risk_unit": closed.get("risk_unit", rec.get("risk_unit")),
+                     "max_rr_seen": closed.get("max_rr_seen"), "locked_rr": closed.get("locked_rr"),
+                     "atr_source": rec.get("atr_source"), **(detail or {})})
         side = "SELL" if rec["direction"] == "LONG" else "BUY"
         self._log_cycle(rec, pnl=pnl, price=exit_px, event="closed", reason=reason, side=side)
 
@@ -1395,8 +1482,8 @@ class MainAgent:
                 if self.use_mt5 and broker is not None and bpos is None:
                     # closed at the broker: stop loss / take profit hit, or closed by hand
                     info = mt5_orders.closed_deal_info(rec["ticket"]) or {}
-                    self._finish(rec, info.get("price"), info.get("reason", "closed_at_broker"),
-                                 info.get("profit"))
+                    self._finish(rec, info.get("price"), info.get("reason", "external_close"),
+                                 info.get("profit"), detail=info.get("detail"))
                     continue
                 self._manage(rec, bpos)
 
@@ -1545,7 +1632,9 @@ class LiveSink:
         plans = dict(getattr(manager, "mt5_order_plan", {}) or {})
         market_data = dict(getattr(manager, "mt5_data", {}) or {})
         with self._shared_lock:
-            for raw_ticker in getattr(manager, "final_invest", []) or []:
+            held = list(getattr(manager, "final_invest", []) or []) + \
+                list(getattr(manager, "market_closed_tickers", []) or [])
+            for raw_ticker in held:
                 ticker = str(raw_ticker).upper()
                 if ticker not in self._shared_final_invest and len(self._shared_final_invest) >= MAX_FINAL_INVEST:
                     continue
@@ -1606,6 +1695,14 @@ class LiveSink:
                     manager.daily_results.append(item["result"])
             self._save_shared_final_invest()
 
+            # Per-ticker market check: only tickers whose market is open go on to Discord approval
+            # (and the broker checks below). The others stay in shared final INVEST.
+            still_closed = [x["ticker"] for x in merged
+                            if not market_hours.is_ticker_market_open(x["ticker"])]
+            if still_closed:
+                print(f"[batches] market closed, kept in shared final INVEST: {still_closed}")
+                merged = [x for x in merged if x["ticker"] not in still_closed]
+
             if not self.use_mt5:
                 return [x["ticker"] for x in merged]
 
@@ -1645,6 +1742,28 @@ class LiveSink:
                     continue
                 open_tickers.append(ticker)
             return open_tickers
+
+    def retain_candidate(self, cand: Candidate) -> bool:
+        """A candidate whose market is closed comes back from the execution pool to shared final
+        INVEST. False when shared final INVEST has no room for it."""
+        ticker = str(cand.ticker).upper()
+        with self._shared_lock:
+            if ticker not in self._shared_final_invest and \
+                    len(self._shared_final_invest) >= MAX_FINAL_INVEST:
+                return False
+            old = self._shared_final_invest.get(ticker, {})
+            self._shared_final_invest[ticker] = {
+                "ticker": ticker,
+                "confidence": float(cand.confidence or old.get("confidence") or 0.0),
+                "direction": cand.direction or old.get("direction"),
+                "result": cand.result or old.get("result") or {},
+                "order_plan": old.get("order_plan") or {},
+                "mt5_data": old.get("mt5_data") or {},
+                "batch": int(cand.batch or old.get("batch") or 0),
+                "created": cand.created or old.get("created") or time.time(),
+            }
+            self._save_shared_final_invest()
+        return True
 
     def recheck_shared(self, batch_no: int, first_batch: bool = False) -> str:
         """Recheck retained candidates without running another discovery/analysis batch."""
@@ -1858,6 +1977,7 @@ def _prepare_live(manager: Any, notifier: Any, ledger: BatchLedger, use_mt5: boo
     recovered = main.open_count()
     sink = LiveSink(main, ledger, use_mt5)
     main.shared_candidates_fn = sink.shared_candidates
+    main.retain_shared_fn = sink.retain_candidate
     if handed:
         n = ledger.next_batch_no()
         tickers = list(manager.final_invest)

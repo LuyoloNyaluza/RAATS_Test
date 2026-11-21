@@ -518,11 +518,46 @@ def closed_deal_info(ticket: Any) -> Optional[Dict[str, Any]]:
         if not out:
             return None
         last = out[-1]
-        if last.reason == getattr(mt5, "DEAL_REASON_SL", -1):
-            reason = "stop_loss"
-        elif last.reason == getattr(mt5, "DEAL_REASON_TP", -2):
-            reason = "take_profit"
-        else:
-            reason = "closed_at_broker"
+        code = int(last.reason)
+        by_code = {
+            getattr(mt5, "DEAL_REASON_SL", -1): "stop_loss",
+            getattr(mt5, "DEAL_REASON_TP", -2): "take_profit",
+            getattr(mt5, "DEAL_REASON_SO", -3): "stop_out",            # broker margin stop-out
+            getattr(mt5, "DEAL_REASON_CLIENT", -4): "manual_close",    # desktop terminal
+            getattr(mt5, "DEAL_REASON_MOBILE", -5): "manual_close",    # mobile terminal
+            getattr(mt5, "DEAL_REASON_WEB", -6): "manual_close",       # web terminal
+            getattr(mt5, "DEAL_REASON_EXPERT", -7): "expert_close",    # an EA / script (RAATS or other)
+        }
+        reason = by_code.get(code, "external_close")
         return {"price": float(last.price), "reason": reason,
-                "profit": float(sum(d.profit + d.commission + d.swap for d in out))}
+                "profit": float(sum(d.profit + d.commission + d.swap for d in out)),
+                "detail": {"deal_reason_code": code, "deal_comment": str(getattr(last, "comment", "") or ""),
+                           "deal_ticket": int(last.ticket), "deal_time": int(last.time)}}
+
+
+def intraday_atr(symbol: str, timeframe: str = "M5", period: int = 14, bars: int = 60) -> Optional[float]:
+    """Wilder-style ATR(period) from the last CLOSED bars of an MT5 intraday timeframe.
+
+    Returns None when MT5 cannot supply enough bars (caller falls back to the daily ATR).
+    The still-forming bar is excluded so the value does not jitter while it builds.
+    """
+    if mt5 is None or not symbol:
+        return None
+    tf = getattr(mt5, "TIMEFRAME_" + timeframe.upper(), None)
+    if tf is None:
+        return None
+    with session() as ok:
+        if not ok:
+            return None
+        rates = mt5.copy_rates_from_pos(symbol, tf, 1, bars)      # start_pos=1 skips the forming bar
+        if rates is None or len(rates) < period + 1:
+            return None
+        highs = [float(r["high"]) for r in rates]
+        lows = [float(r["low"]) for r in rates]
+        closes = [float(r["close"]) for r in rates]
+    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+           for i in range(1, len(rates))]
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr if atr > 0 else None

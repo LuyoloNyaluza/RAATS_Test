@@ -6,7 +6,8 @@ Collects market data, sentiment and OHLCV data.
 Sentiment can come from two sources:
 
 1. Discovery news supplied by trading_loop_dynamic.py.
-   These articles are scored directly using score_sentiment.py.
+   These articles were already scored by src/data/discovery.py (using score_sentiment.py);
+   this module only reads those scores (confidence-weighted). It does not call the model.
 
 2. Existing *_news_scored.json files for backward compatibility.
 
@@ -20,17 +21,12 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import pandas_ta as ta  # noqa: F401
 import yfinance as yf
-
-from src.data.score_sentiment import (
-    score_articles,
-    summarize_ticker_sentiment,
-)
 
 logger = logging.getLogger("raats.agents.collector")
 
@@ -305,6 +301,9 @@ def _sentiment_score_from_articles(
 
     for article in articles:
 
+        if article.get("valid") is False:      # the model gave no usable answer: not a vote
+            continue
+
         sentiment = article.get(
             "sentiment",
             "neutral",
@@ -325,130 +324,6 @@ def _sentiment_score_from_articles(
         counts["positive"]
         - counts["negative"]
     ) / total
-
-
-def _extract_discovery_articles(
-    discovery_news: Optional[
-        Dict[str, List[Dict[str, Any]]]
-    ],
-) -> List[Dict[str, Any]]:
-    """
-    Flatten the discovery news structure into one article list.
-
-    Expected:
-
-    {
-        "yfinance_news": [...],
-        "google_news": [...]
-    }
-    """
-
-    if not discovery_news:
-        return []
-
-    articles = []
-
-    for source_key in (
-        "yfinance_news",
-        "google_news",
-    ):
-
-        source_articles = discovery_news.get(
-            source_key,
-            [],
-        )
-
-        if not isinstance(
-            source_articles,
-            list,
-        ):
-            continue
-
-        for article in source_articles:
-
-            if not isinstance(
-                article,
-                dict,
-            ):
-                continue
-
-            article_copy = dict(article)
-
-            # Preserve the discovery source.
-            if source_key == "yfinance_news":
-                article_copy[
-                    "discovery_source"
-                ] = "Yahoo Finance"
-
-            else:
-                article_copy[
-                    "discovery_source"
-                ] = "Google News"
-
-            articles.append(
-                article_copy
-            )
-
-    return articles
-
-
-def _score_discovery_news(
-    ticker: str,
-    discovery_news: Optional[
-        Dict[str, List[Dict[str, Any]]]
-    ],
-) -> Optional[float]:
-    """
-    Score news already fetched by discovery.py.
-
-    No network request is made here.
-    """
-
-    articles = _extract_discovery_articles(
-        discovery_news
-    )
-
-    if not articles:
-        return None
-
-    logger.info(
-        "%s: scoring %d discovered news articles.",
-        ticker,
-        len(articles),
-    )
-
-    scored_articles = score_articles(
-        ticker,
-        articles,
-        model_name=os.environ.get(
-            "RAATS_SENTIMENT_MODEL",
-            "qwen2.5:3b",
-        ),
-    )
-
-    summary = summarize_ticker_sentiment(
-        scored_articles
-    )
-
-    logger.info(
-        "%s: discovered news sentiment = %s "
-        "(positive=%d, negative=%d, neutral=%d, total=%d)",
-        ticker,
-        summary["overall"],
-        summary["positive"],
-        summary["negative"],
-        summary["neutral"],
-        summary["total"],
-    )
-
-    sentiment = _sentiment_score_from_articles(
-        scored_articles
-    )
-
-    return max(
-        -1.0,
-        min(1.0, sentiment),
-    )
 
 
 def collect_sentiment(
@@ -478,7 +353,10 @@ def collect_sentiment(
         total_weight = 0.0
         for article in articles:
             sentiment = str(article.get("sentiment", "neutral")).lower()
-            confidence = float(article.get("confidence", 0.0) or 0.0)
+            try:
+                confidence = max(0.0, min(1.0, float(article.get("confidence") or 0.0)))
+            except (TypeError, ValueError):
+                confidence = 0.0
             weighted_score += score_values.get(sentiment, 0.0) * confidence
             total_weight += confidence
         if total_weight > 0:
