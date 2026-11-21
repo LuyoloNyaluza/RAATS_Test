@@ -75,6 +75,7 @@ from src.risk.risk_manager import RiskManager
 from src.data.rgr_screen import screen_candidate
 from src.data.mt5_sizing import build_order_plan, format_order_plan
 from src.utils.trade_text import trade_rows, format_rows
+from src.utils import market_hours
 from src.data.reserve_tickers import build_reserve, normalize as _norm_ticker
 from src.data.mt5_bridge import (
     enrich_final_invest, get_account_balance, notify_insufficient_balance,
@@ -629,6 +630,7 @@ class DynamicTradingManager:
         self.batch_no: Optional[int] = None
         self.batch_id: Optional[str] = None
         self.batch_market_filter: Optional[Callable[[Any], List[str]]] = None
+        self.market_closed_tickers: List[str] = []     # final INVEST tickers whose market is closed
 
         # One-time reserve (30 extra tickers) state
         self.reserve_loaded = False
@@ -1844,6 +1846,12 @@ class DynamicTradingManager:
         market_filter = getattr(self, "batch_market_filter", None)
         if callable(market_filter):
             self.final_invest = cast(List[str], market_filter(self))
+        elif not simulate_date:
+            # No live sink: the loop itself checks every ticker's market. Only open markets go
+            # to Discord approval; the others are kept in market_closed_tickers (handed on to
+            # the live phase, which holds them until their market opens).
+            self.final_invest, self.market_closed_tickers = self._split_by_market_hours(
+                self.final_invest)
 
         if self.enable_mt5 and self.mt5_order_plan:
             print("\n" + format_order_plan(self.mt5_order_plan))
@@ -1907,6 +1915,15 @@ class DynamicTradingManager:
         middleware.process_session_end(session_results)
 
         return self.daily_results
+
+    @staticmethod
+    def _split_by_market_hours(tickers: List[str]) -> Tuple[List[str], List[str]]:
+        """(open now, closed now) by each ticker's own exchange hours."""
+        open_now = [t for t in tickers if market_hours.is_ticker_market_open(t)]
+        closed = [t for t in tickers if t not in open_now]
+        if closed:
+            print(f"\nMarket closed, kept out of this approval: {closed}")
+        return open_now, closed
 
     def _get_notifier(self) -> DiscordNotifier:
         """One Discord notifier per manager, created on first use."""
@@ -2359,6 +2376,23 @@ class DynamicTradingManager:
             self.final_invest
         )
 
+        # Reconcile with the broker: the MT5 balance is the truth. The trade-by-trade equity above
+        # is built from recorded P&L, so keep it, but report any gap and use the broker figure.
+        try:
+            from src.data import mt5_orders as _mt5o
+            _bal = _mt5o.account_balance() if _mt5o.live_enabled() else None
+        except Exception:
+            _bal = None
+        if _bal is not None and self.portfolio_value:
+            metrics["final_equity_from_trades"] = metrics.get("final_equity")
+            metrics["broker_balance"] = round(float(_bal), 2)
+            metrics["final_equity"] = round(float(_bal), 2)
+            metrics["total_return_pct"] = round((float(_bal) / float(self.portfolio_value) - 1) * 100, 2)
+            _gap = round(float(_bal) - float(metrics["final_equity_from_trades"] or 0), 2)
+            metrics["equity_gap_vs_trades"] = _gap
+            if abs(_gap) > 0.05:
+                print(f"[metrics] WARNING: broker balance differs from the sum of recorded trade P&L by {_gap:+.2f}")
+
         print(
             "\n"
             + "=" * 60
@@ -2668,6 +2702,10 @@ RUNNER_POLL_SEC = _batch_env_float("RAATS_RUNNER_POLL_SEC", 2.0)
 # unused tickers are available (only a batch with none at all counts as exhausted).
 # Batches below this number keep the strict 50 rule. Set very high to disable.
 RELAX_FROM_BATCH = int(_batch_env_float("RAATS_RELAX_FROM_BATCH", 5))
+# The runner never waits for the first batch to be opened longer than this (0 = no limit), and
+# says what it is waiting for every HEARTBEAT seconds, so a wait can never look like a hang.
+FIRST_OPEN_MAX_WAIT_SEC = _batch_env_float("RAATS_FIRST_OPEN_MAX_WAIT_SEC", 900.0)
+BATCH_HEARTBEAT_SEC = _batch_env_float("RAATS_BATCH_HEARTBEAT_SEC", 300.0)
 # Retry interval when balance is unreadable
 BATCH_BALANCE_RETRY_SEC = _batch_env_float("RAATS_BATCH_BALANCE_RETRY_SEC", 5.0)
 
@@ -3136,6 +3174,25 @@ class BatchRunner(threading.Thread):
         while time.time() < end and not self._halted():
             time.sleep(min(RUNNER_POLL_SEC, max(0.0, end - time.time())))
 
+    def _heartbeat(self, message: str) -> None:
+        """Print `message` at most once per BATCH_HEARTBEAT_SEC."""
+        now = time.time()
+        if now - getattr(self, "_last_heartbeat", 0.0) >= BATCH_HEARTBEAT_SEC:
+            self._last_heartbeat = now
+            print(f"[batches] {message}")
+
+    def _wait_first_open(self) -> None:
+        """Wait until the Main Agent has worked on the first batch (bounded, with heartbeats)."""
+        sink, start = self.sink, time.time()
+        while sink.first_batch_pending() and not self._halted():
+            self._wait(RUNNER_POLL_SEC)
+            if FIRST_OPEN_MAX_WAIT_SEC > 0 and time.time() - start > FIRST_OPEN_MAX_WAIT_SEC:
+                print(f"[batches] the first batch was not opened within {FIRST_OPEN_MAX_WAIT_SEC:.0f}s; "
+                      "batches 2, 3, ... start anyway")
+                break
+            self._heartbeat("waiting for the Main Agent to work on the first batch")
+        self.first_batch = False
+
     def _balance_ok(self, batch_no: int) -> bool:
         """Check if MT5 balance is sufficient for a batch (before running discovery)."""
         balance_unavailable_logged = False
@@ -3218,6 +3275,8 @@ class BatchRunner(threading.Thread):
         sink = self.sink
         while not self._halted():
             if not sink.has_room():
+                self._heartbeat("no room in final INVEST yet; waiting for a position to open or a "
+                                "candidate to leave (no new batch until then)")
                 self._wait(RUNNER_POLL_SEC)
                 continue
             batch_no = sink.next_batch_no()
@@ -3246,9 +3305,7 @@ class BatchRunner(threading.Thread):
                         if recheck == "stopped":
                             break
                         if recheck == "handed" and self.first_batch:
-                            while sink.first_batch_pending() and not self._halted():
-                                self._wait(RUNNER_POLL_SEC)
-                            self.first_batch = False
+                            self._wait_first_open()
                         retained = getattr(sink, "shared_candidates", lambda: [])()
                     if self._halted():
                         break
@@ -3267,9 +3324,7 @@ class BatchRunner(threading.Thread):
                     if not self._halted():
                         recheck = sink.recheck_shared(batch_no, self.first_batch)
                         if recheck == "handed" and self.first_batch:
-                            while sink.first_batch_pending() and not self._halted():
-                                self._wait(RUNNER_POLL_SEC)
-                            self.first_batch = False
+                            self._wait_first_open()
                     # If all 10 shared slots are occupied, do not start discovery batches
                     # that cannot contribute anything. Recheck only until a handover frees slots.
                     retained = retained_fn()
@@ -3281,15 +3336,11 @@ class BatchRunner(threading.Thread):
                         if recheck == "stopped":
                             break
                         if recheck == "handed" and self.first_batch:
-                            while sink.first_batch_pending() and not self._halted():
-                                self._wait(RUNNER_POLL_SEC)
-                            self.first_batch = False
+                            self._wait_first_open()
                         retained = retained_fn()
             if outcome == "handed" and self.first_batch:
                 # the Main Agent works on the first batch before the next one starts
-                while sink.first_batch_pending() and not self._halted():
-                    self._wait(RUNNER_POLL_SEC)
-                self.first_batch = False
+                self._wait_first_open()
             elif outcome == "rejected":
                 self._wait(REJECTED_BATCH_PAUSE_SEC)     # rejected: add nothing, continue
             elif outcome == "macro":

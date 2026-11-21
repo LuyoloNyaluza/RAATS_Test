@@ -289,6 +289,15 @@ class RiskManager:
         return {"updated": True, "current_rr": current_rr, "steps": steps,
                 "locked_rr": locked_rr, "old_stop_loss": old_sl, "stop_loss": new_sl}
 
+    def observe(self, ticker: str, current_price: float) -> float:
+        """Record the best R reached so far (max_rr_seen) and return the current R."""
+        position = self.positions.get(ticker)
+        if position is None:
+            return 0.0
+        current_rr = position.current_rr(current_price)
+        position.max_rr_seen = max(position.max_rr_seen, current_rr)
+        return current_rr
+
     def check_exit(self, ticker: str, current_price: float) -> Optional[str]:
         position = self.positions.get(ticker)
         if position is None:

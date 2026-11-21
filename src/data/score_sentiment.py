@@ -14,26 +14,54 @@ logger = logging.getLogger("raats.data.score_sentiment")
 
 DEFAULT_SENTIMENT_MODEL = os.environ.get(
     "RAATS_SENTIMENT_MODEL",
-    "qwen2.5:3b",
+    "phi3:mini-128k",
 )
 
 
-SENTIMENT_PROMPT = """Rate the financial sentiment of this news article for the given stock ticker.
+SENTIMENT_INSTRUCTIONS = """You are an objective financial news analyst.
+
+### Evaluation Rules:
+1. **Ticker Relevance**: Assess the article in relation to the specific ticker. Do not assign sentiment based on news about another company unless a clear and meaningful connection exists.
+
+2. **Evidence Evaluation**: Base sentiment on the information actually reported in the current headline and summary. Do not assume financial impact, market reaction, or future outcomes that the article does not establish.
+
+3. **Positive Sentiment**: Use positive when the reported development provides a reasonably clear benefit to the company, such as improved earnings, revenue growth, increased demand, successful products, or favourable business developments.
+
+4. **Negative Sentiment**: Use negative when the reported development presents a reasonably clear disadvantage, such as declining earnings, revenue losses, regulatory penalties, dilution, major customer losses, or operational problems.
+
+5. **Routine News**: Scheduled events, routine appointments, ordinary filings, routine financing, and announcements without demonstrated financial benefits or disadvantages should generally be neutral.
+
+6. **Read Direction Carefully**: Check negations, comparisons and expectations against the actual reported outcome. For example, losses narrowing or revenue declining less than expected may indicate improvement, but assess the overall evidence rather than relying on wording alone. Guidance and outlook should also be considered alongside historical results.
+
+7. **Mixed and Unclear News**: Use neutral when positive and negative developments roughly balance, or when the article is informational, speculative, ambiguous, or unrelated to the ticker.
+
+8. **Avoid False Signals**: Do not interpret analyst opinions, routine announcements, partnerships without demonstrated benefits, or general industry news as automatically positive or negative.
+
+9. **Related News Context**: Any related earlier coverage is background information only. Base the classification primarily on the current article. Do not allow unrelated historical headlines to determine its sentiment.
+
+10. **Confidence Assessment**: Confidence should reflect the relevance, clarity, and strength of the evidence. Use lower confidence when the article is ambiguous, incomplete, indirect, or based on speculation.
+
+11. **Strict Constraints**: Answer with exactly one of: positive, negative, neutral. Do not provide trading advice.
 
 Respond ONLY in valid JSON, no extra text.
+Keep "reasoning" to ONE short sentence, under 20 words:
 
+{{
+  "sentiment": "positive | negative | neutral",
+  "confidence": <0-1 float>,
+  "reasoning": "<one short sentence, max 20 words>"
+}}
+"""
+
+SENTIMENT_ARTICLE = """
 Ticker: {ticker}
 Source: {source}
 Headline: {headline}
 Summary: {summary}
 {related_block}
-Consider whether the article is positive, negative, or neutral for the specific ticker.
+JSON:"""
 
-{{
-  "sentiment": "positive | negative | neutral",
-  "confidence": <0-1 float>,
-  "reasoning": "<one short sentence>"
-}}"""
+SENTIMENT_PROMPT = SENTIMENT_INSTRUCTIONS + SENTIMENT_ARTICLE
 
 
 def _safe_parse_json(raw_text: str) -> Dict[str, Any]:
@@ -72,6 +100,28 @@ def _normalise_sentiment(value: str) -> str:
         return value
 
     return "neutral"
+
+
+_LABELS = ("positive", "negative", "neutral")
+
+
+def _validate_answer(result: Dict[str, Any]):
+    """(sentiment, confidence, valid). An answer is usable only if it names exactly one of the
+    three labels and gives a confidence above 0 and at most 1. A copied template
+    ("positive | negative | neutral"), an unknown word or a missing confidence is NOT turned into
+    a neutral vote."""
+    raw = str(result.get("sentiment", "")).strip().lower().strip(" .!\"'")
+    label = raw if raw in _LABELS else None
+    confidence = result.get("confidence")
+    if confidence is None:
+        return "neutral", 0.0, False
+    try:
+        conf = float(confidence)
+    except (TypeError, ValueError):
+        return "neutral", 0.0, False
+    if label is None or not (0.0 < conf <= 1.0):
+        return "neutral", 0.0, False
+    return label, conf, True
 
 
 def _related_block_for(
@@ -142,49 +192,39 @@ def score_article(
         related_block=related_block,
     )
 
-    try:
-        response = ollama.generate(
-            model=model_name,
-            prompt=prompt,
-            options={
-                "temperature": 0.1,
-                "num_predict": 150,
-            },
-        )
+    result: Dict[str, Any] = {}
+    valid = False
+    sentiment, confidence = "neutral", 0.0
 
-        result = _safe_parse_json(
-            response.get("response", "")
-        )
+    for attempt in (1, 2):                    # one retry: a small model sometimes returns junk
+        try:
+            response = ollama.generate(
+                model=model_name,
+                prompt=prompt,
+                options={
+                    "temperature": 0.1,
+                    "num_predict": 150,
+                },
+            )
+            result = _safe_parse_json(response.get("response", ""))
+        except Exception as exc:
+            logger.error(
+                "Sentiment scoring failed for %s: %s",
+                ticker,
+                article.get("title", "")[:80],
+            )
+            result = {"reasoning": f"error: {exc}"}
+            break                              # a failing call is not retried
 
-    except Exception as exc:
-        logger.error(
-            "Sentiment scoring failed for %s: %s",
-            ticker,
-            article.get("title", "")[:80],
-        )
-
-        result = {
-            "sentiment": "neutral",
-            "confidence": 0.0,
-            "reasoning": f"error: {exc}",
-        }
+        sentiment, confidence, valid = _validate_answer(result)
+        if valid:
+            break
 
     scored_article = dict(article)
-
-    scored_article["sentiment"] = _normalise_sentiment(
-        result.get("sentiment", "neutral")
-    )
-
-    try:
-        scored_article["confidence"] = float(
-            result.get("confidence", 0.0)
-        )
-    except (TypeError, ValueError):
-        scored_article["confidence"] = 0.0
-
-    scored_article["reasoning"] = str(
-        result.get("reasoning", "")
-    )
+    scored_article["sentiment"] = sentiment
+    scored_article["confidence"] = confidence
+    scored_article["valid"] = valid
+    scored_article["reasoning"] = str(result.get("reasoning", ""))
 
     if use_memory:
         scored_article["related_count"] = related_count
@@ -238,6 +278,21 @@ def summarize_ticker_sentiment(
             "negative": 0,
             "neutral": 0,
             "total": 0,
+        }
+
+    # Answers the model failed to give properly (valid == False) are not votes.
+    invalid = sum(1 for a in scored_articles if a.get("valid") is False)
+    scored_articles = [a for a in scored_articles if a.get("valid") is not False]
+
+    if not scored_articles:
+        return {
+            "overall": "neutral",
+            "score": 0.0,
+            "positive": 0,
+            "negative": 0,
+            "neutral": 0,
+            "total": 0,
+            "invalid": invalid,
         }
 
     counts = {
@@ -297,6 +352,7 @@ def summarize_ticker_sentiment(
         "score": round(score, 4),
         **counts,
         "total": len(scored_articles),
+        "invalid": invalid,
     }
 
 

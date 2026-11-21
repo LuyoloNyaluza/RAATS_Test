@@ -1,3 +1,4 @@
+
 """
 src/agents/analyst.py
 
@@ -12,6 +13,7 @@ RiskManager.
 import json
 import logging
 import os
+from datetime import date
 from typing import Dict, Optional, Any, List
 
 try:
@@ -29,14 +31,15 @@ logger = logging.getLogger(
 
 DEFAULT_ANALYST_MODEL = os.environ.get(
     "RAATS_ANALYST_MODEL",
-    "llama3",
+    "gemma3:4b",
 )
 
 
-ANALYST_PROMPT = """You are an objective financial analyst.
+ANALYST_PROMPT = """You are an objective financial analyst evaluating whether a stock presents a genuine trading opportunity.
 
 Given the following market data for {ticker}:
 
+- Analysis reference date: {as_of_date}
 - Close price: {close}
 - SMA 10: {sma_10}
 - RSI: {rsi}
@@ -49,13 +52,53 @@ Historical Context & Prior Signals:
 {history_block}
 
 ### Evaluation Rules:
-1. **Opportunity Assessment**: Decide strictly whether current conditions present a genuine, actionable trading opportunity or if they do not justify a trade. Avoid unjustified investments.
-2. **Evidence Evaluation**: Objectively weigh relevant evidence. If news is unrelated, weak, duplicated, stale, or unclear, do not treat it as strong evidence. Avoid overstating the market impact of news headlines.
-3. **Historical Context Utilization**: Cross-reference historical context to ensure consistency, avoid repeating recent false starts, and account for prior trends without blindly chasing outdated setups. Historical signals must not override genuinely improved current conditions.
-4. **Strict Constraints**:
-  - Do NOT pick a direction.
-  - Do NOT say BUY or SELL (trade direction is handled separately from price trend data).
-5. **Confidence Assessment**: Confidence should reflect the strength and consistency of the available evidence supporting the decision.
+
+1. **Opportunity Assessment**:
+   Decide whether the available evidence identifies a genuine opportunity worth further evaluation by the trading system.
+
+   INVEST means there is sufficient evidence of a meaningful opportunity for the RiskManager to evaluate. It does not mean that a trade must be executed.
+
+   HOLD means the available evidence is insufficient, weak, conflicting, or does not justify further trade evaluation.
+
+2. **Fundamental and News Evidence**:
+   Consider meaningful developments such as:
+   - Revenue growth, improved earnings, and positive earnings surprises.
+   - Increased guidance, improving forecasts, and stronger business outlook.
+   - Major contracts, increased demand, successful products, and regulatory approvals.
+   - Declining earnings, reduced guidance, customer losses, dilution, regulatory penalties, and operational problems.
+
+   Give greater weight to specific, financially meaningful developments than routine announcements or unsupported opinions.
+
+3. **Market Indicators**:
+   Assess Close price, SMA 10, and RSI together with the available evidence.
+
+   - Price above SMA 10 can indicate positive short-term price behaviour.
+   - Price below SMA 10 can indicate negative short-term price behaviour.
+   - RSI below 30 can indicate oversold conditions.
+   - RSI above 70 can indicate overbought conditions.
+
+   These indicators provide context, not automatic INVEST or HOLD decisions. An oversold condition does not automatically invalidate a genuine opportunity, and an overbought condition does not automatically justify one.
+
+4. **Sentiment Evaluation**:
+   Consider sentiment alongside the actual news and market data. Do not treat a positive or negative sentiment score as sufficient evidence on its own.
+
+5. **Evidence Quality**:
+   Objectively weigh relevant evidence. If news is unrelated, weak, duplicated, stale, speculative, or unclear, do not treat it as strong evidence. Avoid overstating the market impact of headlines.
+
+6. **News Recency**:
+   Compare publication dates against the analysis reference date. Give greater weight to recent, relevant developments. Older news is historical context, not evidence of a current opportunity unless supported by new developments.
+
+7. **Historical Context Utilization**:
+   Cross-reference historical context to identify previous false starts and avoid blindly chasing outdated setups. Historical signals must not override genuinely improved current conditions.
+
+8. **Strict Constraints**:
+   - Do NOT pick a trade direction.
+   - Do NOT say BUY or SELL.
+   - Trade direction is determined separately by the RiskManager using price trend data.
+   - INVEST only identifies an opportunity for further evaluation.
+
+9. **Confidence Assessment**:
+   Confidence should reflect the strength, relevance, and consistency of the available evidence. Do not express high confidence when evidence is incomplete or conflicting.
 
 Respond ONLY in valid JSON, no extra text.
 Keep "justification" to ONE short sentence, under 20 words:
@@ -65,6 +108,7 @@ Keep "justification" to ONE short sentence, under 20 words:
   "confidence": <0-1 float>,
   "justification": "<one short sentence, max 20 words>"
 }}"""
+
 
 def _safe_parse_json(
     raw_text: str,
@@ -294,6 +338,13 @@ def analyze_market(
         or DEFAULT_ANALYST_MODEL
     )
 
+    # Use the simulation date when available.
+    # Otherwise, use the current system date.
+    as_of_date = (
+        state.get("simulate_date")
+        or date.today().isoformat()
+    )
+
     discovery_news = state.get(
         "discovery_news",
         {},
@@ -304,7 +355,7 @@ def analyze_market(
     )
 
     # Earlier days' coverage of this ticker, kept separate from live news.
-    # Strictly before simulate_date/today, so it cannot leak future articles.
+    # Use the same reference date as the analyst prompt.
     history_block = ""
 
     try:
@@ -317,9 +368,10 @@ def analyze_market(
             ticker,
             recent_for_ticker(
                 ticker,
-                as_of=state.get("simulate_date"),
+                as_of=as_of_date,
             ),
         )
+
     except Exception as exc:
         logger.warning(
             "News history unavailable for %s: %s",
@@ -328,6 +380,7 @@ def analyze_market(
         )
 
     prompt = ANALYST_PROMPT.format(
+        as_of_date=as_of_date,
         ticker=ticker,
         close=market_data["close"],
         sma_10=market_data["sma_10"],

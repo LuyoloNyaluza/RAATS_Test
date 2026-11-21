@@ -1,0 +1,73 @@
+model,ticker,headline,expected,got,confidence,hard
+phi3:mini-128k,HD,Home Depot lifts annual sales outlook,positive,positive,0.95,0
+phi3:mini-128k,TGT,"Target posts weaker holiday sales, trims forecast",negative,negative,0.95,0
+phi3:mini-128k,CAT,Caterpillar to publish results on Thursday,neutral,neutral,0.50,0
+phi3:mini-128k,QCOM,Qualcomm signs multi-year chip supply deal with Samsung,positive,positive,0.95,0
+phi3:mini-128k,NKE,Nike to open new store in Madrid,neutral,neutral,0.50,1
+phi3:mini-128k,INTC,AMD wins server contract from a major cloud provider,negative,negative,0.95,1
+phi3:mini-128k,BAC,Bank of America names new head of consumer lending,neutral,neutral,0.50,1
+phi3:mini-128k,UAL,United Airlines fuel costs fall 12%,positive,positive,0.95,0
+phi3:mini-128k,PFE,Pfizer trial fails to meet primary endpoint,negative,negative,0.95,0
+phi3:mini-128k,MRK,Merck raises $2 billion in new share offering,negative,neutral,0.70,1
+phi3:mini-128k,LOW,Lowe's earnings beat estimates but guidance falls short,negative,negative,0.70,1
+phi3:mini-128k,COST,Costco comparable sales rise 8%,positive,positive,0.95,0
+phi3:mini-128k,V,Visa and Mastercard both report steady volumes,neutral,neutral,0.95,1
+phi3:mini-128k,AMAT,Applied Materials loss narrower than analysts feared,positive,positive,0.95,1
+phi3:mini-128k,GE,GE Aerospace wins engine order after rival's grounding,positive,positive,0.95,1
+phi3:mini-128k,DAL,Delta schedules investor day for next month,neutral,neutral,0.50,0
+phi3:mini-128k,BABA,Alibaba faces new antitrust probe,negative,negative,0.95,0
+phi3:mini-128k,SPOT,Spotify user growth exceeds forecasts,positive,positive,0.95,0
+phi3:mini-128k,MCD,McDonald's completes scheduled bond repayment,neutral,neutral,0.70,1
+phi3:mini-128k,RIVN,Rivian halts production at main plant after fire,negative,negative,0.95,0
+phi3:mini-128k,ADBE,Adobe stock steady after analyst reiterates rating,neutral,neutral,0.50,0
+phi3:mini-128k,ZM,Zoom revenue did not decline as feared,positive,positive,0.95,1
+phi3:mini-128k,NOK,Ericsson wins deal that Nokia had bid for,negative,negative,0.95,1
+phi3:mini-128k,LLY,Eli Lilly obesity drug approved in Europe,positive,positive,0.95,0
+qwen2.5:3b,HD,Home Depot lifts annual sales outlook,positive,positive,0.85,0
+qwen2.5:3b,TGT,"Target posts weaker holiday sales, trims forecast",negative,negative,0.90,0
+qwen2.5:3b,CAT,Caterpillar to publish results on Thursday,neutral,neutral,0.80,0
+qwen2.5:3b,QCOM,Qualcomm signs multi-year chip supply deal with Samsung,positive,positive,0.90,0
+qwen2.5:3b,NKE,Nike to open new store in Madrid,neutral,neutral,0.70,1
+qwen2.5:3b,INTC,AMD wins server contract from a major cloud provider,negative,neutral,0.50,1
+qwen2.5:3b,BAC,Bank of America names new head of consumer lending,neutral,neutral,0.60,1
+qwen2.5:3b,UAL,United Airlines fuel costs fall 12%,positive,positive,0.90,0
+qwen2.5:3b,PFE,Pfizer trial fails to meet primary endpoint,negative,negative,0.90,0
+qwen2.5:3b,MRK,Merck raises $2 billion in new share offering,negative,neutral,0.60,1
+qwen2.5:3b,LOW,Lowe's earnings beat estimates but guidance falls short,negative,neutral,0.60,1
+qwen2.5:3b,COST,Costco comparable sales rise 8%,positive,positive,0.80,0
+qwen2.5:3b,V,Visa and Mastercard both report steady volumes,neutral,neutral,0.80,1
+qwen2.5:3b,AMAT,Applied Materials loss narrower than analysts feared,positive,positive,0.80,1
+qwen2.5:3b,GE,GE Aerospace wins engine order after rival's grounding,positive,positive,0.90,1
+qwen2.5:3b,DAL,Delta schedules investor day for next month,neutral,neutral,0.80,0
+qwen2.5:3b,BABA,Alibaba faces new antitrust probe,negative,negative,0.80,0
+qwen2.5:3b,SPOT,Spotify user growth exceeds forecasts,positive,positive,0.80,0
+qwen2.5:3b,MCD,McDonald's completes scheduled bond repayment,neutral,neutral,0.80,1
+qwen2.5:3b,RIVN,Rivian halts production at main plant after fire,negative,negative,0.90,0
+qwen2.5:3b,ADBE,Adobe stock steady after analyst reiterates rating,neutral,neutral,0.80,0
+qwen2.5:3b,ZM,Zoom revenue did not decline as feared,positive,positive,0.80,1
+qwen2.5:3b,NOK,Ericsson wins deal that Nokia had bid for,negative,negative,0.90,1
+qwen2.5:3b,LLY,Eli Lilly obesity drug approved in Europe,positive,positive,0.90,0
+gemma3:4b,HD,Home Depot lifts annual sales outlook,positive,positive,0.85,0
+gemma3:4b,TGT,"Target posts weaker holiday sales, trims forecast",negative,negative,0.85,0
+gemma3:4b,CAT,Caterpillar to publish results on Thursday,neutral,neutral,0.80,0
+gemma3:4b,QCOM,Qualcomm signs multi-year chip supply deal with Samsung,positive,positive,0.85,0
+gemma3:4b,NKE,Nike to open new store in Madrid,neutral,neutral,0.70,1
+gemma3:4b,INTC,AMD wins server contract from a major cloud provider,negative,negative,0.80,1
+gemma3:4b,BAC,Bank of America names new head of consumer lending,neutral,neutral,0.60,1
+gemma3:4b,UAL,United Airlines fuel costs fall 12%,positive,positive,0.95,0
+gemma3:4b,PFE,Pfizer trial fails to meet primary endpoint,negative,negative,0.85,0
+gemma3:4b,MRK,Merck raises $2 billion in new share offering,negative,neutral,0.70,1
+gemma3:4b,LOW,Lowe's earnings beat estimates but guidance falls short,negative,negative,0.80,1
+gemma3:4b,COST,Costco comparable sales rise 8%,positive,positive,0.95,0
+gemma3:4b,V,Visa and Mastercard both report steady volumes,neutral,neutral,0.80,1
+gemma3:4b,AMAT,Applied Materials loss narrower than analysts feared,positive,positive,0.85,1
+gemma3:4b,GE,GE Aerospace wins engine order after rival's grounding,positive,positive,0.85,1
+gemma3:4b,DAL,Delta schedules investor day for next month,neutral,neutral,0.80,0
+gemma3:4b,BABA,Alibaba faces new antitrust probe,negative,negative,0.80,0
+gemma3:4b,SPOT,Spotify user growth exceeds forecasts,positive,positive,0.95,0
+gemma3:4b,MCD,McDonald's completes scheduled bond repayment,neutral,neutral,0.80,1
+gemma3:4b,RIVN,Rivian halts production at main plant after fire,negative,negative,0.85,0
+gemma3:4b,ADBE,Adobe stock steady after analyst reiterates rating,neutral,neutral,0.80,0
+gemma3:4b,ZM,Zoom revenue did not decline as feared,positive,positive,0.85,1
+gemma3:4b,NOK,Ericsson wins deal that Nokia had bid for,negative,negative,0.85,1
+gemma3:4b,LLY,Eli Lilly obesity drug approved in Europe,positive,positive,0.85,0

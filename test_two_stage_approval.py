@@ -34,6 +34,7 @@ def fake_timer(simulate=True):
 
 
 LA.wait_for_entry = fake_timer
+LA.market_hours.is_ticker_market_open = lambda t, **k: True      # not a clock test
 LA.APPROVAL_JOIN_SEC = 0.05
 
 

@@ -1,0 +1,53 @@
+model,scenario,expected,got,confidence,hard,invalid,justification
+llama3,strong-1,INVEST,INVEST,0.80,0,0,"Record revenue, raised guidance, and major contract win create a strong fundamental opportunity"
+llama3,strong-2,INVEST,INVEST,0.70,0,0,Recent regulatory approval and lifted revenue guidance create a genuine trading opportunity.
+llama3,strong-3,INVEST,INVEST,0.70,0,0,Recent positive news and improving market indicators support a genuine trading opportunity.
+llama3,strong-4,INVEST,INVEST,0.80,0,0,"Recent profit beat and guidance raise, combined with positive market indicators, justify further evaluation."
+llama3,override-history,INVEST,INVEST,0.80,1,0,Recent revenue growth and major contract wins outweigh previous guidance concerns.
+llama3,oversold-positive,INVEST,INVEST,0.80,1,0,Recent positive news and market indicators suggest a genuine opportunity for further evaluation.
+llama3,no-news,HOLD,INVEST,0.60,0,0,"Sufficient evidence of a stable price and neutral sentiment, with no recent news"
+llama3,unrelated-news,HOLD,INVEST,0.60,0,0,Recent oil price stability and unchanged interest rates create a favorable market environment.
+llama3,stale-duplicates,HOLD,INVEST,0.70,0,0,Recent expansion plans and positive sentiment outweigh neutral market indicators.
+llama3,overbought-weak,HOLD,INVEST,0.70,0,0,Recent analyst reiteration and positive news outweigh bearish market indicators.
+llama3,mixed-news,HOLD,HOLD,0.50,0,0,"Mixed profit and outlook, unclear impact of recent news, and neutral market indicators"
+llama3,routine-news,HOLD,INVEST,0.70,0,0,Recent news and market indicators suggest a potential opportunity worth further evaluation.
+llama3,false-starts,HOLD,INVEST,0.60,0,0,"Recent news is quiet, but historical context suggests a potential setup"
+phi3:mini-128k,strong-1,INVEST,HOLD,0.00,0,1,Failed to parse LLM output.
+phi3:mini-128k,strong-2,INVEST,INVEST,0.95,0,0,"BBB's regulatory approval and revenue guidance lift, combined with strong market indicators and sentiment, suggest a genuine opportunity."
+phi3:mini-128k,strong-3,INVEST,INVEST,0.85,0,0,Supply deal and demand surge signal positive opportunity.
+phi3:mini-128k,strong-4,INVEST,HOLD,0.00,0,1,"Error during analysis: prediction aborted, token repeat limit reached (status code: 500)"
+phi3:mini-128k,override-history,INVEST,INVEST,0.95,1,0,Record revenue growth and major contract win signal strong opportunity.
+phi3:mini-128k,oversold-positive,INVEST,HOLD,0.00,1,1,"Error during analysis: prediction aborted, token repeat limit reached (status code: 500)"
+phi3:mini-128k,no-news,HOLD,HOLD,0.35,0,0,"Lack of recent, relevant news and conflicting market indicators."
+phi3:mini-128k,unrelated-news,HOLD,HOLD,0.45,0,0,"No strong, relevant news or market indicators suggest a genuine opportunity."
+phi3:mini-128k,stale-duplicates,HOLD,HOLD,0.45,0,0,"Recent news is unrelated to market indicators and lacks strong, recent developments."
+phi3:mini-128k,overbought-weak,HOLD,HOLD,0.45,0,0,"RSI near overbought level, but sentiment and news lack strong, recent positive developments."
+phi3:mini-128k,mixed-news,HOLD,HOLD,0.45,0,0,Mixed news and equal close price to SMA 10 with RSI at 50.
+phi3:mini-128k,routine-news,HOLD,HOLD,0.45,0,0,News is recent but lacks strong financial impact evidence.
+phi3:mini-128k,false-starts,HOLD,HOLD,0.45,0,0,"Recent news is speculative and lacks strong, relevant financial developments."
+qwen2.5:3b,strong-1,INVEST,HOLD,0.65,0,0,Recent positive news on revenue growth and contract wins supports further evaluation.
+qwen2.5:3b,strong-2,INVEST,HOLD,0.70,0,0,"Recent regulatory approval and improved revenue guidance suggest a positive outlook, warranting further evaluation."
+qwen2.5:3b,strong-3,INVEST,HOLD,0.60,0,0,"Recent positive news and improved sentiment outweigh minor overbought RSI, but recent developments are strong."
+qwen2.5:3b,strong-4,INVEST,HOLD,0.65,0,0,"Recent positive news and strong RSI suggest potential opportunity, but overbought condition warrants caution."
+qwen2.5:3b,override-history,INVEST,HOLD,0.65,1,0,"Recent positive news and improved outlook outweigh recent price dip, but RSI is near 70, caution needed."
+qwen2.5:3b,oversold-positive,INVEST,HOLD,0.60,1,0,"Recent positive news and improving sentiment outweigh market indicators, suggesting a genuine opportunity."
+qwen2.5:3b,no-news,HOLD,HOLD,0.25,0,0,No new significant news or market indicators support a genuine opportunity.
+qwen2.5:3b,unrelated-news,HOLD,HOLD,0.50,0,0,Recent news lacks clear financial impact; market indicators suggest mixed signals.
+qwen2.5:3b,stale-duplicates,HOLD,HOLD,0.65,0,0,"Recent store openings plan supports positive outlook, but overbought RSI suggests caution."
+qwen2.5:3b,overbought-weak,HOLD,HOLD,0.60,0,0,"Recent news reiterates rating with no change, but RSI overbought suggests caution."
+qwen2.5:3b,mixed-news,HOLD,HOLD,0.30,0,0,Mixed news and neutral market indicators do not provide clear evidence of a genuine opportunity.
+qwen2.5:3b,routine-news,HOLD,HOLD,0.60,0,0,"Recent developments lack specific financial impact, but market indicators suggest potential."
+qwen2.5:3b,false-starts,HOLD,HOLD,0.60,0,0,Recent price above SMA 10 and RSI in oversold range suggest potential for further evaluation.
+gemma3:4b,strong-1,INVEST,INVEST,0.85,0,0,"Recent news of revenue growth, contract wins, and increased forecasts strongly suggests a potential opportunity."
+gemma3:4b,strong-2,INVEST,INVEST,0.75,0,0,Recent regulatory approval and revised forecasts strongly suggest a potential price increase.
+gemma3:4b,strong-3,INVEST,INVEST,0.75,0,0,"Recent supply deal and surging demand, coupled with a rising RSI, suggest a potential opportunity."
+gemma3:4b,strong-4,INVEST,INVEST,0.75,0,0,"Strong profit beat and buyback announcement, coupled with positive guidance, warrant further investigation."
+gemma3:4b,override-history,INVEST,INVEST,0.75,1,0,Record revenue and a major contract significantly outweigh recent negative signals.
+gemma3:4b,oversold-positive,INVEST,INVEST,0.75,1,0,Recent news of a large contract win and recovering orders strengthens the potential opportunity.
+gemma3:4b,no-news,HOLD,HOLD,0.50,0,0,The data presents a neutral picture with no significant indicators or news.
+gemma3:4b,unrelated-news,HOLD,HOLD,0.60,0,0,The data presents a mixed picture with neutral indicators and weak news.
+gemma3:4b,stale-duplicates,HOLD,HOLD,0.40,0,0,The repeated news of expansion is weak and doesn't justify investment at this time.
+gemma3:4b,overbought-weak,HOLD,HOLD,0.40,0,0,The high RSI and lack of significant fundamental news warrant further investigation.
+gemma3:4b,mixed-news,HOLD,HOLD,0.60,0,0,Mixed news and neutral indicators suggest a cautious approach pending further information.
+gemma3:4b,routine-news,HOLD,HOLD,0.60,0,0,Recent news is minor and doesn't significantly alter the stock's current valuation.
+gemma3:4b,false-starts,HOLD,HOLD,0.60,0,0,"Recent news and historical signals indicate volatility, lacking a clear, sustained opportunity."
