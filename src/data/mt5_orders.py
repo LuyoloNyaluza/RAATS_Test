@@ -174,6 +174,35 @@ def account_balance() -> Optional[float]:
         return float(info.balance) if info is not None else None
 
 
+def realized_pnl_today() -> Optional[float]:
+    """Net P&L of today's buy/sell deals from the broker (profit + commission + swap + fee).
+
+    Deposits and withdrawals are excluded. 'Today' = the PC's calendar day, compared with the deal
+    times as the broker stamps them; if the broker's clock is in another time zone than the PC,
+    set RAATS_BROKER_TZ_SHIFT_HOURS (broker time minus PC time, in hours). None = unavailable.
+    """
+    if mt5 is None:
+        return None
+    from datetime import datetime, timedelta, timezone
+    shift = float(os.environ.get("RAATS_BROKER_TZ_SHIFT_HOURS", "0") or 0)
+    now = datetime.now()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    with session() as ok:
+        if not ok:
+            return None
+        deals = mt5.history_deals_get(start - timedelta(days=1), now + timedelta(days=1))
+        if deals is None:
+            return None
+        total = 0.0
+        for d in deals:
+            if d.type not in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL):
+                continue
+            when = datetime.fromtimestamp(d.time, tz=timezone.utc).replace(tzinfo=None) - timedelta(hours=shift)
+            if when >= start:
+                total += d.profit + d.commission + d.swap + float(getattr(d, "fee", 0.0) or 0.0)
+        return total
+
+
 def account_free_margin() -> Optional[float]:
     with session() as ok:
         if not ok or mt5 is None:
