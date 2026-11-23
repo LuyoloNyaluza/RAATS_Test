@@ -112,7 +112,7 @@ class RiskManager:
         step_trigger_rr: float = 2.0,   # LADDER_START_R
         step_size_rr: float = 0.5,      # LADDER_STEP_R
         base_locked_rr: float = 1.5,    # LOCK_GAP_R
-        max_daily_loss_pct: float = 0.05,
+        max_daily_loss_pct: float = 0.20,   # of the START-OF-DAY balance; env RAATS_MAX_DAILY_LOSS_PCT overrides
         gradient_lookback: int = 10,
         gradient_deadband: float = 0.3,
         gradient_k: float = 0.25,
@@ -125,7 +125,9 @@ class RiskManager:
         self.step_trigger_rr = step_trigger_rr
         self.step_size_rr = step_size_rr
         self.base_locked_rr = base_locked_rr
-        self.max_daily_loss_pct = max_daily_loss_pct
+        import os as _os
+        _env = _os.environ.get("RAATS_MAX_DAILY_LOSS_PCT")
+        self.max_daily_loss_pct = float(_env) if _env else max_daily_loss_pct
 
         self.gradient_lookback = gradient_lookback
         self.gradient_deadband = gradient_deadband
@@ -136,6 +138,9 @@ class RiskManager:
 
         self.positions: Dict[str, Position] = {}
         self.daily_pnl: float = 0.0
+        self.day_key: Optional[str] = None
+        self.day_start_balance: Optional[float] = None
+        self.loss_limit_reported: bool = False
         self.closed_trades: List[dict] = []
 
     def resolve_gradient(self, closes: Sequence[float], atr: float) -> Tuple[float, float]:
@@ -187,16 +192,38 @@ class RiskManager:
         take_profit = entry_price + (direction * self.rrr * risk_unit)
         return stop_loss, take_profit
 
-    def can_trade_today(self, portfolio_value: float) -> bool:
+    def sync_day(self, day_key: str, day_start_balance: float, realized_today: Optional[float] = None) -> None:
+        """Start a new trading day: remember the start-of-day balance and the net closed P&L so far
+        (the broker's figure, so a restart mid-day does not forget earlier closes)."""
+        if day_key != self.day_key:
+            self.day_key = day_key
+            self.day_start_balance = float(day_start_balance)
+            self.daily_pnl = float(realized_today or 0.0)
+            self.loss_limit_reported = False
+
+    def daily_loss_limit(self, portfolio_value: Optional[float] = None) -> Optional[float]:
+        """The most the day may lose: max_daily_loss_pct of the START-OF-DAY balance."""
+        start = self.day_start_balance
+        if start is None and portfolio_value is not None:
+            start = portfolio_value - self.daily_pnl
+        return None if start is None else start * self.max_daily_loss_pct
+
+    def can_trade_today(self, portfolio_value: Optional[float] = None) -> bool:
+        """False once the day's NET closed P&L (wins offset losses) is a loss of the limit or more.
+        Only gates NEW entries: open positions are never touched by this check."""
         if self.daily_pnl >= 0:
             return True
-        return abs(self.daily_pnl) <= (portfolio_value * self.max_daily_loss_pct)
+        limit = self.daily_loss_limit(portfolio_value)
+        return limit is None or -self.daily_pnl < limit
 
     def update_daily_pnl(self, pnl: float) -> None:
         self.daily_pnl += pnl
 
     def reset_daily(self) -> None:
         self.daily_pnl = 0.0
+        self.day_key = None
+        self.day_start_balance = None
+        self.loss_limit_reported = False
 
     def validate_trade(
         self, ticker: str, signal: str, current_price: float, portfolio_value: float,
@@ -205,8 +232,9 @@ class RiskManager:
     ) -> Tuple[bool, float, int, str]:
         if not self.can_trade_today(portfolio_value):
             return False, 0.0, 0, (
-                f"Daily loss limit reached (pnl={self.daily_pnl:.2f}, "
-                f"limit={portfolio_value * self.max_daily_loss_pct:.2f})"
+                f"Daily loss limit reached (net closed P&L {self.daily_pnl:.2f} today, limit "
+                f"{self.daily_loss_limit(portfolio_value):.2f} = {self.max_daily_loss_pct:.0%} "
+                f"of the start-of-day balance)"
             )
 
         if atr is None or atr <= 0:

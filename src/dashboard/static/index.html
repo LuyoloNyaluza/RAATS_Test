@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAATS Dashboard</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0A1018;color:#E6EDF3;font:14px Inter,"Segoe UI",system-ui,sans-serif}
+.wrap{max-width:1500px;margin:0 auto;padding:16px;display:flex;flex-direction:column;gap:14px;min-height:100vh}
+.top{display:flex;align-items:center;gap:28px;flex-wrap:wrap}
+.top .t1{font-size:18px;font-weight:600}.top .t2{font-size:12px;color:#9AA7B5}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px;background:#3FB950}
+.dot.running{background:#4C9AFF}.dot.stopping{background:#F0B429}
+.g{color:#3FB950}.r{color:#FF6B66}.a{color:#F0B429}.m{color:#9AA7B5}
+#banner{display:none;background:#5C4410;border:1px solid #7A5A12;border-radius:8px;padding:10px 14px;font-weight:500}
+.grid{display:grid;grid-template-columns:340px 1fr 1fr;grid-template-rows:250px 235px minmax(260px,1fr);gap:14px;flex:1;min-height:0}
+.p{background:#111A24;border:1px solid #223246;border-radius:10px;display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}
+.ph{padding:9px 14px;font-size:14px;font-weight:600;color:#fff;display:flex;justify-content:space-between;align-items:center;background:#1B2735}
+.ph span{font-weight:400;font-size:12px;opacity:.9}
+.pb{padding:12px 14px;display:flex;flex-direction:column;gap:10px;flex:1;min-height:0}
+.gr{border-color:#1F6F43}.gr .ph{background:#14532D}.am{border-color:#7A5A12}.am .ph{background:#5C4410}.rd{border-color:#7F2A2A}.rd .ph{background:#6B1F1F}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:500;color:#9AA7B5;font-size:12px;padding:4px 6px;border-bottom:1px solid #223246;position:sticky;top:0;background:#111A24}
+td{padding:6px;border-bottom:1px solid #182433}
+.sc{overflow:auto;flex:1;min-height:0;scrollbar-color:#324156 transparent}
+#tbl-open{min-width:1180px}#tbl-open td,#tbl-open th{white-space:nowrap}
+th.act,td.act{position:sticky;right:0;background:#111A24;text-align:center;box-shadow:-1px 0 0 #223246}th.act{top:0;z-index:2}
+.xbtn{font:600 12px Consolas,monospace;color:#FF6B66;background:#1B2735;border:1px solid #7F2A2A;border-radius:6px;padding:4px 8px;cursor:pointer}
+.xbtn:hover{background:#6B1F1F;color:#fff}.xbtn:disabled{opacity:.45;cursor:not-allowed}
+.tag{padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600;color:#fff}.LONG{background:#1A7F37}.SHORT{background:#C93C37}
+.btn{font:600 14px Inter,"Segoe UI",sans-serif;border:0;border-radius:8px;padding:11px 14px;cursor:pointer;color:#fff;min-height:44px}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.run{background:#1A7F37;flex:1}.stop{background:#2A3747;flex:1}.gen{background:#2F6FDB}.xls{background:#1D6F5F}
+select,input[type=date]{font:inherit;background:#0A1018;color:#E6EDF3;border:1px solid #324156;border-radius:8px;padding:10px;min-height:44px;color-scheme:dark;width:100%;min-width:0}
+.row{display:flex;gap:8px}
+#shot{width:100%;flex:1;min-height:0;object-fit:contain;display:none;background:#111A24}
+#notice{display:none;align-items:center;gap:10px;padding:10px 14px;border-top:1px solid #223246;color:#C9D4DF;font-size:13px}
+#notice i{flex:none;width:22px;height:22px;border-radius:50%;background:#2F6FDB;color:#fff;text-align:center;font-style:normal;font-weight:700;line-height:22px}
+.log{font:12.5px/1.55 "JetBrains Mono",Consolas,monospace;color:#C9D4DF;background:#080D13;border-radius:8px;padding:10px 12px;overflow-y:auto;flex:1;min-height:0;white-space:pre-wrap;word-break:break-word}
+.log .e{color:#FF6B66}.log .k{color:#3FB950}
+@media(max-width:1000px){.grid{grid-template-columns:1fr;grid-template-rows:none}.grid>*{grid-column:auto!important;grid-row:auto!important;min-height:240px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="top">
+<div style="display:flex;align-items:center;gap:12px">
+<svg width="36" height="36" viewBox="0 0 36 36" aria-hidden="true"><rect x="4" y="22" width="6" height="10" fill="#3FB950"/><rect x="14" y="14" width="6" height="18" fill="#3FB950"/><rect x="24" y="6" width="6" height="26" fill="#3FB950"/></svg>
+<div><div class="t1">RAATS – Live Trading Dashboard</div><div class="t2">Agentic AI for adaptive real-time trading</div></div></div>
+<div>Agent: <b id="agent" class="g">Ready</b></div>
+<div>Bal: <b id="bal">n/a</b></div>
+<div>Ret: <b id="ret">n/a</b> <span class="m" style="font-size:12px">today</span></div>
+<div>Profit: <b id="profit">n/a</b></div>
+<div class="m" style="margin-left:auto" id="clock"></div>
+</div>
+<div id="banner" role="status"></div>
+
+<div class="grid">
+<div style="grid-row:1 / span 3;display:flex;flex-direction:column;gap:14px;min-height:0">
+<div class="p"><div class="pb row" style="flex-direction:row"><button id="run" class="btn run" type="button">Run Live Agent</button><button id="stop" class="btn stop" type="button">Stop</button></div></div>
+<div class="p"><div class="ph">Select Graph</div><div class="pb">
+<div class="row"><select id="kind" aria-label="Graph type"><option value="balance">Balance curve</option><option value="daily">Daily P/L</option><option value="drawdown">Drawdown</option><option value="hist">R-multiple histogram</option><option value="session">Performance by session</option><option value="hour">Performance by hour</option></select>
+<input id="day" type="date" aria-label="Date"></div>
+<button id="gen" class="btn gen" type="button">Generate Graph</button></div></div>
+<div class="p" style="flex:1"><div class="ph">Performance Graph <span id="gtitle"></span></div>
+<img id="shot" alt="Selected performance graph"><div id="notice"><i>i</i><span id="notice-t"></span></div>
+<div id="gempty" class="m" style="padding:14px">Pick a graph and a date, then press Generate Graph.</div></div>
+</div>
+
+<div class="p gr"><div class="ph">Trades Open <span id="n-open">0</span></div><div class="pb"><div class="sc" tabindex="0" aria-label="Open trades"><table id="tbl-open"><thead><tr><th>Ticket</th><th>Symbol</th><th>Side</th><th>Volume</th><th>Entry</th><th>Current</th><th>SL</th><th>TP</th><th>Swap</th><th>Comm.</th><th>P/L ($)</th><th>Chg %</th><th>Opened</th><th class="act">Action</th></tr></thead><tbody id="t-open"></tbody></table></div></div></div>
+<div class="p gr"><div class="ph">Closed Positions <span id="n-closed">0</span></div><div class="pb"><div class="sc" tabindex="0" aria-label="Closed positions"><table><thead><tr><th>Ticker</th><th>Side</th><th>Entry</th><th>Exit</th><th>P/L</th><th>R</th></tr></thead><tbody id="t-closed"></tbody></table></div></div></div>
+<div class="p am"><div class="ph">Tickers Waiting for Open Positions <span id="n-waiting">0</span></div><div class="pb"><div class="sc" tabindex="0" aria-label="Waiting tickers"><table><thead><tr><th>Ticker</th><th>Reason</th><th>Since</th></tr></thead><tbody id="t-waiting"></tbody></table></div></div></div>
+<div style="display:flex;flex-direction:column;gap:14px;min-height:0">
+<div class="p rd" style="flex:1"><div class="ph">Blocked Positions <span id="n-blocked">0</span></div><div class="pb"><div class="sc" tabindex="0" aria-label="Blocked positions"><table><thead><tr><th>Ticker</th><th>Reason</th><th>Time</th></tr></thead><tbody id="t-blocked"></tbody></table></div></div></div>
+<button id="xls" class="btn xls" type="button">Generate Excel</button>
+</div>
+
+<div class="p" style="grid-column:2 / span 2"><div class="ph">Live Agent Console <label style="font-weight:400;font-size:12px"><input id="lock" type="checkbox" checked> Scroll lock</label></div><div class="pb"><div id="log" class="log" role="log" tabindex="0" aria-label="Live agent console"></div></div></div>
+</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const num = (v, d = 2) => (v === null || v === undefined) ? "" : Number(v).toFixed(d);
+const sign = v => (v === null || v === undefined) ? "" : (v >= 0 ? "g" : "r");
+const signed = (v, d = 2, suf = "") => (v === null || v === undefined) ? "" : (v >= 0 ? "+" : "") + Number(v).toFixed(d) + suf;
+
+function td(text, cls) { const c = document.createElement("td"); c.textContent = text ?? ""; if (cls) c.className = cls; return c; }
+function tag(side) { const c = document.createElement("td"); if (side) { const s = document.createElement("span"); s.className = "tag " + side; s.textContent = side; c.appendChild(s); } return c; }
+function fill(id, rows, build) {
+  const body = $(id); body.replaceChildren();
+  rows.forEach(r => { const tr = document.createElement("tr"); build(r).forEach(c => tr.appendChild(c)); body.appendChild(tr); });
+}
+const KIND_CLASS = { rejected: "r", failed: "a", noreply: "a", dailyloss: "a", system: "m" };
+
+async function poll() {
+  try {
+    const s = await (await fetch("/api/state")).json();
+    const st = s.agent.state;
+    $("agent").textContent = st === "running" ? "Running" : st === "stopping" ? "Stopping" : "Ready";
+    $("agent").className = st === "ready" ? "g" : st === "running" ? "" : "a";
+    $("run").disabled = st !== "ready"; $("stop").disabled = st === "ready";
+    $("stop").textContent = st === "stopping" ? "Force stop" : "Stop";
+    $("bal").textContent = s.account.balance == null ? "n/a" : "$" + num(s.account.balance);
+    $("ret").textContent = s.account.return_pct == null ? "n/a" : signed(s.account.return_pct, 2, "%");
+    $("ret").className = sign(s.account.return_pct);
+    const tp = s.account.total_profit;
+    $("profit").textContent = tp == null ? "n/a" : (tp >= 0 ? "+$" : "-$") + Math.abs(tp).toFixed(2);
+    $("profit").className = sign(tp);
+    $("clock").textContent = s.now;
+    const b = $("banner"); b.style.display = s.banner ? "block" : "none"; b.textContent = s.banner || "";
+    $("n-closed").textContent = s.closed.length;
+    $("n-waiting").textContent = s.waiting.length; $("n-blocked").textContent = s.blocked.length;
+    fill("t-closed", s.closed.slice().reverse(), r => [td(r.ticker), tag(r.side), td(num(r.entry)), td(num(r.exit)),
+      td(signed(r.pnl), sign(r.pnl)), td(signed(r.r, 1, "R"), sign(r.r))]);
+    fill("t-waiting", s.waiting, r => [td(r.ticker), td(r.reason), td(r.since)]);
+    fill("t-blocked", s.blocked, r => [td(r.ticker), td(r.reason, KIND_CLASS[r.kind] || "m"), td(r.time)]);
+  } catch (e) { $("agent").textContent = "Dashboard offline"; $("agent").className = "r"; }
+}
+
+const px = v => v == null ? "" : Number(v).toFixed(v >= 100 ? 2 : v >= 1 ? 4 : 5);
+const money = v => v == null ? "" : (v >= 0 ? "+$" : "-$") + Math.abs(v).toFixed(2);
+const pending = new Map();
+function actCell(r, live) {
+  const c = document.createElement("td"); c.className = "act";
+  const b = document.createElement("button"); b.className = "xbtn"; b.type = "button";
+  b.textContent = pending.has(r.ticket) ? "[ … ]" : "[ X ]";
+  b.setAttribute("aria-label", "Close ticket " + r.ticket);
+  b.disabled = !live || pending.has(r.ticket);
+  b.onclick = () => closePos(r);
+  c.appendChild(b); return c;
+}
+async function closePos(r) {
+  if (!confirm(`Close ${r.symbol} (ticket ${r.ticket}) at market?\nCurrent P/L: ${money(r.pnl)}\n\nThe running agent carries this out on its next pass.`)) return;
+  const j = await (await fetch("/api/position/close", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ticket: r.ticket }) })).json();
+  if (j.ok) pending.set(r.ticket, Date.now()); else alert(j.message);
+  pollPositions();
+}
+async function pollPositions() {
+  try {
+    const j = await (await fetch("/api/positions")).json();
+    const live = j.source === "MT5", seen = new Set(j.rows.map(r => r.ticket));
+    pending.forEach((t, k) => { if (!seen.has(k) || Date.now() - t > 120000) pending.delete(k); });
+    $("n-open").textContent = j.rows.length + (live ? "" : " (from log)");
+    fill("t-open", j.rows, r => [td(r.ticket), td(r.symbol), tag(r.side), td(num(r.volume)), td(px(r.entry)), td(px(r.current)),
+      td(px(r.sl)), td(px(r.tp)), td(num(r.swap)), td(num(r.commission)), td(money(r.pnl), sign(r.pnl)),
+      td(signed(r.pct, 2, "%"), sign(r.pct)), td((r.opened || "").replace("T", " ")), actCell(r, live)]);
+  } catch (e) { /* keep the last rows */ }
+}
+
+async function generate() {
+  const kind = $("kind").value, day = $("day").value;
+  $("gtitle").textContent = $("kind").selectedOptions[0].text + (day ? " · " + day : "");
+  $("gempty").style.display = "none";
+  const res = await fetch(`/api/graph?kind=${encodeURIComponent(kind)}&date=${encodeURIComponent(day)}`);
+  if ((res.headers.get("content-type") || "").startsWith("image/")) {
+    const url = URL.createObjectURL(await res.blob());
+    if ($("shot").dataset.url) URL.revokeObjectURL($("shot").dataset.url);
+    $("shot").src = url; $("shot").dataset.url = url;
+    $("shot").style.display = "block"; $("notice").style.display = "none";
+  } else {
+    const j = await res.json();
+    $("shot").style.display = "none"; $("notice").style.display = "flex"; $("notice-t").textContent = j.message || "No data.";
+  }
+}
+
+async function post(url) { const j = await (await fetch(url, { method: "POST" })).json(); poll(); return j; }
+$("run").onclick = () => post("/api/agent/start");
+$("stop").onclick = () => post("/api/agent/stop");
+$("gen").onclick = generate;
+$("xls").onclick = () => { window.location = "/api/excel?date=" + encodeURIComponent($("day").value); };
+
+const now = new Date(); $("day").value = new Date(now - now.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+const log = $("log");
+const es = new EventSource("/api/console");
+es.onmessage = ev => {
+  const d = document.createElement("div");
+  d.textContent = ev.data;
+  if (/error|traceback|failed/i.test(ev.data)) d.className = "e"; else if (/position opened|take_profit/i.test(ev.data)) d.className = "k";
+  log.appendChild(d);
+  while (log.childElementCount > 1500) log.firstChild.remove();
+  if ($("lock").checked) log.scrollTop = log.scrollHeight;
+};
+poll(); setInterval(poll, 3000); pollPositions(); setInterval(pollPositions, 2000); generate();
+</script>
+</body>
+</html>

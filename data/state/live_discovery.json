@@ -1,1 +1,1 @@
-{"date": "2026-11-20", "pool": []}
+{"date": "2026-11-23", "pool": [{"ticker": "VFC", "confidence": 0.65, "direction": "SHORT", "source": "batch5", "batch": 5, "ready": true, "approved": true, "created": 1795450561.2824924}, {"ticker": "OMC", "confidence": 0.65, "direction": "SHORT", "source": "batch5", "batch": 5, "ready": true, "approved": true, "created": 1795450561.2824924}]}

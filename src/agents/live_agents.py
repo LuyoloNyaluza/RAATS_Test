@@ -738,6 +738,23 @@ class MainAgent:
             intra = max(intra, 1.5 * (snap["ask"] - snap["bid"]))
         return float(intra), RISK_ATR_TIMEFRAME
 
+    def _sync_day(self, balance: Optional[float]) -> None:
+        """Once per day (and after a restart): fix the start-of-day balance from the broker's
+        realised P&L so the daily loss limit measures the net of today's closed trades."""
+        import time as _time
+        today = _time.strftime("%Y-%m-%d")
+        if balance is None or self.rm.day_key == today:
+            return
+        realized = None
+        if self.use_mt5:
+            try:
+                realized = mt5_orders.realized_pnl_today()
+            except Exception:
+                realized = None
+        if realized is None:
+            realized = self.rm.daily_pnl if self.rm.day_key is None else 0.0
+        self.rm.sync_day(today, balance - realized, realized)
+
     def _mt5_view(self, tickers: List[str]) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
         if not self.use_mt5:
@@ -970,11 +987,18 @@ class MainAgent:
                                     else self._portfolio_value())
         if balance is None:                    # MT5 mode and the balance cannot be read
             return self._defer(cand, "the MT5 balance cannot be read; no proposal made"), None
+        self._sync_day(balance)
         approved, units, d, reason = self.rm.validate_trade(
             ticker=t, signal="INVEST", current_price=price,
             portfolio_value=balance, atr=risk_atr, m_norm=m_norm, is_top_five=False,
         )
         if not approved:
+            if reason.startswith("Daily loss limit reached") and not self.rm.loss_limit_reported:
+                self.rm.loss_limit_reported = True
+                self._event({"type": "daily_loss_limit_reached", "net_pnl": round(self.rm.daily_pnl, 2),
+                             "day_start_balance": self.rm.day_start_balance,
+                             "limit_pct": self.rm.max_daily_loss_pct})
+                self._alert("Daily loss limit reached: no new positions today; open positions are kept")
             return self._drop(t, f"risk manager: {reason}"), None
         direction = "LONG" if d == 1 else "SHORT"
 
@@ -1170,6 +1194,9 @@ class MainAgent:
         if cand.approval != "APPROVE":
             self._event({"type": "execution_refused", "ticker": t, "approval": cand.approval})
             return self._drop(t, f"no trade approval ({cand.approval or 'none'}); not executed")
+        if not self.rm.can_trade_today(mt5_orders.account_balance() if self.use_mt5 else None):
+            # the limit was reached after this trade was proposed; open positions stay as they are
+            return self._drop(t, "risk manager: Daily loss limit reached since this trade was approved; not executed")
         symbol, snap, lots = ctx["symbol"], ctx["snap"], ctx["lots"]
         direction, d, ref = ctx["direction"], ctx["d"], ctx["ref"]
         sl, tp, traded_units = ctx["sl"], ctx["tp"], ctx["units"]
