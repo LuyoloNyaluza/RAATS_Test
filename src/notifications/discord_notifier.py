@@ -35,7 +35,7 @@ import json
 import os
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
@@ -48,9 +48,11 @@ load_dotenv()
 API_BASE = "https://discord.com/api/v10"
 CHUNK_LIMIT = 1900                      # Discord's hard limit is 2000 characters
 
-EMOJI = {"APPROVE": "\u2705", "REJECT": "\u274c", "MODIFY": "\U0001F4DD"}   # ✅ ❌ 📝
-DISPLAY_ORDER = ("APPROVE", "REJECT", "MODIFY")
-CHECK_ORDER = ("REJECT", "MODIFY", "APPROVE")        # safest outcome checked first
+EMOJI = {"APPROVE": "\u2705", "REJECT": "\u274c", "MODIFY": "\U0001F4DD",
+         "REFRESH": "\U0001F504"}                   # ✅ ❌ 📝 🔄
+DISPLAY_ORDER = ("APPROVE", "REJECT", "MODIFY", "REFRESH")
+CHECK_ORDER = ("REJECT", "MODIFY", "REFRESH", "APPROVE")   # safest outcome checked first; REFRESH
+                                                          # = "do not decide yet, re-run the analysis"
 VALID_RESPONSES = set(DISPLAY_ORDER)
 
 
@@ -72,6 +74,7 @@ class ApprovalRequest:
     log_file: Optional[str] = None
     kind: str = "batch"                          # "batch" (FinalInvestPool) | "trade" (one MT5 trade)
     proposal: Optional[Dict[str, Any]] = None    # the trade proposal when kind == "trade"
+    analysis: Dict[str, Any] = field(default_factory=dict)   # batch: {ticker: {direction, confidence, was}}
 
 
 class DiscordAPIError(RuntimeError):
@@ -247,10 +250,15 @@ class DiscordNotifier:
             ("Entry price", self._num(p.get("entry"), "{:,.4f}", prefix="$")),
             ("Stop Loss", self._num(p.get("stop_loss"), "{:,.4f}", prefix="$")),
             ("Take Profit", self._num(p.get("take_profit"), "{:,.4f}", prefix="$")),
+            ("Stop gap", self._num(p.get("stop_gap_pct"), "{:.2f}", suffix="% of entry")
+             + (" (capped)" if p.get("stop_capped") else "")),
             ("Risk amount", self._num(p.get("risk_amount"), prefix="$")
              + (f" ({float(p['risk_pct']):.1f}% of balance)" if p.get("risk_pct") is not None else "")),
             ("Risk-to-Reward", str(p.get("risk_reward") or "N/A")),
         ]
+        if p.get("analysis_direction"):
+            flipped = p.get("direction_changed")
+            rows.append(("Analysis said", str(p["analysis_direction"]) + ("  -> CHANGED" if flipped else "  (unchanged)")))
         width = max(len(k) for k, _ in rows)
         table = "\n".join(f"{k.ljust(width)}  {v}" for k, v in rows)
         symbol = p.get("mt5_symbol")
@@ -272,6 +280,22 @@ class DiscordNotifier:
             "_Approving this trade starts the entry timer; the order is sent to MT5 only after it._",
         ])
 
+    @staticmethod
+    def _analysis_text(a: Any) -> str:
+        """' \u2014 SELL \u2193 conf 0.70' (+ ' \u26a0\ufe0f was BUY' when a refresh flipped it)."""
+        if not isinstance(a, Mapping) or not a.get("direction"):
+            return ""
+        short = str(a["direction"]).upper() in ("SHORT", "SELL")
+        text = f" \u2014 {'SELL \u2193' if short else 'BUY \u2191'}"
+        if a.get("confidence") is not None:
+            try:
+                text += f" conf {float(a['confidence']):.2f}"
+            except (TypeError, ValueError):
+                pass
+        if a.get("was") and str(a["was"]).upper() != str(a["direction"]).upper():
+            text += f" \u26a0\ufe0f direction changed (was {'SELL' if str(a['was']).upper() in ('SHORT', 'SELL') else 'BUY'})"
+        return text
+
     def _format_request(self, req: ApprovalRequest) -> str:
         if req.kind == "trade":
             return self._format_trade_request(req)
@@ -282,11 +306,14 @@ class DiscordNotifier:
             info = req.mt5_data.get(t) if isinstance(req.mt5_data, Mapping) else None
             if isinstance(info, Mapping):
                 mark = EMOJI["APPROVE"] if info.get("tradable") else EMOJI["REJECT"]
-                lines.append(f"  {mark} {t} \u2192 {info.get('mt5_symbol') or 'N/A'} (spread: {info.get('spread_pct', 'N/A')}%)")
+                line = f"  {mark} {t} \u2192 {info.get('mt5_symbol') or 'N/A'} (spread: {info.get('spread_pct', 'N/A')}%)"
             else:
-                lines.append(f"  \u2022 {t}")
+                line = f"  \u2022 {t}"
+            lines.append(line + self._analysis_text(req.analysis.get(t) if req.analysis else None))
         # no balance and no shortfall here: the Main Agent checks the balance after the pool
         keys = " \u00b7 ".join(f"{EMOJI[o]} {o.lower()}" for o in req.options if o in EMOJI)
+        if req.options and "REFRESH" in req.options:
+            lines.append("_\U0001F504 refresh = re-run the analysis on current prices and ask again._")
         lines.append(f"React within {self.timeout_minutes:g} min: {keys}")
         return "\n".join(lines)
 
@@ -299,6 +326,7 @@ class DiscordNotifier:
         request_id: Optional[str] = None,
         kind: str = "batch",
         proposal: Optional[Mapping[str, Any]] = None,
+        analysis: Optional[Mapping[str, Any]] = None,
     ) -> ApprovalRequest:
         now = datetime.now(timezone.utc)
         req = ApprovalRequest(
@@ -310,6 +338,7 @@ class DiscordNotifier:
             options=list(options or DISPLAY_ORDER),
             kind=kind,
             proposal=dict(proposal) if proposal else None,
+            analysis=dict(analysis or {}),
             expires_at=(now + timedelta(minutes=self.timeout_minutes)).isoformat(),
         )
         req.log_file = str(self._weekly_log_path())
@@ -335,12 +364,13 @@ class DiscordNotifier:
         """The SECOND approval (live_agents.py): one trade, APPROVE or REJECT only.
 
         Approval of a batch (send_approval_request) never authorises an order; only this one does.
-        MODIFY is not offered: anything but APPROVE means the trade is not executed.
+        MODIFY is not offered. REFRESH re-runs the proposal on current prices and asks again; anything
+        but APPROVE means the trade is not executed.
         """
         return self.send_approval_request(
             final_invest=[str(proposal.get("ticker", ""))],
             account_balance=proposal.get("balance"),
-            options=["APPROVE", "REJECT"],
+            options=["APPROVE", "REJECT", "REFRESH"],
             kind="trade",
             proposal=proposal,
         )

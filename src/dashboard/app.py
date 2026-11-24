@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import threading
 import time
 from datetime import date as Date, datetime, timedelta
 from pathlib import Path
@@ -42,49 +44,98 @@ def _day(text: Optional[str]) -> Date:
         return Date.today()
 
 
+# ---------------------------------------------------------------- MT5 cache
+# Every MT5 call runs in ONE background thread; the web endpoints only read the cache. Before, each
+# request called MT5 itself (the whole deal history every 10 s, positions every 2 s, from many
+# threads at once), so one slow call stacked up the others and the page hung and went "offline".
+MT5_ON = os.environ.get("RAATS_DASH_MT5", "1") != "0"
+INCLUDE_FLOATING = os.environ.get("RAATS_DASH_INCLUDE_FLOATING", "1") != "0"
+STALE_SEC = 20.0
+
+
+class _Mt5Cache:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.d: Dict[str, Any] = {}          # name -> (time, value)
+        self.started = False
+
+    def get(self, name: str, max_age: float = STALE_SEC) -> Any:
+        with self.lock:
+            at, val = self.d.get(name, (0.0, None))
+        return val if time.time() - at <= max_age else None
+
+    def _put(self, name: str, val: Any) -> None:
+        if val is not None:                  # keep the last good value on a failed read
+            with self.lock:
+                self.d[name] = (time.time(), val)
+
+    def _loop(self) -> None:
+        from src.data import mt5_orders
+        last_realized = last_total = 0.0
+        while True:
+            try:
+                if mt5_orders.live_enabled():
+                    self._put("positions", mt5_orders.positions_detail())
+                    self._put("account", mt5_orders.account_snapshot())
+                    if time.time() - last_realized > 10:
+                        last_realized = time.time()
+                        self._put("realized", mt5_orders.realized_pnl_today())
+                    if time.time() - last_total > 60:
+                        last_total = time.time()
+                        self._put("total", mt5_orders.overall_profit())
+            except Exception:
+                pass
+            time.sleep(2.0)
+
+    def start(self) -> None:
+        if self.started or not MT5_ON:
+            return
+        self.started = True
+        threading.Thread(target=self._loop, name="raats-dash-mt5", daemon=True).start()
+
+
+MT5 = _Mt5Cache()
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    MT5.start()
+
+
+def _clean(o: Any) -> Any:
+    """NaN / inf are not valid JSON: one bad number used to turn a whole response into a 500."""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_clean(v) for v in o]
+    return o
+
+
 # ---------------------------------------------------------------- account (balance / return)
-_acct: Dict[str, Any] = {"at": 0.0, "val": {}}
-
-
-def _overall_profit() -> Optional[float]:
-    """Overall profit exactly as the MT5 History tab summary shows it ("Profit: x"): the sum of
-    profit + commission + swap + fee over every deal in the account history, leaving out deposits,
-    withdrawals (BALANCE deals) and CREDIT. So Balance = Deposit - Withdrawal + Profit."""
-    import MetaTrader5 as mt5
-    if mt5.account_info() is None and not mt5.initialize():
-        return None
-    deals = mt5.history_deals_get(datetime(2000, 1, 1), datetime.now() + timedelta(days=2))
-    if deals is None:
-        return None
-    skip = {mt5.DEAL_TYPE_BALANCE, mt5.DEAL_TYPE_CREDIT}
-    total = sum(d.profit + d.commission + d.swap + getattr(d, "fee", 0.0) for d in deals if d.type not in skip)
-    return round(total, 2)
-
-
 def _account(day_closed_pnl: float) -> Dict[str, Any]:
-    """Balance from MT5 when available (cached 10 s); the return is today's realised P/L over the
-    start-of-day balance. RAATS_DASH_MT5=0 turns the MT5 lookup off."""
-    if time.time() - _acct["at"] < 10:
-        return _acct["val"]
-    val: Dict[str, Any] = {"balance": None, "start_balance": None, "return_pct": None, "total_profit": None, "source": "log"}
-    if os.environ.get("RAATS_DASH_MT5", "1") != "0":
-        try:
-            from src.data import mt5_orders
-            if mt5_orders.live_enabled():
-                bal = mt5_orders.account_balance()
-                realized = mt5_orders.realized_pnl_today()
-                if bal is not None:
-                    realized = day_closed_pnl if realized is None else realized
-                    start = bal - realized
-                    val = {"balance": round(bal, 2), "start_balance": round(start, 2), "source": "MT5",
-                           "return_pct": round(realized / start * 100, 2) if start else None}
-                    try:
-                        val["total_profit"] = _overall_profit()
-                    except Exception:
-                        val["total_profit"] = None
-        except Exception:
-            pass
-    _acct.update(at=time.time(), val=val)
+    """Balance, return and profit from the MT5 cache.
+
+    MT5's balance only changes when a position CLOSES, so Bal / Ret / Profit used to stand still while
+    trades ran. By default they now include the floating P/L of open positions (Bal shows equity);
+    RAATS_DASH_INCLUDE_FLOATING=0 restores the closed-only figures.
+    Ret = (realised today + floating) / start-of-day balance."""
+    val: Dict[str, Any] = {"balance": None, "start_balance": None, "return_pct": None,
+                           "total_profit": None, "floating": None, "source": "log"}
+    snap = MT5.get("account")
+    if snap is None:
+        return val
+    bal, equity, floating = snap["balance"], snap["equity"], snap["floating"]
+    realized = MT5.get("realized", 120.0)
+    realized = day_closed_pnl if realized is None else realized
+    start = bal - realized
+    fl = floating if INCLUDE_FLOATING else 0.0
+    total = MT5.get("total", 300.0)
+    val.update(balance=round(equity if INCLUDE_FLOATING else bal, 2), start_balance=round(start, 2),
+               return_pct=round((realized + fl) / start * 100, 2) if start else None,
+               total_profit=round(total + fl, 2) if total is not None else None,
+               floating=round(floating, 2), closed_balance=round(bal, 2), source="MT5")
     return val
 
 
@@ -99,17 +150,10 @@ def _panels(day: Date) -> Dict[str, Any]:
 
 
 def _open_rows(fallback):
-    """Open positions as MT5 shows them (live). Falls back to the log rows when MT5 cannot be read."""
-    if os.environ.get("RAATS_DASH_MT5", "1") != "0":
-        try:
-            from src.data import mt5_orders
-            positions_detail = getattr(mt5_orders, "positions_detail", None)
-            if positions_detail is not None:
-                rows = positions_detail()
-                if rows is not None:
-                    return rows, "MT5"
-        except Exception:
-            pass
+    """Open positions as MT5 shows them (from the cache). Falls back to the log rows when MT5 cannot be read."""
+    rows = MT5.get("positions")
+    if rows is not None:
+        return rows, "MT5"
     return fallback, "log"
 
 
@@ -117,7 +161,7 @@ def _open_rows(fallback):
 def positions():
     rows, source = _open_rows(events.build_trades(events.load_events(
         Date.today() - timedelta(days=events.STALE_OPEN_DAYS + 1), Date.today()))[0])
-    return {"rows": rows, "source": source, "agent_running": RUNNER.running()}
+    return _clean({"rows": rows, "source": source, "agent_running": RUNNER.running()})
 
 
 @app.post("/api/position/close")
@@ -154,8 +198,8 @@ def state(date: Optional[str] = None):
     if day == Date.today():
         p["open"], _ = _open_rows(p["open"])
     pnl = sum(c["pnl"] for c in p["closed"] if c["pnl"] is not None)
-    return {**p, "agent": RUNNER.status(), "account": _account(pnl), "day": day.isoformat(),
-            "now": datetime.now().strftime("%b %d, %Y  %H:%M:%S")}
+    return _clean({**p, "agent": RUNNER.status(), "account": _account(pnl), "day": day.isoformat(),
+                   "now": datetime.now().strftime("%b %d, %Y  %H:%M:%S")})
 
 
 @app.get("/api/graph")

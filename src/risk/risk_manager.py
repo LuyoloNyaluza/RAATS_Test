@@ -119,6 +119,7 @@ class RiskManager:
         gradient_f_min: float = 0.75,
         gradient_f_max: float = 2.0,
         widen_with_trend: bool = True,
+        max_sl_pct: Optional[float] = None,
     ):
         self.atr_multiplier = atr_multiplier
         self.rrr = rrr
@@ -129,6 +130,22 @@ class RiskManager:
         _env = _os.environ.get("RAATS_MAX_DAILY_LOSS_PCT")
         self.max_daily_loss_pct = float(_env) if _env else max_daily_loss_pct
 
+        # Tighter stops. The stop distance (= 1R) never exceeds max_sl_pct % of the entry price
+        # (RAATS_MAX_SL_PCT, default 1.0; 0 = no cap), and the trend-widening factor is capped at
+        # RAATS_GRADIENT_F_MAX (unset = the original 2.0). Every path that sizes a stop goes
+        # through compute_risk_unit, so the order, the ladder and the TP all use the same 1R.
+        if max_sl_pct is None:
+            try:
+                max_sl_pct = float(_os.environ.get("RAATS_MAX_SL_PCT", "1.0"))
+            except ValueError:
+                max_sl_pct = 1.0
+        self.max_sl_pct = max(float(max_sl_pct), 0.0)
+        _fmax = _os.environ.get("RAATS_GRADIENT_F_MAX")
+        if _fmax:
+            try:
+                gradient_f_max = float(_fmax)
+            except ValueError:
+                pass
         self.gradient_lookback = gradient_lookback
         self.gradient_deadband = gradient_deadband
         self.gradient_k = gradient_k
@@ -148,12 +165,16 @@ class RiskManager:
         m_norm = normalize_gradient(m, self.gradient_lookback, atr)
         return m, m_norm
 
-    def compute_risk_unit(self, atr: float, m_norm: float) -> Tuple[float, float]:
+    def compute_risk_unit(self, atr: float, m_norm: float,
+                          price: Optional[float] = None) -> Tuple[float, float]:
         gf = gradient_factor(
             m_norm, k=self.gradient_k, f_min=self.gradient_f_min,
             f_max=self.gradient_f_max, widen_with_trend=self.widen_with_trend,
         )
-        return atr * self.atr_multiplier * gf, gf
+        unit = atr * self.atr_multiplier * gf
+        if price and price > 0 and self.max_sl_pct > 0:
+            unit = min(unit, price * self.max_sl_pct / 100.0)
+        return unit, gf
 
     def resolve_direction(self, m_norm: float, signal: str) -> Tuple[int, str]:
         """LLM = invest/hold filter (signal is "INVEST" or "HOLD").
@@ -271,7 +292,7 @@ class RiskManager:
         self, ticker: str, direction: int, entry_price: float, size: float,
         atr: float, m: float = 0.0, m_norm: float = 0.0,
     ) -> Position:
-        risk_unit, gf = self.compute_risk_unit(atr, m_norm)
+        risk_unit, gf = self.compute_risk_unit(atr, m_norm, entry_price)
         stop_loss, take_profit = self.compute_initial_levels(entry_price, direction, risk_unit)
 
         position = Position(

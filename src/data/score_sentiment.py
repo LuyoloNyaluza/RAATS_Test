@@ -1,4 +1,5 @@
 import json
+import re
 import logging
 import os
 from typing import Dict, Any, List, Optional
@@ -64,8 +65,17 @@ JSON:"""
 SENTIMENT_PROMPT = SENTIMENT_INSTRUCTIONS + SENTIMENT_ARTICLE
 
 
+_THINK = re.compile(r"<think>.*?(?:</think>|$)", re.S | re.I)
+
+
+def _strip_think(text: str) -> str:
+    """Reasoning models (e.g. Qwen-Open-Finance-R) write <think>...</think> before the answer; the
+    thinking can contain braces and break the JSON search below."""
+    return _THINK.sub("", text or "").strip()
+
+
 def _safe_parse_json(raw_text: str) -> Dict[str, Any]:
-    text = raw_text.strip()
+    text = _strip_think(raw_text)
 
     try:
         return json.loads(text)

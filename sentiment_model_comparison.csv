@@ -1,73 +1,109 @@
 model,ticker,headline,expected,got,confidence,hard
-phi3:mini-128k,HD,Home Depot lifts annual sales outlook,positive,positive,0.95,0
-phi3:mini-128k,TGT,"Target posts weaker holiday sales, trims forecast",negative,negative,0.95,0
-phi3:mini-128k,CAT,Caterpillar to publish results on Thursday,neutral,neutral,0.50,0
-phi3:mini-128k,QCOM,Qualcomm signs multi-year chip supply deal with Samsung,positive,positive,0.95,0
-phi3:mini-128k,NKE,Nike to open new store in Madrid,neutral,neutral,0.50,1
-phi3:mini-128k,INTC,AMD wins server contract from a major cloud provider,negative,negative,0.95,1
-phi3:mini-128k,BAC,Bank of America names new head of consumer lending,neutral,neutral,0.50,1
-phi3:mini-128k,UAL,United Airlines fuel costs fall 12%,positive,positive,0.95,0
-phi3:mini-128k,PFE,Pfizer trial fails to meet primary endpoint,negative,negative,0.95,0
-phi3:mini-128k,MRK,Merck raises $2 billion in new share offering,negative,neutral,0.70,1
-phi3:mini-128k,LOW,Lowe's earnings beat estimates but guidance falls short,negative,negative,0.70,1
-phi3:mini-128k,COST,Costco comparable sales rise 8%,positive,positive,0.95,0
-phi3:mini-128k,V,Visa and Mastercard both report steady volumes,neutral,neutral,0.95,1
-phi3:mini-128k,AMAT,Applied Materials loss narrower than analysts feared,positive,positive,0.95,1
-phi3:mini-128k,GE,GE Aerospace wins engine order after rival's grounding,positive,positive,0.95,1
-phi3:mini-128k,DAL,Delta schedules investor day for next month,neutral,neutral,0.50,0
-phi3:mini-128k,BABA,Alibaba faces new antitrust probe,negative,negative,0.95,0
-phi3:mini-128k,SPOT,Spotify user growth exceeds forecasts,positive,positive,0.95,0
-phi3:mini-128k,MCD,McDonald's completes scheduled bond repayment,neutral,neutral,0.70,1
-phi3:mini-128k,RIVN,Rivian halts production at main plant after fire,negative,negative,0.95,0
-phi3:mini-128k,ADBE,Adobe stock steady after analyst reiterates rating,neutral,neutral,0.50,0
-phi3:mini-128k,ZM,Zoom revenue did not decline as feared,positive,positive,0.95,1
-phi3:mini-128k,NOK,Ericsson wins deal that Nokia had bid for,negative,negative,0.95,1
-phi3:mini-128k,LLY,Eli Lilly obesity drug approved in Europe,positive,positive,0.95,0
-qwen2.5:3b,HD,Home Depot lifts annual sales outlook,positive,positive,0.85,0
-qwen2.5:3b,TGT,"Target posts weaker holiday sales, trims forecast",negative,negative,0.90,0
-qwen2.5:3b,CAT,Caterpillar to publish results on Thursday,neutral,neutral,0.80,0
-qwen2.5:3b,QCOM,Qualcomm signs multi-year chip supply deal with Samsung,positive,positive,0.90,0
-qwen2.5:3b,NKE,Nike to open new store in Madrid,neutral,neutral,0.70,1
-qwen2.5:3b,INTC,AMD wins server contract from a major cloud provider,negative,neutral,0.50,1
-qwen2.5:3b,BAC,Bank of America names new head of consumer lending,neutral,neutral,0.60,1
-qwen2.5:3b,UAL,United Airlines fuel costs fall 12%,positive,positive,0.90,0
-qwen2.5:3b,PFE,Pfizer trial fails to meet primary endpoint,negative,negative,0.90,0
-qwen2.5:3b,MRK,Merck raises $2 billion in new share offering,negative,neutral,0.60,1
-qwen2.5:3b,LOW,Lowe's earnings beat estimates but guidance falls short,negative,neutral,0.60,1
-qwen2.5:3b,COST,Costco comparable sales rise 8%,positive,positive,0.80,0
-qwen2.5:3b,V,Visa and Mastercard both report steady volumes,neutral,neutral,0.80,1
-qwen2.5:3b,AMAT,Applied Materials loss narrower than analysts feared,positive,positive,0.80,1
-qwen2.5:3b,GE,GE Aerospace wins engine order after rival's grounding,positive,positive,0.90,1
-qwen2.5:3b,DAL,Delta schedules investor day for next month,neutral,neutral,0.80,0
-qwen2.5:3b,BABA,Alibaba faces new antitrust probe,negative,negative,0.80,0
-qwen2.5:3b,SPOT,Spotify user growth exceeds forecasts,positive,positive,0.80,0
-qwen2.5:3b,MCD,McDonald's completes scheduled bond repayment,neutral,neutral,0.80,1
-qwen2.5:3b,RIVN,Rivian halts production at main plant after fire,negative,negative,0.90,0
-qwen2.5:3b,ADBE,Adobe stock steady after analyst reiterates rating,neutral,neutral,0.80,0
-qwen2.5:3b,ZM,Zoom revenue did not decline as feared,positive,positive,0.80,1
-qwen2.5:3b,NOK,Ericsson wins deal that Nokia had bid for,negative,negative,0.90,1
-qwen2.5:3b,LLY,Eli Lilly obesity drug approved in Europe,positive,positive,0.90,0
-gemma3:4b,HD,Home Depot lifts annual sales outlook,positive,positive,0.85,0
-gemma3:4b,TGT,"Target posts weaker holiday sales, trims forecast",negative,negative,0.85,0
-gemma3:4b,CAT,Caterpillar to publish results on Thursday,neutral,neutral,0.80,0
-gemma3:4b,QCOM,Qualcomm signs multi-year chip supply deal with Samsung,positive,positive,0.85,0
-gemma3:4b,NKE,Nike to open new store in Madrid,neutral,neutral,0.70,1
-gemma3:4b,INTC,AMD wins server contract from a major cloud provider,negative,negative,0.80,1
-gemma3:4b,BAC,Bank of America names new head of consumer lending,neutral,neutral,0.60,1
-gemma3:4b,UAL,United Airlines fuel costs fall 12%,positive,positive,0.95,0
-gemma3:4b,PFE,Pfizer trial fails to meet primary endpoint,negative,negative,0.85,0
-gemma3:4b,MRK,Merck raises $2 billion in new share offering,negative,neutral,0.70,1
-gemma3:4b,LOW,Lowe's earnings beat estimates but guidance falls short,negative,negative,0.80,1
-gemma3:4b,COST,Costco comparable sales rise 8%,positive,positive,0.95,0
-gemma3:4b,V,Visa and Mastercard both report steady volumes,neutral,neutral,0.80,1
-gemma3:4b,AMAT,Applied Materials loss narrower than analysts feared,positive,positive,0.85,1
-gemma3:4b,GE,GE Aerospace wins engine order after rival's grounding,positive,positive,0.85,1
-gemma3:4b,DAL,Delta schedules investor day for next month,neutral,neutral,0.80,0
-gemma3:4b,BABA,Alibaba faces new antitrust probe,negative,negative,0.80,0
-gemma3:4b,SPOT,Spotify user growth exceeds forecasts,positive,positive,0.95,0
-gemma3:4b,MCD,McDonald's completes scheduled bond repayment,neutral,neutral,0.80,1
-gemma3:4b,RIVN,Rivian halts production at main plant after fire,negative,negative,0.85,0
-gemma3:4b,ADBE,Adobe stock steady after analyst reiterates rating,neutral,neutral,0.80,0
-gemma3:4b,ZM,Zoom revenue did not decline as feared,positive,positive,0.85,1
-gemma3:4b,NOK,Ericsson wins deal that Nokia had bid for,negative,negative,0.85,1
-gemma3:4b,LLY,Eli Lilly obesity drug approved in Europe,positive,positive,0.85,0
+phi3:mini-128k,AAPL,Apple reports record quarterly revenue,positive,positive,0.95,0
+phi3:mini-128k,AAPL,Apple faces new App Store restrictions,negative,negative,0.95,0
+phi3:mini-128k,MSFT,Microsoft shares trade steadily ahead of earnings,neutral,neutral,0.50,0
+phi3:mini-128k,NVDA,NVIDIA data centre revenue beats estimates,positive,positive,0.95,0
+phi3:mini-128k,NVDA,NVIDIA warns export limits will cut chip sales,negative,negative,0.95,0
+phi3:mini-128k,TSLA,"Tesla recalls 400,000 vehicles over braking fault",negative,negative,0.95,0
+phi3:mini-128k,AMZN,Amazon raises full-year profit forecast,positive,positive,0.95,0
+phi3:mini-128k,META,Meta to hold annual shareholder meeting on June 4,neutral,neutral,0.70,0
+phi3:mini-128k,JPM,JPMorgan profit jumps 18% on trading gains,positive,positive,0.95,0
+phi3:mini-128k,XOM,Exxon cuts dividend after weak oil prices,negative,negative,0.95,0
+phi3:mini-128k,KO,Coca-Cola names new regional marketing head,neutral,neutral,0.50,0
+phi3:mini-128k,DIS,Disney streaming subscribers surge past forecasts,positive,positive,0.95,0
+phi3:mini-128k,CSCO,Cisco beats earnings but cuts next-quarter outlook,negative,negative,0.95,1
+phi3:mini-128k,AMD,Intel loses major data-centre customer to AMD,positive,positive,0.95,1
+phi3:mini-128k,F,Ford's quarterly loss is narrower than feared,positive,positive,0.75,1
+phi3:mini-128k,MSFT,Analyst downgrades NVIDIA on valuation,neutral,neutral,0.50,1
+phi3:mini-128k,PFE,Pfizer drug did not miss its main trial goal,positive,positive,0.95,1
+phi3:mini-128k,BA,Boeing delivers fewer planes than expected,negative,negative,0.95,1
+phi3:mini-128k,INTC,"Intel announces new foundry partnership, no financial terms",neutral,neutral,0.50,1
+phi3:mini-128k,UBER,Uber stock jumps despite a wider loss,positive,positive,0.95,1
+phi3:mini-128k,NFLX,Netflix raises prices; subscriber growth slows,neutral,neutral,0.70,1
+phi3:mini-128k,GM,GM recalls trucks; rival Ford shares rise,negative,negative,0.95,1
+phi3:mini-128k,WMT,"Walmart not expected to lose market share, says analyst",neutral,neutral,0.70,1
+phi3:mini-128k,COIN,Coinbase trading volume plunges 40%,negative,negative,0.95,1
+phi3:mini-128k,SBUX,Starbucks CEO steps down after strong year,neutral,neutral,0.50,1
+phi3:mini-128k,AMD,AMD says supply is sold out for the quarter,positive,negative,0.75,1
+phi3:mini-128k,TSLA,Tesla delivers record vehicles but price cuts squeeze margins,negative,negative,0.95,1
+phi3:mini-128k,AAPL,Apple to hold product event next Tuesday,neutral,neutral,0.50,1
+phi3:mini-128k,PLTR,Palantir wins $480 million Army contract,positive,positive,0.95,1
+phi3:mini-128k,LCID,Lucid plans to raise $1 billion by selling new shares,negative,negative,0.90,1
+phi3:mini-128k,GOOGL,Alphabet ad revenue grows 15%,positive,positive,0.95,0
+phi3:mini-128k,PYPL,PayPal hit by data breach affecting millions,negative,negative,0.95,0
+phi3:mini-128k,PEP,PepsiCo to webcast its earnings call,neutral,neutral,0.50,0
+phi3:mini-128k,CRM,Salesforce wins landmark government deal,positive,positive,0.95,0
+phi3:mini-128k,SNAP,Snap shares plunge after missing user targets,negative,negative,0.95,0
+phi3:mini-128k,ORCL,Oracle completes routine debt refinancing,neutral,neutral,0.70,0
+Melioda96/Qwen-Open-Finance-R-8B,AAPL,Apple reports record quarterly revenue,positive,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,AAPL,Apple faces new App Store restrictions,negative,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,MSFT,Microsoft shares trade steadily ahead of earnings,neutral,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,NVDA,NVIDIA data centre revenue beats estimates,positive,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,NVDA,NVIDIA warns export limits will cut chip sales,negative,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,TSLA,"Tesla recalls 400,000 vehicles over braking fault",negative,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,AMZN,Amazon raises full-year profit forecast,positive,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,META,Meta to hold annual shareholder meeting on June 4,neutral,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,JPM,JPMorgan profit jumps 18% on trading gains,positive,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,XOM,Exxon cuts dividend after weak oil prices,negative,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,KO,Coca-Cola names new regional marketing head,neutral,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,DIS,Disney streaming subscribers surge past forecasts,positive,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,CSCO,Cisco beats earnings but cuts next-quarter outlook,negative,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,AMD,Intel loses major data-centre customer to AMD,positive,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,F,Ford's quarterly loss is narrower than feared,positive,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,MSFT,Analyst downgrades NVIDIA on valuation,neutral,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,PFE,Pfizer drug did not miss its main trial goal,positive,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,BA,Boeing delivers fewer planes than expected,negative,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,INTC,"Intel announces new foundry partnership, no financial terms",neutral,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,UBER,Uber stock jumps despite a wider loss,positive,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,NFLX,Netflix raises prices; subscriber growth slows,neutral,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,GM,GM recalls trucks; rival Ford shares rise,negative,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,WMT,"Walmart not expected to lose market share, says analyst",neutral,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,COIN,Coinbase trading volume plunges 40%,negative,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,SBUX,Starbucks CEO steps down after strong year,neutral,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,AMD,AMD says supply is sold out for the quarter,positive,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,TSLA,Tesla delivers record vehicles but price cuts squeeze margins,negative,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,AAPL,Apple to hold product event next Tuesday,neutral,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,PLTR,Palantir wins $480 million Army contract,positive,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,LCID,Lucid plans to raise $1 billion by selling new shares,negative,neutral,0.00,1
+Melioda96/Qwen-Open-Finance-R-8B,GOOGL,Alphabet ad revenue grows 15%,positive,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,PYPL,PayPal hit by data breach affecting millions,negative,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,PEP,PepsiCo to webcast its earnings call,neutral,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,CRM,Salesforce wins landmark government deal,positive,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,SNAP,Snap shares plunge after missing user targets,negative,neutral,0.00,0
+Melioda96/Qwen-Open-Finance-R-8B,ORCL,Oracle completes routine debt refinancing,neutral,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,AAPL,Apple reports record quarterly revenue,positive,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,AAPL,Apple faces new App Store restrictions,negative,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,MSFT,Microsoft shares trade steadily ahead of earnings,neutral,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,NVDA,NVIDIA data centre revenue beats estimates,positive,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,NVDA,NVIDIA warns export limits will cut chip sales,negative,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,TSLA,"Tesla recalls 400,000 vehicles over braking fault",negative,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,AMZN,Amazon raises full-year profit forecast,positive,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,META,Meta to hold annual shareholder meeting on June 4,neutral,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,JPM,JPMorgan profit jumps 18% on trading gains,positive,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,XOM,Exxon cuts dividend after weak oil prices,negative,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,KO,Coca-Cola names new regional marketing head,neutral,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,DIS,Disney streaming subscribers surge past forecasts,positive,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,CSCO,Cisco beats earnings but cuts next-quarter outlook,negative,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,AMD,Intel loses major data-centre customer to AMD,positive,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,F,Ford's quarterly loss is narrower than feared,positive,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,MSFT,Analyst downgrades NVIDIA on valuation,neutral,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,PFE,Pfizer drug did not miss its main trial goal,positive,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,BA,Boeing delivers fewer planes than expected,negative,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,INTC,"Intel announces new foundry partnership, no financial terms",neutral,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,UBER,Uber stock jumps despite a wider loss,positive,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,NFLX,Netflix raises prices; subscriber growth slows,neutral,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,GM,GM recalls trucks; rival Ford shares rise,negative,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,WMT,"Walmart not expected to lose market share, says analyst",neutral,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,COIN,Coinbase trading volume plunges 40%,negative,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,SBUX,Starbucks CEO steps down after strong year,neutral,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,AMD,AMD says supply is sold out for the quarter,positive,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,TSLA,Tesla delivers record vehicles but price cuts squeeze margins,negative,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,AAPL,Apple to hold product event next Tuesday,neutral,neutral,0.80,1
+martain7r/finance-llama-8b:q4_k_m,PLTR,Palantir wins $480 million Army contract,positive,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,LCID,Lucid plans to raise $1 billion by selling new shares,negative,neutral,0.00,1
+martain7r/finance-llama-8b:q4_k_m,GOOGL,Alphabet ad revenue grows 15%,positive,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,PYPL,PayPal hit by data breach affecting millions,negative,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,PEP,PepsiCo to webcast its earnings call,neutral,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,CRM,Salesforce wins landmark government deal,positive,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,SNAP,Snap shares plunge after missing user targets,negative,neutral,0.00,0
+martain7r/finance-llama-8b:q4_k_m,ORCL,Oracle completes routine debt refinancing,neutral,neutral,0.90,0

@@ -203,6 +203,83 @@ def realized_pnl_today() -> Optional[float]:
         return total
 
 
+def account_snapshot() -> Optional[Dict[str, float]]:
+    """Balance, equity and floating P/L in ONE read. Balance only moves when a position closes;
+    equity = balance + floating P/L moves with every tick."""
+    with session() as ok:
+        if not ok or mt5 is None:
+            return None
+        info = mt5.account_info()
+        if info is None:
+            return None
+        return {"balance": float(info.balance), "equity": float(info.equity),
+                "floating": float(info.profit)}
+
+
+def overall_profit() -> Optional[float]:
+    """Net P/L of every buy/sell deal in the account history (profit + commission + swap + fee),
+    the figure of the MT5 History tab. Deposits, withdrawals and credit are excluded."""
+    if mt5 is None:
+        return None
+    from datetime import datetime, timedelta
+    with session() as ok:
+        if not ok:
+            return None
+        deals = mt5.history_deals_get(datetime(2000, 1, 1), datetime.now() + timedelta(days=2))
+        if deals is None:
+            return None
+        skip = {mt5.DEAL_TYPE_BALANCE, mt5.DEAL_TYPE_CREDIT}
+        return round(sum(d.profit + d.commission + d.swap + float(getattr(d, "fee", 0.0) or 0.0)
+                         for d in deals if d.type not in skip), 2)
+
+
+def positions_detail() -> Optional[list]:
+    """RAATS positions open at the broker, as the dashboard table shows them: swap, commission,
+    P/L and % change included. Floating P/L = profit + swap (+ commission when the broker books
+    it on the open deal). None when MT5 cannot be read."""
+    if mt5 is None or not live_enabled():
+        return None
+    from datetime import datetime, timedelta, timezone
+    with session() as ok:
+        if not ok:
+            return None
+        raw = mt5.positions_get()
+        if raw is None:
+            return None
+        mine = [p for p in raw if p.magic == MAGIC]
+        # Commission lives on the entry deal, not on the position object.
+        comm: Dict[int, float] = {}
+        if mine:
+            try:
+                start = datetime.now() - timedelta(days=30)
+                for d in mt5.history_deals_get(start, datetime.now() + timedelta(days=2)) or []:
+                    if d.entry == mt5.DEAL_ENTRY_IN:
+                        comm[d.position_id] = comm.get(d.position_id, 0.0) + d.commission + float(getattr(d, "fee", 0.0) or 0.0)
+            except Exception:
+                pass
+        rows = []
+        for p in mine:
+            c = comm.get(p.identifier if hasattr(p, "identifier") else p.ticket)
+            if c is None:
+                c = float(getattr(p, "commission", 0.0) or 0.0)
+            swap = float(p.swap or 0.0)
+            pnl = float(p.profit or 0.0) + swap + c
+            entry, cur = float(p.price_open), float(p.price_current)
+            sign = 1 if p.type == 0 else -1
+            pct = sign * (cur - entry) / entry * 100 if entry else None
+            opened = datetime.fromtimestamp(p.time, tz=timezone.utc).astimezone().replace(tzinfo=None)
+            rows.append({
+                "ticket": int(p.ticket), "symbol": p.symbol, "side": "LONG" if p.type == 0 else "SHORT",
+                "volume": float(p.volume), "entry": entry, "current": cur,
+                "sl": float(p.sl) or None, "tp": float(p.tp) or None,
+                "swap": round(swap, 2), "commission": round(c, 2), "profit": round(float(p.profit or 0.0), 2),
+                "pnl": round(pnl, 2), "pct": round(pct, 2) if pct is not None else None,
+                "opened": opened.isoformat(timespec="seconds"),
+            })
+        rows.sort(key=lambda r: r["opened"], reverse=True)
+        return rows
+
+
 def account_free_margin() -> Optional[float]:
     with session() as ok:
         if not ok or mt5 is None:

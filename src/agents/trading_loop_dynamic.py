@@ -1980,12 +1980,71 @@ class DynamicTradingManager:
         notifier = self._get_notifier()
         # Batch approval = which candidates may enter FinalInvestPool. The balance is NOT part of
         # it (and is not shown): the Main Agent checks it after the pool, in live_agents.py.
-        request = notifier.send_approval_request(
-            final_invest=list(self.final_invest),
-            mt5_data=getattr(self, "mt5_data", None) or {},
-            account_balance=None,
-        )
-        return notifier.wait_for_approval(request.request_id)
+        # The message shows each ticker's analysed direction. A 🔄 reaction (REFRESH) re-runs the
+        # analysis on current prices and asks again, so you never approve a direction that has
+        # already turned by the time you tap.
+        max_refresh = int(float(os.environ.get("RAATS_MAX_APPROVAL_REFRESH", "5")))
+        for round_no in range(max_refresh + 1):
+            request = notifier.send_approval_request(
+                final_invest=list(self.final_invest),
+                mt5_data=getattr(self, "mt5_data", None) or {},
+                account_balance=None,
+                analysis=self._analysis_view(),
+            )
+            response = notifier.wait_for_approval(request.request_id)
+            if response != "REFRESH":
+                return response
+            print(f"  Discord: refresh requested (round {round_no + 1}); re-running the analysis")
+            self._refresh_analysis()
+            if not self.final_invest:
+                return "REJECT"
+        return "TIMEOUT"
+
+    def _analysis_view(self) -> Dict[str, Dict[str, Any]]:
+        """{ticker: {direction, confidence, was}} for the batch approval message."""
+        by_ticker = {r.get("ticker"): r for r in getattr(self, "daily_results", [])}
+        was = getattr(self, "_direction_before_refresh", {})
+        out: Dict[str, Dict[str, Any]] = {}
+        for t in self.final_invest:
+            r = by_ticker.get(t) or {}
+            pos = self.risk_manager.positions.get(t)
+            direction = r.get("direction") or (
+                ("LONG" if pos.direction == 1 else "SHORT") if pos is not None else None)
+            out[t] = {"direction": direction, "confidence": r.get("confidence"), "was": was.get(t)}
+        return out
+
+    def _refresh_analysis(self) -> None:
+        """Re-read each final-INVEST ticker's market data and recompute the direction with the same
+        rule the trade proposal uses (gradient sign), so the approver sees what the trade will do.
+        A ticker with no clear direction any more is taken out of this approval."""
+        from src.agents.collector import collect_market_data
+        from src.risk.risk_manager import direction_from_gradient
+        was = self.__dict__.setdefault("_direction_before_refresh", {})
+        by_ticker = {r.get("ticker"): r for r in getattr(self, "daily_results", [])}
+        dropped: List[str] = []
+        for t in list(self.final_invest):
+            try:
+                md = collect_market_data(t)
+                _m, m_norm = self.risk_manager.resolve_gradient(md["closes"], md["atr"])
+            except Exception as exc:
+                print(f"  refresh: {t} data unavailable ({exc}); kept as analysed")
+                continue
+            d = direction_from_gradient(m_norm, self.risk_manager.gradient_deadband)
+            r = by_ticker.get(t)
+            old = (r or {}).get("direction")
+            if d == 0:
+                dropped.append(t)
+                self.final_invest.remove(t)
+                continue
+            new = "LONG" if d == 1 else "SHORT"
+            if r is not None:
+                r["direction"] = new
+            if old and old != new:
+                was[t] = old
+                print(f"  refresh: {t} direction {old} -> {new}")
+        if dropped:
+            self._send_alert("Refresh: no clear direction any more, removed from this approval: "
+                             + ", ".join(dropped))
 
     def _discard_unapproved_positions(self, reason: str) -> None:
         """Drop this session's paper positions when the session is not approved.

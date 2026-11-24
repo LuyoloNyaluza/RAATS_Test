@@ -1,2 +1,3 @@
 {"timestamp":"2026-11-23T16:45:00.811009+02:00","type":"error","ticker":"-","date":"2026-11-23","stage":"main_agent","error":"[Errno 22] Invalid argument","context":{}}
 {"timestamp":"2026-11-23T18:38:05.619950+02:00","type":"error","ticker":"-","date":"2026-11-23","stage":"batch_pipeline_discovery","error":"[Errno 22] Invalid argument","context":{"batch_no":7}}
+{"timestamp":"2026-11-24T16:07:41.540712+02:00","type":"error","ticker":"-","date":"2026-11-24","stage":"batch_pipeline_analysis","error":"[Errno 22] Invalid argument","context":{"batch_no":2}}

@@ -131,6 +131,10 @@ TRADE_REJECT_RETRY_SEC = _env_float("RAATS_TRADE_REJECT_RETRY_SEC", 3600.0)
 # margin rose by more than 10 %. At most MAX_REPROPOSALS times for one candidate.
 REPROPOSE_DRIFT_R = _env_float("RAATS_REPROPOSE_DRIFT_R", 0.25)
 MAX_REPROPOSALS = int(_env_float("RAATS_MAX_REPROPOSALS", 3))
+# The direction is recomputed from the price trend when the trade is proposed. When it differs from the
+# direction the analysis gave: "ask" (default) = the Discord trade approval says so and shows what the
+# analysis said; "skip" = the candidate is not proposed at all.
+DIRECTION_FLIP_POLICY = os.environ.get("RAATS_DIRECTION_FLIP_POLICY", "ask").strip().lower()
 STOP_FILE = os.environ.get("RAATS_STOP_FILE", "data/STOP")
 STATE_FILE = os.environ.get("RAATS_STATE_FILE", "data/state/live_discovery.json")
 SHARED_FINAL_INVEST_FILE = os.environ.get(
@@ -1001,6 +1005,13 @@ class MainAgent:
                 self._alert("Daily loss limit reached: no new positions today; open positions are kept")
             return self._drop(t, f"risk manager: {reason}"), None
         direction = "LONG" if d == 1 else "SHORT"
+        analysed = str(cand.direction or "").upper()
+        analysed = {"BUY": "LONG", "SELL": "SHORT"}.get(analysed, analysed)
+        flipped = analysed in ("LONG", "SHORT") and analysed != direction
+        if flipped and DIRECTION_FLIP_POLICY == "skip":
+            self._event({"type": "direction_changed", "ticker": t, "analysis": analysed, "now": direction,
+                         "action": "skipped"})
+            return self._drop(t, f"direction changed since the analysis ({analysed} -> {direction}); skipped"), None
 
         lots, traded_units, oversize = None, units, None
         if snap:
@@ -1022,11 +1033,14 @@ class MainAgent:
                 return self._drop(t, sized["reason"]), None
             traded_units = lots * snap["contract_size"]
 
-        risk_unit, _gf = self.rm.compute_risk_unit(risk_atr, m_norm)
         ref = md["close"]
         if snap:
             ref = snap["ask"] if direction == "LONG" else snap["bid"]
+        risk_unit, _gf = self.rm.compute_risk_unit(risk_atr, m_norm, ref)   # capped at RAATS_MAX_SL_PCT of price
+        raw_unit, _ = self.rm.compute_risk_unit(risk_atr, m_norm)          # before the price cap
+        sl_capped = raw_unit > risk_unit * (1 + 1e-9)
         sl, tp = self.rm.compute_initial_levels(ref, d, risk_unit)
+        sl_before_broker = sl
         # Initial TP uses rrr (3R), ceiling only applies during monitoring in _manage
         required_margin, free_margin = None, balance
         if snap:
@@ -1056,14 +1070,30 @@ class MainAgent:
                           f"it is proposed again when the market opens"), None
 
         risk_per_unit = abs(ref - sl)
+        stop_gap_pct = (risk_per_unit / ref * 100) if ref else None
+        cap_pct = getattr(self.rm, "max_sl_pct", 0.0)
+        warnings_pre: List[str] = []
+        if sl_capped and cap_pct > 0:
+            warnings_pre.append(f"Stop shortened by the {cap_pct:g}% price cap: ATR x {self.rm.atr_multiplier:g} x "
+                                f"trend factor {_gf:.2f} wanted {raw_unit / ref * 100:.2f}%.")
+        if (cap_pct > 0 and stop_gap_pct is not None and stop_gap_pct > cap_pct * 1.001
+                and abs(sl - sl_before_broker) > 1e-12):
+            warnings_pre.append(f"Stop gap {stop_gap_pct:.2f}% is above the {cap_pct:g}% cap: the broker's "
+                                f"minimum stop distance pushed the stop out.")
         risk_amount = risk_per_unit * traded_units
         reward_amount = abs(tp - ref) * traded_units
         risk_pct = (risk_amount / balance * 100) if balance else None
-        warnings: List[str] = []
+        warnings: List[str] = list(warnings_pre)
         warn_level = RISK_WARN_PCT_SMALL if (balance or 0) < RISK_WARN_SMALL_BALANCE else RISK_WARN_PCT_LARGE
         if warn_level > 0 and balance and risk_amount > warn_level * balance:
             warnings.append(f"If the stop is hit this trade loses ${risk_amount:,.2f}, "
                             f"{risk_pct:.0f}% of the ${balance:,.2f} balance (warning level {warn_level:.0%}).")
+        if flipped:
+            warnings.append(f"DIRECTION CHANGED since the analysis: it said {'SELL' if analysed == 'SHORT' else 'BUY'}, "
+                            f"the price trend now says {'SELL' if direction == 'SHORT' else 'BUY'}. "
+                            f"React \U0001F504 to refresh, or \u274c to skip.")
+            self._event({"type": "direction_changed", "ticker": t, "analysis": analysed, "now": direction,
+                         "action": "flagged"})
         rr = (abs(tp - ref) / risk_per_unit) if risk_per_unit else None
         proposal = {
             "ticker": t, "mt5_symbol": symbol, "side": "BUY" if d == 1 else "SELL",
@@ -1074,6 +1104,8 @@ class MainAgent:
             "lots": lots, "units": traded_units, "entry": ref, "stop_loss": sl, "take_profit": tp,
             "risk_amount": risk_amount, "reward_amount": reward_amount,
             "risk_pct": risk_pct, "warnings": warnings,
+            "stop_gap_pct": stop_gap_pct, "stop_capped": sl_capped, "trend_factor": _gf,
+            "analysis_direction": analysed or None, "direction_changed": flipped,
             "atr_source": atr_source, "risk_atr": risk_atr, "daily_atr": atr,
             "risk_reward": f"1:{rr:.1f}" if rr else "n/a", "time": _now(),
         }
@@ -1297,6 +1329,15 @@ class MainAgent:
             return self._request_trade_approval(cand, ctx)
         if cand.approval == "APPROVE":
             return self._execute_approved(cand)    # steps 4 - 6
+        if cand.approval == "REFRESH":             # you tapped 🔄: recalculate on current data, ask again
+            self._event({"type": "trade_refresh_requested", "ticker": t, "round": cand.approval_rounds})
+            if cand.approval_rounds >= MAX_REPROPOSALS + 3:
+                return self._trade_not_approved(cand, "TIMEOUT")
+            cand.approval, cand.proposal = "", {}
+            status, ctx = self._prepare(cand)
+            if status != "ok" or ctx is None:
+                return status
+            return self._request_trade_approval(cand, ctx)
         return self._trade_not_approved(cand, cand.approval)
 
     def _try_open(self, cand: Candidate) -> str:

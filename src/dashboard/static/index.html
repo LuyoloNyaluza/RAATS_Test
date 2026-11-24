@@ -14,7 +14,7 @@ body{margin:0;background:#0A1018;color:#E6EDF3;font:14px Inter,"Segoe UI",system
 .dot.running{background:#4C9AFF}.dot.stopping{background:#F0B429}
 .g{color:#3FB950}.r{color:#FF6B66}.a{color:#F0B429}.m{color:#9AA7B5}
 #banner{display:none;background:#5C4410;border:1px solid #7A5A12;border-radius:8px;padding:10px 14px;font-weight:500}
-.grid{display:grid;grid-template-columns:340px 1fr 1fr;grid-template-rows:250px 235px minmax(260px,1fr);gap:14px;flex:1;min-height:0}
+.grid{display:grid;grid-template-columns:340px 1fr 1fr;grid-template-rows:250px 235px 320px;gap:14px;flex:none}
 .p{background:#111A24;border:1px solid #223246;border-radius:10px;display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}
 .ph{padding:9px 14px;font-size:14px;font-weight:600;color:#fff;display:flex;justify-content:space-between;align-items:center;background:#1B2735}
 .ph span{font-weight:400;font-size:12px;opacity:.9}
@@ -37,6 +37,7 @@ select,input[type=date]{font:inherit;background:#0A1018;color:#E6EDF3;border:1px
 #shot{width:100%;flex:1;min-height:0;object-fit:contain;display:none;background:#111A24}
 #notice{display:none;align-items:center;gap:10px;padding:10px 14px;border-top:1px solid #223246;color:#C9D4DF;font-size:13px}
 #notice i{flex:none;width:22px;height:22px;border-radius:50%;background:#2F6FDB;color:#fff;text-align:center;font-style:normal;font-weight:700;line-height:22px}
+.cons{height:320px;min-height:0!important}
 .log{font:12.5px/1.55 "JetBrains Mono",Consolas,monospace;color:#C9D4DF;background:#080D13;border-radius:8px;padding:10px 12px;overflow-y:auto;flex:1;min-height:0;white-space:pre-wrap;word-break:break-word}
 .log .e{color:#FF6B66}.log .k{color:#3FB950}
 @media(max-width:1000px){.grid{grid-template-columns:1fr;grid-template-rows:none}.grid>*{grid-column:auto!important;grid-row:auto!important;min-height:240px}}
@@ -76,7 +77,7 @@ select,input[type=date]{font:inherit;background:#0A1018;color:#E6EDF3;border:1px
 <button id="xls" class="btn xls" type="button">Generate Excel</button>
 </div>
 
-<div class="p" style="grid-column:2 / span 2"><div class="ph">Live Agent Console <label style="font-weight:400;font-size:12px"><input id="lock" type="checkbox" checked> Scroll lock</label></div><div class="pb"><div id="log" class="log" role="log" tabindex="0" aria-label="Live agent console"></div></div></div>
+<div class="p cons" style="grid-column:2 / span 2"><div class="ph">Live Agent Console <label style="font-weight:400;font-size:12px"><input id="lock" type="checkbox" checked> Scroll lock</label></div><div class="pb"><div id="log" class="log" role="log" tabindex="0" aria-label="Live agent console"></div></div></div>
 </div>
 </div>
 
@@ -94,15 +95,29 @@ function fill(id, rows, build) {
 }
 const KIND_CLASS = { rejected: "r", failed: "a", noreply: "a", dailyloss: "a", system: "m" };
 
+// One request at a time, each with a timeout, and "offline" only after 3 failures in a row: a slow
+// answer used to pile up requests and a single hiccup used to flash "Dashboard offline".
+async function getJSON(url, ms = 8000) {
+  const c = new AbortController(), t = setTimeout(() => c.abort(), ms);
+  try {
+    const r = await fetch(url, { signal: c.signal, cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+async function every(fn, ms) { for (;;) { try { await fn(); } catch (e) {} await new Promise(r => setTimeout(r, ms)); } }
+let fails = 0;
 async function poll() {
   try {
-    const s = await (await fetch("/api/state")).json();
+    const s = await getJSON("/api/state");
+    fails = 0;
     const st = s.agent.state;
     $("agent").textContent = st === "running" ? "Running" : st === "stopping" ? "Stopping" : "Ready";
     $("agent").className = st === "ready" ? "g" : st === "running" ? "" : "a";
     $("run").disabled = st !== "ready"; $("stop").disabled = st === "ready";
     $("stop").textContent = st === "stopping" ? "Force stop" : "Stop";
     $("bal").textContent = s.account.balance == null ? "n/a" : "$" + num(s.account.balance);
+    $("bal").title = s.account.floating == null ? "" : "Includes open P/L " + money(s.account.floating) + "; closed balance $" + num(s.account.closed_balance);
     $("ret").textContent = s.account.return_pct == null ? "n/a" : signed(s.account.return_pct, 2, "%");
     $("ret").className = sign(s.account.return_pct);
     const tp = s.account.total_profit;
@@ -116,7 +131,7 @@ async function poll() {
       td(signed(r.pnl), sign(r.pnl)), td(signed(r.r, 1, "R"), sign(r.r))]);
     fill("t-waiting", s.waiting, r => [td(r.ticker), td(r.reason), td(r.since)]);
     fill("t-blocked", s.blocked, r => [td(r.ticker), td(r.reason, KIND_CLASS[r.kind] || "m"), td(r.time)]);
-  } catch (e) { $("agent").textContent = "Dashboard offline"; $("agent").className = "r"; }
+  } catch (e) { if (++fails >= 3) { $("agent").textContent = "Dashboard offline"; $("agent").className = "r"; } }
 }
 
 const px = v => v == null ? "" : Number(v).toFixed(v >= 100 ? 2 : v >= 1 ? 4 : 5);
@@ -139,7 +154,7 @@ async function closePos(r) {
 }
 async function pollPositions() {
   try {
-    const j = await (await fetch("/api/positions")).json();
+    const j = await getJSON("/api/positions");
     const live = j.source === "MT5", seen = new Set(j.rows.map(r => r.ticket));
     pending.forEach((t, k) => { if (!seen.has(k) || Date.now() - t > 120000) pending.delete(k); });
     $("n-open").textContent = j.rows.length + (live ? "" : " (from log)");
@@ -182,7 +197,7 @@ es.onmessage = ev => {
   while (log.childElementCount > 1500) log.firstChild.remove();
   if ($("lock").checked) log.scrollTop = log.scrollHeight;
 };
-poll(); setInterval(poll, 3000); pollPositions(); setInterval(pollPositions, 2000); generate();
+every(poll, 3000); every(pollPositions, 2000); generate();
 </script>
 </body>
 </html>
